@@ -1,0 +1,24 @@
+﻿git commit -m "Clean commit without build artifacts"# Rust - NEVER commit these!
+target/
+Cargo.lock
+
+# Debug files
+*.pdb
+*.rlib
+*.exegit rm --cached .env
+*.dll
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+/target/
+
+.env
+
+.env
+
+.env.*

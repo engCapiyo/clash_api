@@ -1,0 +1,12 @@
+{
+  "db_name": "MySQL",
+  "query": "\n        INSERT INTO posts (user_id, game_id, title, content, image_url, bet_amount, predicted_team, created_at)\n        VALUES (?, ?, ?, ?, ?, ?, ?, NOW())\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "13377f1fe6e1827f7bf9cfbf2a17c1ffc01e4b032a6b9c86d383f6949f852135"
+}

@@ -1,0 +1,1 @@
+//DATABASE_URL=mysql://root:Capiyo%401010@34.31.228.57:3306/clashdb
