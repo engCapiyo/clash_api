@@ -9,6 +9,8 @@ pub(crate) mod b2c_handlers;
 pub(crate) mod bets;
 pub(crate) mod chat_handlers;
 pub(crate) mod comrade_handler;
+
+pub(crate) mod channel;
 pub(crate) mod events_handler;
 pub(crate) mod mpesa_handlers;
 pub(crate) mod notification_handler;

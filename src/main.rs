@@ -141,6 +141,7 @@ async fn build_router(app_state: AppState) -> Router {
         .nest("/api/chats", routes::chat::routes())
         .nest("/ws", routes::vote_routes::ws_routes())
         .nest("/comments", routes::posts::comment_routes())
+        .nest("/api/channels", routes::channel::channel_routes())
         .nest(
             "/api/notifications",
             routes::vote_routes::notification_routes(),
