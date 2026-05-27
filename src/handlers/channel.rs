@@ -57,6 +57,22 @@ pub async fn create_channel_handler(
         "channel_id": channel_id,
     })))
 }
+pub async fn get_user_channel_count_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let count = channels_col
+        .count_documents(doc! { "members.user_id": &user_id })
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "user_id": user_id,
+        "channel_count": count,
+    })))
+}
 
 // ============================================================================
 // GET CHANNEL BY ID

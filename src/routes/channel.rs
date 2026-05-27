@@ -8,9 +8,9 @@ use serde_json::json;
 use crate::handlers::channel::{
     add_members_to_channel_handler, cast_vote_handler, create_channel_handler,
     finalize_fixture_result_handler, get_channel_fixtures_handler, get_channel_handler,
-    get_channel_leaderboard_handler, get_messages_handler, get_weekly_top_channel_handler,
-    initialize_fixture_chat_handler, leave_channel_handler, reset_weekly_messages_handler,
-    send_message_handler,
+    get_channel_leaderboard_handler, get_messages_handler, get_user_channel_hanlder,
+    get_weekly_top_channel_handler, initialize_fixture_chat_handler, leave_channel_handler,
+    reset_weekly_messages_handler, send_message_handler,
 };
 use crate::AppState;
 
@@ -18,6 +18,7 @@ pub fn channel_routes() -> Router<AppState> {
     Router::new()
         // Channel CRUD
         .route("/", post(create_channel_handler))
+        .route("/user/:user_id/count", get(get_user_channel_count_handler))
         .route("/:channel_id", get(get_channel_handler))
         .route(
             "/:channel_id/leaderboard",
