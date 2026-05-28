@@ -16,27 +16,27 @@ use crate::AppState;
 
 pub fn channel_routes() -> Router<AppState> {
     Router::new()
-        // Channel CRUD
-        .route("/", post(create_channel_handler))
+        // =============================================================
+        // SPECIFIC ROUTES (no dynamic segments) - MUST come FIRST
+        // =============================================================
         .route("/user/:user_id/count", get(get_user_channel_count_handler))
+        .route("/weekly/top", get(get_weekly_top_channel_handler))
+        .route("/fixture/chat", post(initialize_fixture_chat_handler))
+        .route("/members/add", post(add_members_to_channel_handler))
+        .route("/members/leave", post(leave_channel_handler))
+        .route("/messages", post(send_message_handler))
+        .route("/messages", get(get_messages_handler))
+        .route("/votes", post(cast_vote_handler))
+        .route("/admin/reset-weekly", post(reset_weekly_messages_handler))
+        .route("/fixtures/finalize", post(finalize_fixture_result_handler))
+        // =============================================================
+        // DYNAMIC ROUTES (with path parameters) - MUST come LAST
+        // =============================================================
+        .route("/", post(create_channel_handler))
         .route("/:channel_id", get(get_channel_handler))
         .route(
             "/:channel_id/leaderboard",
             get(get_channel_leaderboard_handler),
         )
         .route("/:channel_id/fixtures", get(get_channel_fixtures_handler))
-        .route("/weekly/top", get(get_weekly_top_channel_handler))
-        // Fixture chat
-        .route("/fixture/chat", post(initialize_fixture_chat_handler))
-        // Members
-        .route("/members/add", post(add_members_to_channel_handler))
-        .route("/members/leave", post(leave_channel_handler))
-        // Messages
-        .route("/messages", post(send_message_handler))
-        .route("/messages", get(get_messages_handler))
-        // Votes
-        .route("/votes", post(cast_vote_handler))
-        // Admin / Cron
-        .route("/admin/reset-weekly", post(reset_weekly_messages_handler))
-        .route("/fixtures/finalize", post(finalize_fixture_result_handler))
 }
