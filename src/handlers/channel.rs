@@ -24,22 +24,41 @@ pub async fn create_channel_handler(
     let now = DateTime::now();
     let channel_id = Uuid::new_v4().to_string();
 
-    let channel = Channel {
-        id: None,
-        channel_id: channel_id.clone(),
-        name: payload.name,
-        created_by: payload.created_by.clone(),
-        created_at: now,
-        members: vec![ChannelMember {
-            user_id: payload.created_by,
-            username: payload.created_by_username,
-            role: "admin".to_string(),
+    // Build members list: admin first, then any passed-in members
+    let mut members = vec![ChannelMember {
+        user_id: payload.created_by.clone(),
+        username: payload.created_by_username.clone(),
+        role: "admin".to_string(),
+        joined_at: now,
+        season_points: 0,
+        correct_votes: 0,
+        total_votes: 0,
+        msg_count: 0,
+    }];
+
+    // Add the selected comrades
+    for m in payload.members.unwrap_or_default() {
+        members.push(ChannelMember {
+            user_id: m.user_id,
+            username: m.username,
+            role: "member".to_string(),
             joined_at: now,
             season_points: 0,
             correct_votes: 0,
             total_votes: 0,
             msg_count: 0,
-        }],
+        });
+    }
+
+    let member_count = members.len() as i32;
+
+    let channel = Channel {
+        id: None,
+        channel_id: channel_id.clone(),
+        name: payload.name,
+        created_by: payload.created_by,
+        created_at: now,
+        members,
         activity: ChannelActivity {
             total_messages: 0,
             messages_this_week: 0,
@@ -47,7 +66,7 @@ pub async fn create_channel_handler(
             last_message_at: None,
         },
         season: payload.season,
-        member_count: 1,
+        member_count,
     };
 
     channels_col.insert_one(channel).await?;
@@ -644,6 +663,7 @@ pub struct CreateChannelRequest {
     pub created_by: String,
     pub created_by_username: String,
     pub season: String,
+    pub members: Option<Vec<NewMember>>,
 }
 
 #[derive(Debug, serde::Deserialize)]
