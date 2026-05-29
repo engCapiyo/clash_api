@@ -76,6 +76,28 @@ pub async fn create_channel_handler(
         "channel_id": channel_id,
     })))
 }
+pub async fn get_user_channels_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    // Find channels where the user is a member
+    let filter = doc! { "members.user_id": &user_id };
+    let mut cursor = channels_col.find(filter).await?;
+
+    let mut channels = Vec::new();
+    while cursor.advance().await? {
+        channels.push(cursor.deserialize_current()?);
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "channels": channels,
+        "count": channels.len(),
+    })))
+}
+
 pub async fn get_user_channel_count_handler(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
