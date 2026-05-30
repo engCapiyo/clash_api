@@ -1,10 +1,6 @@
 use mongodb::bson::{oid::ObjectId, DateTime};
 use serde::{Deserialize, Serialize};
 
-// ============================================================================
-// FIXTURE MODEL (master match data)
-// ============================================================================
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Fixture {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -13,15 +9,11 @@ pub struct Fixture {
     pub home_team: String,
     pub away_team: String,
     pub kickoff_time: DateTime,
-    pub status: String,         // "upcoming", "live", "completed"
-    pub result: Option<String>, // "home", "away", "draw"
+    pub status: String,
+    pub result: Option<String>,
     pub home_score: Option<i32>,
     pub away_score: Option<i32>,
 }
-
-// ============================================================================
-// CHANNEL MODELS
-// ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Channel {
@@ -41,7 +33,7 @@ pub struct Channel {
 pub struct ChannelMember {
     pub user_id: String,
     pub username: String,
-    pub role: String, // "admin" or "member"
+    pub role: String,
     pub joined_at: DateTime,
     pub season_points: i32,
     pub correct_votes: i32,
@@ -56,10 +48,6 @@ pub struct ChannelActivity {
     pub week_reset_at: DateTime,
     pub last_message_at: Option<DateTime>,
 }
-
-// ============================================================================
-// FIXTURE CHAT MODELS
-// ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChannelFixture {
@@ -85,7 +73,23 @@ pub struct VoteCounts {
 }
 
 // ============================================================================
-// MESSAGE MODELS
+// REPLY DATA
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ReplyToData {
+    #[serde(rename = "messageId")]
+    pub message_id: String,
+    pub text: String,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
+    #[serde(rename = "isMe")]
+    pub is_me: bool,
+}
+
+// ============================================================================
+// MESSAGE MODEL
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,15 +97,29 @@ pub struct Message {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub channel_id: String,
-    pub fixture_id: Option<String>, // None = overall channel chat
+    pub fixture_id: Option<String>,
     pub sender_id: String,
     pub sender_name: String,
     pub text: String,
     pub sent_at: DateTime,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<String>,
+    #[serde(default)]
+    pub is_image: bool,
+    #[serde(default)]
+    pub is_video: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyToData>,
 }
 
 // ============================================================================
-// VOTE MODELS
+// VOTE MODEL
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,14 +129,14 @@ pub struct Vote {
     pub channel_id: String,
     pub fixture_id: String,
     pub user_id: String,
-    pub selection: String, // "home", "away", "draw"
+    pub selection: String,
     pub is_correct: Option<bool>,
     pub points_awarded: Option<i32>,
     pub voted_at: DateTime,
 }
 
 // ============================================================================
-// PAYOUT MODELS
+// PAYOUT MODEL
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -127,12 +145,12 @@ pub struct Payout {
     pub id: Option<ObjectId>,
     pub user_id: String,
     pub channel_id: String,
-    pub payout_type: String, // "weekly", "season_rank1", "season_rank2", "season_rank3"
+    pub payout_type: String,
     pub amount: f64,
     pub currency: String,
     pub week: Option<i32>,
     pub season: String,
-    pub status: String, // "pending", "paid", "failed"
+    pub status: String,
     pub created_at: DateTime,
     pub paid_at: Option<DateTime>,
 }

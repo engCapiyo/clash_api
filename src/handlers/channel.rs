@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use mongodb::bson::{doc, DateTime};
@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use crate::errors::Result;
 use crate::models::channel::{
-    Channel, ChannelActivity, ChannelFixture, ChannelMember, Fixture, Message, Vote, VoteCounts,
+    Channel, ChannelActivity, ChannelFixture, ChannelMember, Fixture, Message, ReplyToData, Vote,
+    VoteCounts,
 };
 use crate::AppState;
 
@@ -24,7 +25,6 @@ pub async fn create_channel_handler(
     let now = DateTime::now();
     let channel_id = Uuid::new_v4().to_string();
 
-    // Build members list: admin first, then any passed-in members
     let mut members = vec![ChannelMember {
         user_id: payload.created_by.clone(),
         username: payload.created_by_username.clone(),
@@ -36,7 +36,6 @@ pub async fn create_channel_handler(
         msg_count: 0,
     }];
 
-    // Add the selected comrades
     for m in payload.members.unwrap_or_default() {
         members.push(ChannelMember {
             user_id: m.user_id,
@@ -76,13 +75,17 @@ pub async fn create_channel_handler(
         "channel_id": channel_id,
     })))
 }
+
+// ============================================================================
+// GET USER CHANNELS
+// ============================================================================
+
 pub async fn get_user_channels_handler(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
 
-    // Find channels where the user is a member
     let filter = doc! { "members.user_id": &user_id };
     let mut cursor = channels_col.find(filter).await?;
 
@@ -91,12 +94,18 @@ pub async fn get_user_channels_handler(
         channels.push(cursor.deserialize_current()?);
     }
 
+    let count = channels.len();
+
     Ok(Json(json!({
         "success": true,
         "channels": channels,
-        "count": channels.len(),
+        "count": count,
     })))
 }
+
+// ============================================================================
+// GET USER CHANNEL COUNT
+// ============================================================================
 
 pub async fn get_user_channel_count_handler(
     State(state): State<AppState>,
@@ -186,7 +195,7 @@ pub async fn get_channel_leaderboard_handler(
 }
 
 // ============================================================================
-// GET WEEKLY TOP CHANNEL (for admin payout)
+// GET WEEKLY TOP CHANNEL
 // ============================================================================
 
 pub async fn get_weekly_top_channel_handler(
@@ -275,7 +284,7 @@ pub async fn initialize_fixture_chat_handler(
 }
 
 // ============================================================================
-// GET CHANNEL FIXTURES (all fixtures a channel follows)
+// GET CHANNEL FIXTURES
 // ============================================================================
 
 pub async fn get_channel_fixtures_handler(
@@ -294,16 +303,18 @@ pub async fn get_channel_fixtures_handler(
         fixtures.push(cursor.deserialize_current()?);
     }
 
+    let count = fixtures.len();
+
     Ok(Json(json!({
         "success": true,
         "channel_id": channel_id,
         "fixtures": fixtures,
-        "count": fixtures.len(),
+        "count": count,
     })))
 }
 
 // ============================================================================
-// SEND MESSAGE
+// SEND MESSAGE (REST fallback)
 // ============================================================================
 
 pub async fn send_message_handler(
@@ -323,11 +334,17 @@ pub async fn send_message_handler(
         sender_name: payload.sender_name.clone(),
         text: payload.text.clone(),
         sent_at: now,
+        message_id: payload.message_id.clone(),
+        selection: payload.selection.clone(),
+        image_url: payload.image_url.clone(),
+        video_url: payload.video_url.clone(),
+        is_image: payload.is_image.unwrap_or(false),
+        is_video: payload.is_video.unwrap_or(false),
+        reply_to: payload.reply_to.clone(),
     };
 
     messages_col.insert_one(message).await?;
 
-    // Update channel activity
     channels_col
         .update_one(
             doc! { "channel_id": &payload.channel_id },
@@ -341,7 +358,6 @@ pub async fn send_message_handler(
         )
         .await?;
 
-    // Update member message count
     channels_col
         .update_one(
             doc! {
@@ -352,7 +368,6 @@ pub async fn send_message_handler(
         )
         .await?;
 
-    // Update fixture last message if applicable
     if let Some(fixture_id) = &payload.fixture_id {
         channel_fixtures_col
             .update_one(
@@ -378,33 +393,38 @@ pub async fn send_message_handler(
 // GET MESSAGES
 // ============================================================================
 
-// ============================================================================
-// CAST VOTE
-// ============================================================================
+#[derive(Debug, serde::Deserialize)]
+pub struct GetMessagesQuery {
+    pub channel_id: String,
+    pub fixture_id: Option<String>,
+    pub limit: Option<i32>,
+    pub offset: Option<i32>,
+}
+
 pub async fn get_messages_handler(
     State(state): State<AppState>,
-    Json(payload): Json<GetMessagesRequest>,
+    Query(params): Query<GetMessagesQuery>,
 ) -> Result<Json<serde_json::Value>> {
     let messages_col = state.db.collection::<Message>("messages");
-    let limit = payload.limit.unwrap_or(50);
+    let limit = params.limit.unwrap_or(50);
 
-    let filter = if let Some(fixture_id) = &payload.fixture_id {
+    let filter = if let Some(fixture_id) = &params.fixture_id {
         doc! {
-            "channel_id": &payload.channel_id,
+            "channel_id": &params.channel_id,
             "fixture_id": fixture_id,
         }
     } else {
         doc! {
-            "channel_id": &payload.channel_id,
-            "fixture_id": None::<String>,
+            "channel_id": &params.channel_id,
+            "fixture_id": mongodb::bson::Bson::Null,
         }
     };
 
     let mut cursor = messages_col
         .find(filter)
-        .sort(doc! { "sent_at": -1 })
+        .sort(doc! { "sent_at": 1 })
         .limit(limit as i64)
-        .skip(payload.offset.unwrap_or(0) as u64)
+        .skip(params.offset.unwrap_or(0) as u64)
         .await?;
 
     let mut messages = Vec::new();
@@ -412,12 +432,18 @@ pub async fn get_messages_handler(
         messages.push(cursor.deserialize_current()?);
     }
 
+    let count = messages.len();
+
     Ok(Json(json!({
         "success": true,
         "messages": messages,
-        "count": messages.len(),
+        "count": count,
     })))
 }
+
+// ============================================================================
+// CAST VOTE
+// ============================================================================
 
 pub async fn cast_vote_handler(
     State(state): State<AppState>,
@@ -427,7 +453,6 @@ pub async fn cast_vote_handler(
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
     let now = DateTime::now();
 
-    // Check if already voted
     let existing = votes_col
         .find_one(doc! {
             "channel_id": &payload.channel_id,
@@ -455,7 +480,6 @@ pub async fn cast_vote_handler(
 
     votes_col.insert_one(vote).await?;
 
-    // Increment vote count in channel_fixtures
     let increment_field = match payload.selection.as_str() {
         "home" => "vote_counts.home",
         "away" => "vote_counts.away",
@@ -481,7 +505,7 @@ pub async fn cast_vote_handler(
 }
 
 // ============================================================================
-// FINALIZE FIXTURE RESULT (award points after match ends)
+// FINALIZE FIXTURE RESULT
 // ============================================================================
 
 pub async fn finalize_fixture_result_handler(
@@ -493,7 +517,6 @@ pub async fn finalize_fixture_result_handler(
     let fixtures_col = state.db.collection::<Fixture>("fixtures");
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
-    // Update fixture with result
     fixtures_col
         .update_one(
             doc! { "fixture_id": &payload.fixture_id },
@@ -506,7 +529,6 @@ pub async fn finalize_fixture_result_handler(
         )
         .await?;
 
-    // Update all channel_fixtures status for this fixture
     channel_fixtures_col
         .update_many(
             doc! { "fixture_id": &payload.fixture_id },
@@ -514,7 +536,6 @@ pub async fn finalize_fixture_result_handler(
         )
         .await?;
 
-    // Find all votes for this fixture across all channels
     let mut cursor = votes_col
         .find(doc! { "fixture_id": &payload.fixture_id, "is_correct": null })
         .await?;
@@ -524,7 +545,6 @@ pub async fn finalize_fixture_result_handler(
         let is_correct = vote.selection == payload.result;
         let points = if is_correct { 10 } else { 0 };
 
-        // Update vote with correctness and points
         votes_col
             .update_one(
                 doc! { "_id": vote.id },
@@ -537,7 +557,6 @@ pub async fn finalize_fixture_result_handler(
             )
             .await?;
 
-        // Update member in channel
         if points > 0 {
             channels_col
                 .update_one(
@@ -583,7 +602,6 @@ pub async fn add_members_to_channel_handler(
 
     let mut members_to_add = Vec::new();
     for member in &payload.members {
-        // CHANGE: add & to iterate by reference
         members_to_add.push(doc! {
             "user_id": &member.user_id,
             "username": &member.username,
@@ -596,12 +614,14 @@ pub async fn add_members_to_channel_handler(
         });
     }
 
+    let added_count = payload.members.len();
+
     let result = channels_col
         .update_one(
             doc! { "channel_id": &payload.channel_id },
             doc! {
                 "$push": { "members": { "$each": members_to_add } },
-                "$inc": { "member_count": payload.members.len() as i32 }
+                "$inc": { "member_count": added_count as i32 }
             },
         )
         .await?;
@@ -612,9 +632,10 @@ pub async fn add_members_to_channel_handler(
 
     Ok(Json(json!({
         "success": true,
-        "added_count": payload.members.len(),
+        "added_count": added_count,
     })))
 }
+
 // ============================================================================
 // LEAVE CHANNEL
 // ============================================================================
@@ -649,7 +670,7 @@ pub async fn leave_channel_handler(
 }
 
 // ============================================================================
-// RESET WEEKLY MESSAGES (cron job - call every Monday at 00:00)
+// RESET WEEKLY MESSAGES
 // ============================================================================
 
 pub async fn reset_weekly_messages_handler(
@@ -701,14 +722,13 @@ pub struct SendMessageRequest {
     pub sender_id: String,
     pub sender_name: String,
     pub text: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct GetMessagesRequest {
-    pub channel_id: String,
-    pub fixture_id: Option<String>,
-    pub limit: Option<i32>,
-    pub offset: Option<i32>,
+    pub message_id: Option<String>,
+    pub selection: Option<String>,
+    pub image_url: Option<String>,
+    pub video_url: Option<String>,
+    pub is_image: Option<bool>,
+    pub is_video: Option<bool>,
+    pub reply_to: Option<ReplyToData>,
 }
 
 #[derive(Debug, serde::Deserialize)]

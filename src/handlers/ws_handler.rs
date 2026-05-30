@@ -1,5 +1,4 @@
-use crate::models::channel::{Channel, ChannelFixture, Message};
-use crate::models::game::{CommentaryEntry, Game};
+use crate::models::channel::{Channel, ChannelFixture, Message, ReplyToData};
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
@@ -7,7 +6,7 @@ use axum::{
     },
     response::IntoResponse,
 };
-use bson::{doc, oid::ObjectId, DateTime as BsonDateTime};
+use bson::{doc, DateTime as BsonDateTime};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -18,7 +17,10 @@ use tracing;
 
 use crate::state::AppState;
 
-// ========== QUERY PARAMS ==========
+// ============================================================================
+// QUERY PARAMS
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
     #[serde(rename = "roomId")]
@@ -27,107 +29,10 @@ pub struct WsQuery {
     pub username: Option<String>,
 }
 
-// ========== WEB SOCKET MESSAGE TYPES ==========
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(tag = "type")]
-pub enum WSMessage {
-    #[serde(rename = "chat.message")]
-    ChatMessage {
-        payload: ChatMessagePayload,
-        timestamp: String,
-    },
-    #[serde(rename = "typing")]
-    Typing {
-        payload: TypingPayload,
-        timestamp: String,
-    },
-    #[serde(rename = "presence")]
-    Presence {
-        payload: PresencePayload,
-        timestamp: String,
-    },
-    #[serde(rename = "vote.update")]
-    VoteUpdate {
-        payload: VoteUpdatePayload,
-        timestamp: String,
-    },
-    #[serde(rename = "like")]
-    Like {
-        payload: LikePayload,
-        timestamp: String,
-    },
-    #[serde(rename = "pong")]
-    Pong { timestamp: String },
-    #[serde(rename = "connected")]
-    Connected { room_id: String, timestamp: String },
-}
+// ============================================================================
+// UPGRADE HANDLER
+// ============================================================================
 
-// ========== PAYLOAD STRUCTURES ==========
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ChatMessagePayload {
-    pub roomId: String,
-    pub channelId: String,
-    pub fixtureId: Option<String>,
-    pub message: String,
-    pub fromUserId: String,
-    pub username: String,
-    pub selection: Option<String>,
-    pub messageId: String,
-    pub timestamp: String,
-    pub replyTo: Option<ReplyData>,
-    pub imageUrl: Option<String>,
-    pub videoUrl: Option<String>,
-    pub isImage: Option<bool>,
-    pub isVideo: Option<bool>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ReplyData {
-    pub messageId: String,
-    pub text: String,
-    pub username: String,
-    pub selection: Option<String>,
-    pub isMe: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct LikePayload {
-    pub fixtureId: String,
-    pub userId: String,
-    pub username: String,
-    pub action: String,
-    pub totalLikes: i64,
-    pub timestamp: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct TypingPayload {
-    pub roomId: String,
-    pub isTyping: bool,
-    pub fromUserId: String,
-    pub username: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct PresencePayload {
-    pub user_id: String,
-    pub username: String,
-    pub status: String,
-    pub room_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct VoteUpdatePayload {
-    pub fixture_id: String,
-    pub user_id: String,
-    pub selection: String,
-    pub home_votes: i64,
-    pub away_votes: i64,
-    pub draw_votes: i64,
-}
-
-// ========== UPGRADE HANDLER ==========
 pub async fn ws_comments_handler(
     ws: WebSocketUpgrade,
     Query(params): Query<WsQuery>,
@@ -146,7 +51,10 @@ pub async fn ws_comments_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, room_id, user_id, username, state))
 }
 
-// ========== PARSE ROOM ID ==========
+// ============================================================================
+// PARSE ROOM ID
+// ============================================================================
+
 fn parse_room_id(room_id: &str) -> (String, Option<String>) {
     if room_id.ends_with("_overall") {
         let channel_id = room_id.trim_end_matches("_overall").to_string();
@@ -163,7 +71,10 @@ fn parse_room_id(room_id: &str) -> (String, Option<String>) {
     }
 }
 
-// ========== PER-CONNECTION LOGIC ==========
+// ============================================================================
+// PER-CONNECTION LOGIC
+// ============================================================================
+
 async fn handle_socket(
     socket: WebSocket,
     room_id: String,
@@ -181,7 +92,6 @@ async fn handle_socket(
     let sender = Arc::new(Mutex::new(sender));
     let sender_clone = sender.clone();
 
-    // Clone values for use in closures
     let room_id_clone = room_id.clone();
     let channel_id_clone = channel_id.clone();
     let fixture_id_clone = fixture_id.clone();
@@ -208,7 +118,7 @@ async fn handle_socket(
         }
     }
 
-    // Broadcast user online presence
+    // Broadcast presence
     let presence = serde_json::json!({
         "type": "presence",
         "payload": {
@@ -231,8 +141,6 @@ async fn handle_socket(
     );
 
     let room_id_for_send = room_id_clone.clone();
-    let channel_id_for_save = channel_id_clone.clone();
-    let fixture_id_for_save = fixture_id_clone.clone();
 
     // Task 1: Forward broadcast messages to this client
     let mut send_task = tokio::spawn(async move {
@@ -298,7 +206,7 @@ async fn handle_socket(
         _ = &mut recv_task => send_task.abort(),
     }
 
-    // Broadcast user offline presence
+    // Broadcast offline presence
     let offline_presence = serde_json::json!({
         "type": "presence",
         "payload": {
@@ -317,6 +225,10 @@ async fn handle_socket(
     tracing::info!("🔌 WS disconnected for room: {}", room_id_clone);
 }
 
+// ============================================================================
+// HANDLE INCOMING MESSAGE
+// ============================================================================
+
 async fn handle_incoming_message(
     text: String,
     state: &AppState,
@@ -327,89 +239,89 @@ async fn handle_incoming_message(
     username: &str,
     broadcaster: &tokio::sync::broadcast::Sender<String>,
 ) {
-    if let Ok(json_msg) = serde_json::from_str::<Value>(&text) {
-        let message_type = json_msg.get("type").and_then(|t| t.as_str());
+    let json_msg = match serde_json::from_str::<Value>(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Failed to parse WS message: {}", e);
+            return;
+        }
+    };
 
-        match message_type {
-            Some("chat.message") => {
-                if let Some(payload) = json_msg.get("payload") {
-                    let payload_clone = payload.clone();
+    let message_type = json_msg.get("type").and_then(|t| t.as_str());
 
-                    tracing::info!(
-                        "📨 Received chat.message from user {} in room {}",
-                        user_id,
-                        room_id
-                    );
+    match message_type {
+        Some("chat.message") => {
+            if let Some(payload) = json_msg.get("payload") {
+                let payload_clone = payload.clone();
 
-                    // Save message to messages collection
-                    if let Err(e) = save_message_to_database(
-                        state,
-                        channel_id,
-                        fixture_id,
-                        user_id,
-                        username,
-                        &payload_clone,
-                    )
-                    .await
-                    {
-                        tracing::error!("Failed to save message: {}", e);
-                        return;
-                    }
+                tracing::info!("📨 chat.message from user {} in room {}", user_id, room_id);
 
-                    // Broadcast the message
-                    let broadcast_msg = serde_json::json!({
-                        "type": "chat.message",
-                        "payload": payload_clone,
-                        "timestamp": Utc::now().to_rfc3339(),
-                    });
-
-                    if let Ok(broadcast_json) = serde_json::to_string(&broadcast_msg) {
-                        let _ = broadcaster.send(broadcast_json);
-                        tracing::info!("📡 Broadcasted chat.message to room {}", room_id);
-                    }
+                if let Err(e) = save_message_to_database(
+                    state,
+                    channel_id,
+                    fixture_id,
+                    user_id,
+                    username,
+                    &payload_clone,
+                )
+                .await
+                {
+                    tracing::error!("❌ Failed to save message: {}", e);
+                    return;
                 }
-            }
 
-            Some("typing") => {
-                if let Some(payload) = json_msg.get("payload") {
-                    let broadcast_msg = serde_json::json!({
-                        "type": "typing",
-                        "payload": payload,
-                        "timestamp": Utc::now().to_rfc3339(),
-                    });
-                    if let Ok(broadcast_json) = serde_json::to_string(&broadcast_msg) {
-                        let _ = broadcaster.send(broadcast_json);
-                    }
-                }
-            }
-
-            Some("room.join") => {
-                tracing::info!("User {} joined room {}", user_id, room_id);
-            }
-
-            Some("room.leave") => {
-                tracing::info!("User {} left room {}", user_id, room_id);
-            }
-
-            Some("ping") => {
-                let pong = serde_json::json!({
-                    "type": "pong",
+                let broadcast_msg = serde_json::json!({
+                    "type": "chat.message",
+                    "payload": payload_clone,
                     "timestamp": Utc::now().to_rfc3339(),
                 });
-                if let Ok(pong_json) = serde_json::to_string(&pong) {
-                    let _ = broadcaster.send(pong_json);
+
+                if let Ok(broadcast_json) = serde_json::to_string(&broadcast_msg) {
+                    let _ = broadcaster.send(broadcast_json);
+                    tracing::info!("📡 Broadcasted chat.message to room {}", room_id);
                 }
             }
+        }
 
-            _ => {
-                tracing::debug!("Unknown message type: {:?}", message_type);
+        Some("typing") => {
+            if let Some(payload) = json_msg.get("payload") {
+                let broadcast_msg = serde_json::json!({
+                    "type": "typing",
+                    "payload": payload,
+                    "timestamp": Utc::now().to_rfc3339(),
+                });
+                if let Ok(broadcast_json) = serde_json::to_string(&broadcast_msg) {
+                    let _ = broadcaster.send(broadcast_json);
+                }
             }
+        }
+
+        Some("room.join") => {
+            tracing::info!("User {} joined room {}", user_id, room_id);
+        }
+
+        Some("room.leave") => {
+            tracing::info!("User {} left room {}", user_id, room_id);
+        }
+
+        Some("ping") => {
+            let pong = serde_json::json!({
+                "type": "pong",
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+            if let Ok(pong_json) = serde_json::to_string(&pong) {
+                let _ = broadcaster.send(pong_json);
+            }
+        }
+
+        _ => {
+            tracing::debug!("Unknown message type: {:?}", message_type);
         }
     }
 }
 
 // ============================================================================
-// CHANNEL-BASED MESSAGE STORAGE
+// SAVE MESSAGE TO DATABASE
 // ============================================================================
 
 async fn save_message_to_database(
@@ -432,12 +344,42 @@ async fn save_message_to_database(
         .unwrap_or("")
         .to_string();
 
-    let selection = payload
-        .get("selection")
+    let message_id = payload
+        .get("messageId")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Create message document
+    let selection = payload
+        .get("selection")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let image_url = payload
+        .get("imageUrl")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let video_url = payload
+        .get("videoUrl")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let is_image = payload
+        .get("isImage")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let is_video = payload
+        .get("isVideo")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let reply_to: Option<ReplyToData> = payload
+        .get("replyTo")
+        .and_then(|v| if v.is_null() { None } else { Some(v) })
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
     let message = Message {
         id: None,
         channel_id: channel_id.to_string(),
@@ -446,19 +388,28 @@ async fn save_message_to_database(
         sender_name: username.to_string(),
         text: message_text.clone(),
         sent_at: now,
+        message_id,
+        selection,
+        image_url,
+        video_url,
+        is_image,
+        is_video,
+        reply_to,
     };
 
-    // Insert message
     messages_col
         .insert_one(&message)
         .await
         .map_err(|e| format!("Failed to insert message: {}", e))?;
+
     tracing::info!(
-        "✅ Message saved to messages collection with channel_id: {}",
-        channel_id
+        "✅ Message saved — user: {}, channel: {}, fixture: {:?}",
+        user_id,
+        channel_id,
+        fixture_id
     );
 
-    // Update channel activity counters
+    // Update channel activity
     channels_col
         .update_one(
             doc! { "channel_id": channel_id },
@@ -472,7 +423,6 @@ async fn save_message_to_database(
         )
         .await
         .map_err(|e| format!("Failed to update channel activity: {}", e))?;
-    tracing::info!("✅ Updated channel activity for channel: {}", channel_id);
 
     // Update member message count
     channels_col
@@ -485,9 +435,8 @@ async fn save_message_to_database(
         )
         .await
         .map_err(|e| format!("Failed to update member count: {}", e))?;
-    tracing::info!("✅ Updated member msg_count for user: {}", user_id);
 
-    // Update fixture last message if this is a fixture chat
+    // Update fixture last message if applicable
     if let Some(fix_id) = fixture_id {
         channel_fixtures_col
             .update_one(
@@ -505,14 +454,13 @@ async fn save_message_to_database(
             )
             .await
             .map_err(|e| format!("Failed to update fixture last message: {}", e))?;
-        tracing::info!("✅ Updated fixture last_message for fixture: {}", fix_id);
     }
 
     Ok(())
 }
 
 // ============================================================================
-// BROADCAST HELPER (kept for compatibility)
+// BROADCAST HELPER
 // ============================================================================
 
 pub async fn broadcast_live_match_update(
