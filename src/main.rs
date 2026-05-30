@@ -108,7 +108,6 @@ async fn initialize_app_state(db: mongodb::Database) -> AppState {
 
     app_state
 }
-
 async fn build_router(app_state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -122,14 +121,12 @@ async fn build_router(app_state: AppState) -> Router {
         .allow_headers(Any)
         .allow_credentials(false);
 
-    Router::new()
+    let api_routes = Router::new()
         .route("/", get(root_handler))
         .route("/health", get(health_check))
         .route("/api/health", get(api_health_check))
         .route("/debug/fcm", get(debug_fcm))
         .route("/api/simple_health_check", get(simple_health_check))
-        // User profile routes (new - Firebase auth)
-        // Existing routes
         .nest("/api/auth", routes::auth::auth_routes())
         .nest("/api/games", routes::games::routes())
         .nest("/api/comrades", routes::comrade_route::comrade_routes())
@@ -140,7 +137,6 @@ async fn build_router(app_state: AppState) -> Router {
         .nest("/api/votes", routes::vote_routes::vote_routes())
         .nest("/api/archive", routes::archive::archive_routes())
         .nest("/api/chats", routes::chat::routes())
-        .route("/ws/channel", get(ws_comments_handler))
         .nest("/comments", routes::posts::comment_routes())
         .nest("/api/channels", routes::channel::channel_routes())
         .nest(
@@ -149,7 +145,12 @@ async fn build_router(app_state: AppState) -> Router {
         )
         .nest("/api/profile", routes::user_profile::user_profile_routes())
         .nest("/api", routes::posts::upload_routes())
-        .layer(cors)
+        .layer(cors);
+
+    // WS route outside CORS — no header interference
+    Router::new()
+        .route("/ws/channel", get(ws_comments_handler))
+        .merge(api_routes)
         .with_state(app_state)
 }
 
