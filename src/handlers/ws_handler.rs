@@ -58,6 +58,9 @@ pub async fn ws_comments_handler(
         handle_socket(socket, channel_id, fixture_id, user_id, username, state)
     })
 }
+pub async fn ws_test_handler() -> &'static str {
+    "ws route reachable"
+}
 
 // ============================================================================
 // PARSE ROOM ID

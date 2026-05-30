@@ -1,4 +1,4 @@
-use crate::handlers::ws_handler::ws_comments_handler;
+use crate::handlers::ws_handler::{ws_comments_handler, ws_test_handler};
 use axum::extract::State;
 use axum::{http::Method, response::Json, routing::get, Router};
 use serde_json::{json, Value};
@@ -150,6 +150,7 @@ async fn build_router(app_state: AppState) -> Router {
     // WS route outside CORS — no header interference
     Router::new()
         .route("/ws/channel", get(ws_comments_handler))
+        .route("/ws/channel/test", get(ws_test_handler))
         .merge(api_routes)
         .with_state(app_state)
 }
