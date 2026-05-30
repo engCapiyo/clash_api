@@ -3,10 +3,10 @@ use axum::{
     Json,
 };
 use mongodb::bson::{doc, DateTime};
-use serde_json::json;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::errors::Result;
+use crate::errors::{AppError, Result};
 use crate::models::channel::{
     Channel, ChannelActivity, ChannelFixture, ChannelMember, Fixture, Message, ReplyToData, Vote,
     VoteCounts,
@@ -137,7 +137,7 @@ pub async fn get_channel_handler(
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await?
-        .ok_or_else(|| crate::errors::AppError::DocumentNotFound)?;
+        .ok_or(AppError::DocumentNotFound)?;
 
     Ok(Json(json!({
         "success": true,
@@ -158,7 +158,7 @@ pub async fn get_channel_leaderboard_handler(
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await?
-        .ok_or_else(|| crate::errors::AppError::DocumentNotFound)?;
+        .ok_or(AppError::DocumentNotFound)?;
 
     let mut members = channel.members;
     members.sort_by(|a, b| b.season_points.cmp(&a.season_points));
@@ -254,7 +254,7 @@ pub async fn initialize_fixture_chat_handler(
     let fixture = fixtures_col
         .find_one(doc! { "fixture_id": &payload.fixture_id })
         .await?
-        .ok_or_else(|| crate::errors::AppError::DocumentNotFound)?;
+        .ok_or(AppError::DocumentNotFound)?;
 
     let new_chat = ChannelFixture {
         id: None,
@@ -314,40 +314,109 @@ pub async fn get_channel_fixtures_handler(
 }
 
 // ============================================================================
-// SEND MESSAGE (REST fallback)
+// SAVE MESSAGE TO DATABASE
 // ============================================================================
 
-pub async fn send_message_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<SendMessageRequest>,
-) -> Result<Json<serde_json::Value>> {
+async fn save_message_to_database(
+    state: &AppState,
+    channel_id: &str,
+    fixture_id: &Option<String>,
+    user_id: &str,
+    username: &str,
+    payload: &Value,
+) -> Result<()> {
+    tracing::info!("💾 save_message_to_database called");
+    tracing::info!("  channel_id: {}", channel_id);
+    tracing::info!("  fixture_id: {:?}", fixture_id);
+    tracing::info!("  user_id: {}", user_id);
+    tracing::info!("  payload: {:?}", payload);
+
     let messages_col = state.db.collection::<Message>("messages");
     let channels_col = state.db.collection::<Channel>("channels");
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
-    let now = DateTime::now();
+
+    let now = bson::DateTime::now();
+
+    let message_text = payload
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let message_id = payload
+        .get("messageId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let selection = payload
+        .get("selection")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let image_url = payload
+        .get("imageUrl")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let video_url = payload
+        .get("videoUrl")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let is_image = payload
+        .get("isImage")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let is_video = payload
+        .get("isVideo")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let reply_to: Option<ReplyToData> = payload
+        .get("replyTo")
+        .and_then(|v| if v.is_null() { None } else { Some(v) })
+        .and_then(|v| match serde_json::from_value(v.clone()) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!("⚠️ Failed to parse replyTo: {}", e);
+                None
+            }
+        });
 
     let message = Message {
         id: None,
-        channel_id: payload.channel_id.clone(),
-        fixture_id: payload.fixture_id.clone(),
-        sender_id: payload.sender_id.clone(),
-        sender_name: payload.sender_name.clone(),
-        text: payload.text.clone(),
+        channel_id: channel_id.to_string(),
+        fixture_id: fixture_id.clone(),
+        sender_id: user_id.to_string(),
+        sender_name: username.to_string(),
+        text: message_text.clone(),
         sent_at: now,
-        message_id: payload.message_id.clone(),
-        selection: payload.selection.clone(),
-        image_url: payload.image_url.clone(),
-        video_url: payload.video_url.clone(),
-        is_image: payload.is_image.unwrap_or(false),
-        is_video: payload.is_video.unwrap_or(false),
-        reply_to: payload.reply_to.clone(),
+        message_id,
+        selection,
+        image_url,
+        video_url,
+        is_image,
+        is_video,
+        reply_to,
     };
 
-    messages_col.insert_one(message).await?;
+    messages_col.insert_one(&message).await.map_err(|e| {
+        tracing::error!("❌ MongoDB insert FAILED: {}", e);
+        AppError::MongoDB(e)
+    })?;
 
-    channels_col
+    tracing::info!(
+        "✅ Message inserted — channel: {}, user: {}",
+        channel_id,
+        user_id
+    );
+
+    // Channel activity — non-fatal, just log
+    if let Err(e) = channels_col
         .update_one(
-            doc! { "channel_id": &payload.channel_id },
+            doc! { "channel_id": channel_id },
             doc! {
                 "$inc": {
                     "activity.total_messages": 1,
@@ -356,37 +425,54 @@ pub async fn send_message_handler(
                 "$set": { "activity.last_message_at": now }
             },
         )
-        .await?;
+        .await
+    {
+        tracing::error!("❌ Channel activity update failed: {}", e);
+    } else {
+        tracing::info!("✅ Channel activity updated");
+    }
 
-    channels_col
+    // Member message count — non-fatal
+    if let Err(e) = channels_col
         .update_one(
             doc! {
-                "channel_id": &payload.channel_id,
-                "members.user_id": &payload.sender_id
+                "channel_id": channel_id,
+                "members.user_id": user_id,
             },
             doc! { "$inc": { "members.$.msg_count": 1 } },
         )
-        .await?;
+        .await
+    {
+        tracing::error!("❌ Member count update failed: {}", e);
+    } else {
+        tracing::info!("✅ Member count updated");
+    }
 
-    if let Some(fixture_id) = &payload.fixture_id {
-        channel_fixtures_col
+    // Fixture last message — non-fatal
+    if let Some(fix_id) = fixture_id {
+        if let Err(e) = channel_fixtures_col
             .update_one(
                 doc! {
-                    "channel_id": &payload.channel_id,
-                    "fixture_id": fixture_id,
+                    "channel_id": channel_id,
+                    "fixture_id": fix_id,
                 },
                 doc! {
                     "$set": {
-                        "last_message": &payload.text,
+                        "last_message": &message_text,
                         "last_message_at": now,
-                        "last_sender": &payload.sender_name,
+                        "last_sender": username,
                     }
                 },
             )
-            .await?;
+            .await
+        {
+            tracing::error!("❌ Fixture last_message update failed: {}", e);
+        } else {
+            tracing::info!("✅ Fixture last_message updated");
+        }
     }
 
-    Ok(Json(json!({ "success": true })))
+    Ok(())
 }
 
 // ============================================================================
@@ -445,6 +531,14 @@ pub async fn get_messages_handler(
 // CAST VOTE
 // ============================================================================
 
+#[derive(Debug, serde::Deserialize)]
+pub struct CastVoteRequest {
+    pub channel_id: String,
+    pub fixture_id: String,
+    pub user_id: String,
+    pub selection: String,
+}
+
 pub async fn cast_vote_handler(
     State(state): State<AppState>,
     Json(payload): Json<CastVoteRequest>,
@@ -462,9 +556,7 @@ pub async fn cast_vote_handler(
         .await?;
 
     if existing.is_some() {
-        return Err(crate::errors::AppError::ValidationError(
-            "Already voted".to_string(),
-        ));
+        return Err(AppError::ValidationError("Already voted".to_string()));
     }
 
     let vote = Vote {
@@ -484,11 +576,7 @@ pub async fn cast_vote_handler(
         "home" => "vote_counts.home",
         "away" => "vote_counts.away",
         "draw" => "vote_counts.draw",
-        _ => {
-            return Err(crate::errors::AppError::ValidationError(
-                "Invalid selection".to_string(),
-            ))
-        }
+        _ => return Err(AppError::ValidationError("Invalid selection".to_string())),
     };
 
     channel_fixtures_col
@@ -507,6 +595,12 @@ pub async fn cast_vote_handler(
 // ============================================================================
 // FINALIZE FIXTURE RESULT
 // ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct FinalizeFixtureRequest {
+    pub fixture_id: String,
+    pub result: String,
+}
 
 pub async fn finalize_fixture_result_handler(
     State(state): State<AppState>,
@@ -593,6 +687,18 @@ pub async fn finalize_fixture_result_handler(
 // ADD MEMBERS TO CHANNEL
 // ============================================================================
 
+#[derive(Debug, serde::Deserialize)]
+pub struct AddMembersRequest {
+    pub channel_id: String,
+    pub members: Vec<NewMember>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct NewMember {
+    pub user_id: String,
+    pub username: String,
+}
+
 pub async fn add_members_to_channel_handler(
     State(state): State<AppState>,
     Json(payload): Json<AddMembersRequest>,
@@ -627,7 +733,7 @@ pub async fn add_members_to_channel_handler(
         .await?;
 
     if result.matched_count == 0 {
-        return Err(crate::errors::AppError::DocumentNotFound);
+        return Err(AppError::DocumentNotFound);
     }
 
     Ok(Json(json!({
@@ -639,6 +745,12 @@ pub async fn add_members_to_channel_handler(
 // ============================================================================
 // LEAVE CHANNEL
 // ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct LeaveChannelRequest {
+    pub channel_id: String,
+    pub user_id: String,
+}
 
 pub async fn leave_channel_handler(
     State(state): State<AppState>,
@@ -661,7 +773,7 @@ pub async fn leave_channel_handler(
         .await?;
 
     if result.matched_count == 0 {
-        return Err(crate::errors::AppError::ValidationError(
+        return Err(AppError::ValidationError(
             "Cannot leave. Either not a member, or you are the admin".to_string(),
         ));
     }
@@ -729,36 +841,4 @@ pub struct SendMessageRequest {
     pub is_image: Option<bool>,
     pub is_video: Option<bool>,
     pub reply_to: Option<ReplyToData>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct CastVoteRequest {
-    pub channel_id: String,
-    pub fixture_id: String,
-    pub user_id: String,
-    pub selection: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct FinalizeFixtureRequest {
-    pub fixture_id: String,
-    pub result: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct AddMembersRequest {
-    pub channel_id: String,
-    pub members: Vec<NewMember>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct NewMember {
-    pub user_id: String,
-    pub username: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct LeaveChannelRequest {
-    pub channel_id: String,
-    pub user_id: String,
 }
