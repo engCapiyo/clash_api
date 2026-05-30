@@ -10,12 +10,8 @@ use crate::handlers::channel::{
     get_user_channels_handler, get_weekly_top_channel_handler, initialize_fixture_chat_handler,
     leave_channel_handler, reset_weekly_messages_handler,
 };
-use crate::handlers::ws_handler::ws_comments_handler;
-use crate::AppState;
 
-pub fn ws_channel_routes() -> Router<AppState> {
-    Router::new().route("/", get(ws_comments_handler))
-}
+use crate::AppState;
 
 pub fn channel_routes() -> Router<AppState> {
     Router::new()

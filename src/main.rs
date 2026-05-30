@@ -1,3 +1,4 @@
+use crate::handlers::ws_handler::ws_comments_handler;
 use axum::extract::State;
 use axum::{http::Method, response::Json, routing::get, Router};
 use serde_json::{json, Value};
@@ -139,7 +140,7 @@ async fn build_router(app_state: AppState) -> Router {
         .nest("/api/votes", routes::vote_routes::vote_routes())
         .nest("/api/archive", routes::archive::archive_routes())
         .nest("/api/chats", routes::chat::routes())
-        .nest("/ws/channel", routes::channel::ws_channel_routes())
+        .route("/ws/channel", get(ws_comments_handler))
         .nest("/comments", routes::posts::comment_routes())
         .nest("/api/channels", routes::channel::channel_routes())
         .nest(
