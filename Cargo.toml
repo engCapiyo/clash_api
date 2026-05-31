@@ -4,17 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [profile.release]
-opt-level = 2          # 3 is too aggressive for Render free tier compilation
-lto = false            # lto = true causes OOM during compilation on free tier
-codegen-units = 4      # 1 causes very slow/OOM compilation; 4 is a safe balance
+opt-level = 2
+lto = false
+codegen-units = 4
 strip = true
-# panic = "abort" REMOVED — this was causing exit code 134 on any panic/unwrap
 
 [dependencies]
 
 # Web Framework
 axum = { version = "0.7", features = ["macros", "ws"] }
-
 tokio = { version = "1.0", features = ["full"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
@@ -23,7 +21,7 @@ lazy_static = "1.4"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_with = "3.8"
+serde_with = "=3.8.3"
 
 # Authentication & Security
 chrono = { version = "0.4", features = ["serde"] }
@@ -39,7 +37,7 @@ bytes = "1.0"
 mime = "0.3"
 axum-extra = { version = "0.9", features = ["multipart"] }
 futures-util = "0.3"
-thiserror = "1.0"
+thiserror = "=1.0.69"
 anyhow = "1.0.100"
 reqwest = { version = "0.11", features = ["json", "multipart"] }
 base64 = "0.21"
@@ -47,13 +45,12 @@ md5 = "0.7"
 infer = "0.13"
 
 # Database
-mongodb = "3.4.1"
+mongodb = "=3.4.1"
 bson = { version = "2.8", features = ["chrono-0_4"] }
 validator = { version = "0.18", features = ["derive"] }
 futures = "0.3"
 async-trait = "0.1"
 tokio-tungstenite = "0.21"
-
 dashmap = "5"
 
 # Redis
@@ -64,10 +61,10 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 # OAuth2 / FCM
-yup-oauth2 = "8.0"
+yup-oauth2 = "=8.3.2"
 hyper = { version = "0.14", features = ["full"] }
 hyper-rustls = "0.24"
-rs-firebase-admin-sdk = "2.4.0"
+rs-firebase-admin-sdk = "=2.4.0"
 
 # Misc
 dotenvy = "0.15"
