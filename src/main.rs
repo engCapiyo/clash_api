@@ -1,4 +1,4 @@
-use crate::handlers::ws_handler::{ws_comments_handler, ws_test_handler,ws_debug_handler};
+
 use axum::extract::State;
 use axum::{http::Method, response::Json, routing::get, Router};
 use serde_json::{json, Value};
@@ -121,7 +121,7 @@ async fn build_router(app_state: AppState) -> Router {
         .allow_headers(Any)
         .allow_credentials(false);
 
-    let api_routes = Router::new()
+    Router::new()
         .route("/", get(root_handler))
         .route("/health", get(health_check))
         .route("/api/health", get(api_health_check))
@@ -131,28 +131,20 @@ async fn build_router(app_state: AppState) -> Router {
         .nest("/api/games", routes::games::routes())
         .nest("/api/comrades", routes::comrade_route::comrade_routes())
         .nest("/api/posts", routes::posts::routes())
-        .route("/ws/debug", get(ws_debug_handler))
         .nest("/api/bets", routes::bets::bets_routes())
         .nest("/api/pledges", routes::pledges::routes())
         .nest("/api/lipaclash", routes::mpesa::mpesa_routes())
         .nest("/api/votes", routes::vote_routes::vote_routes())
         .nest("/api/archive", routes::archive::archive_routes())
         .nest("/api/chats", routes::chat::routes())
+        .nest("/ws", routes::vote_routes::ws_routes())
+        .nest("/ws/channel", routes::channel::ws_channel_routes())
         .nest("/comments", routes::posts::comment_routes())
         .nest("/api/channels", routes::channel::channel_routes())
-        .nest(
-            "/api/notifications",
-            routes::vote_routes::notification_routes(),
-        )
+        .nest("/api/notifications", routes::vote_routes::notification_routes())
         .nest("/api/profile", routes::user_profile::user_profile_routes())
         .nest("/api", routes::posts::upload_routes())
-        .layer(cors);
-
-    // WS route outside CORS — no header interference
-    Router::new()
-        .route("/ws/channel", get(ws_comments_handler))
-        .route("/ws/channel/test", get(ws_test_handler))
-        .merge(api_routes)
+        .layer(cors)
         .with_state(app_state)
 }
 
