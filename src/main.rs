@@ -1,4 +1,4 @@
-use crate::handlers::ws_handler::{ws_comments_handler, ws_test_handler};
+use crate::handlers::ws_handler::{ws_comments_handler, ws_test_handler,ws_debug_handler};
 use axum::extract::State;
 use axum::{http::Method, response::Json, routing::get, Router};
 use serde_json::{json, Value};
@@ -131,6 +131,7 @@ async fn build_router(app_state: AppState) -> Router {
         .nest("/api/games", routes::games::routes())
         .nest("/api/comrades", routes::comrade_route::comrade_routes())
         .nest("/api/posts", routes::posts::routes())
+        .route("/ws/debug", get(ws_debug_handler))
         .nest("/api/bets", routes::bets::bets_routes())
         .nest("/api/pledges", routes::pledges::routes())
         .nest("/api/lipaclash", routes::mpesa::mpesa_routes())

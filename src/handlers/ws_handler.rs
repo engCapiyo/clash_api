@@ -61,6 +61,14 @@ pub async fn ws_comments_handler(
 pub async fn ws_test_handler() -> &'static str {
     "ws route reachable"
 }
+pub async fn ws_debug_handler(
+    headers: axum::http::HeaderMap,
+) -> impl axum::response::IntoResponse {
+    for (key, value) in headers.iter() {
+        tracing::info!("📋 Header: {} = {:?}", key, value);
+    }
+    "debug"
+}
 
 // ============================================================================
 // PARSE ROOM ID
