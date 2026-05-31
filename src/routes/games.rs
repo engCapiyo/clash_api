@@ -19,6 +19,7 @@ pub fn routes() -> Router<AppState> {
         .route("/match/:match_id", get(games::get_game_by_match_id))
         .route("/:match_id/score", put(games::update_game_score))
         .route("/:match_id/status", put(games::update_game_status))
+        .route("/:match_id/goal", post(games::add_goal_event))
         .route("/history", get(games::get_history_games))
         .route(
             "/history/:match_id",

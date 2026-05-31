@@ -8,8 +8,8 @@ use crate::services::cloudinary::CloudinaryService;
 use crate::services::fcm_service::FCMService;
 use crate::services::mpesa_service::MpesaService;
 
-/// One broadcast channel per fixtureId.
-/// Key = fixtureId, Value = sender half of the channel.
+/// One broadcast channel per room key.
+/// Key format: "{channel_id}_{fixture_id}" or "{channel_id}_overall"
 pub type CommentBroadcaster = Arc<DashMap<String, broadcast::Sender<String>>>;
 
 #[derive(Clone)]
@@ -18,7 +18,6 @@ pub struct AppState {
     pub mpesa_service: Option<Arc<MpesaService>>,
     pub fcm_service: Option<Arc<FCMService>>,
     pub cloudinary: CloudinaryService,
-    /// Shared in-memory broadcaster — no Redis needed
     pub comment_broadcaster: CommentBroadcaster,
 }
 
@@ -45,15 +44,14 @@ impl AppState {
         self
     }
 
-    /// Get or create a broadcast sender for a given fixtureId.
-    pub fn get_or_create_broadcaster(&self, fixture_id: &str) -> broadcast::Sender<String> {
-        if let Some(tx) = self.comment_broadcaster.get(fixture_id) {
+    /// Get or create a broadcast sender for a given room key.
+    /// Room key format: "{channel_id}_{fixture_id}" or "{channel_id}_overall"
+    pub fn get_or_create_broadcaster(&self, room_key: &str) -> broadcast::Sender<String> {
+        if let Some(tx) = self.comment_broadcaster.get(room_key) {
             return tx.clone();
         }
-        // capacity 64: if a slow client misses messages that's fine
         let (tx, _) = broadcast::channel(64);
-        self.comment_broadcaster
-            .insert(fixture_id.to_string(), tx.clone());
+        self.comment_broadcaster.insert(room_key.to_string(), tx.clone());
         tx
     }
 }

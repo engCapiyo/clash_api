@@ -720,6 +720,10 @@ pub async fn update_game_score(
     Path(match_id): Path<String>,
     Json(payload): Json<UpdateGameScore>,
 ) -> Result<Json<Game>> {
+    use crate::handlers::ws_handler::broadcast_live_match_update;
+    use crate::models::channel::ChannelFixture;
+    use mongodb::Collection;
+
     let collection: Collection<Game> = state.db.collection("games");
     let filter = doc! { "match_id": &match_id };
     let mut update_doc = doc! {};
@@ -744,24 +748,43 @@ pub async fn update_game_score(
     let update_result = collection
         .update_one(filter.clone(), doc! { "$set": update_doc })
         .await?;
+    
     if update_result.matched_count == 0 {
         return Err(AppError::DocumentNotFound);
     }
 
-    // ✅ ADD THIS - Broadcast score update to WebSocket
+    // ✅ Broadcast to ALL channels that have this fixture
     if payload.home_score.is_some() || payload.away_score.is_some() {
-        // First get the updated game to get current scores
         if let Some(game) = collection.find_one(filter.clone()).await? {
+            let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
+            let mut cursor = channel_fixtures_col
+                .find(doc! { "fixture_id": &match_id })
+                .await?;
+
             let score_payload = json!({
                 "fixture_id": match_id,
                 "home_score": game.home_score.unwrap_or(0),
                 "away_score": game.away_score.unwrap_or(0),
                 "minute": game.time_elapsed,
             });
-            broadcast_live_match_update(&state, &match_id, "score", score_payload).await;
+
+            let mut channel_count = 0;
+            while cursor.advance().await? {
+                let cf = cursor.deserialize_current()?;
+                broadcast_live_match_update(
+                    &state, 
+                    &cf.channel_id, 
+                    &match_id, 
+                    "score", 
+                    score_payload.clone()
+                ).await;
+                channel_count += 1;
+            }
+
             tracing::info!(
-                "📡 Broadcasted score update: {} → {}-{}",
+                "📡 Broadcasted score update for {} to {} channels: {}-{}",
                 match_id,
+                channel_count,
                 game.home_score.unwrap_or(0),
                 game.away_score.unwrap_or(0)
             );
@@ -773,11 +796,19 @@ pub async fn update_game_score(
         None => Err(AppError::DocumentNotFound),
     }
 }
+// ============================================================================
+// UPDATE GAME STATUS - Broadcasts to ALL channels with this fixture
+// ============================================================================
+
 pub async fn update_game_status(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
     Json(payload): Json<GameStatusUpdate>,
 ) -> Result<Json<Game>> {
+    use crate::handlers::ws_handler::broadcast_live_match_update;
+    use crate::models::channel::ChannelFixture;
+    use mongodb::Collection;
+
     let collection: Collection<Game> = state.db.collection("games");
 
     let valid_statuses = ["upcoming", "soon", "live", "completed"];
@@ -801,19 +832,140 @@ pub async fn update_game_status(
 
     collection.update_one(filter.clone(), update).await?;
 
-    // ✅ ADD THIS - Broadcast status change to WebSocket
+    // ✅ Broadcast to ALL channels that have this fixture
+    let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
+    let mut cursor = channel_fixtures_col
+        .find(doc! { "fixture_id": &match_id })
+        .await?;
+
     let status_payload = json!({
         "fixture_id": match_id,
         "status": payload.status,
-        "time_elapsed": 0,
+        "is_live": is_live,
+        "available_for_voting": available_for_voting,
     });
 
-    broadcast_live_match_update(&state, &match_id, "status", status_payload).await;
+    let mut channel_count = 0;
+    while cursor.advance().await? {
+        let cf = cursor.deserialize_current()?;
+        broadcast_live_match_update(
+            &state,
+            &cf.channel_id,
+            &match_id,
+            "status",
+            status_payload.clone(),
+        ).await;
+        channel_count += 1;
+    }
+
+    tracing::info!(
+        "📡 Broadcasted status update for {} to {} channels: {}",
+        match_id,
+        channel_count,
+        payload.status
+    );
 
     match collection.find_one(filter).await? {
         Some(game) => Ok(Json(game)),
         None => Err(AppError::DocumentNotFound),
     }
+}
+
+// ============================================================================
+// RECEIVE LIVE UPDATE - From Python Poller, Broadcasts to ALL channels
+// ============================================================================
+
+pub async fn receive_live_update(
+    State(state): State<AppState>,
+    Json(update): Json<LiveGameUpdate>,
+) -> Result<Json<serde_json::Value>> {
+    use crate::handlers::ws_handler::broadcast_live_match_update;
+    use crate::models::channel::ChannelFixture;
+    use mongodb::Collection;
+
+    tracing::info!("🔴 Live update received: {:?}", update);
+
+    let games_col: Collection<Game> = state.db.collection("games");
+    let filter = doc! { "match_id": &update.fixture_id };
+
+    // Determine status based on event_type
+    let (status, is_live, available_for_voting) = match update.event_type.as_str() {
+        "match_end" => ("completed", false, false),
+        "half_time" => ("live", true, false),
+        "second_half" => ("live", true, false),
+        _ => ("live", true, false),
+    };
+
+    let set_doc = doc! {
+        "home_score": update.home_score,
+        "away_score": update.away_score,
+        "time_elapsed": update.minute,
+        "status": status,
+        "is_live": is_live,
+        "available_for_voting": available_for_voting,
+        "scraped_at": BsonDateTime::from_chrono(Utc::now()),
+    };
+
+    games_col
+        .update_one(filter.clone(), doc! { "$set": set_doc })
+        .await?;
+
+    tracing::info!(
+        "✅ Updated {}: {}-{} (status: {}, {}')",
+        update.fixture_id,
+        update.home_score,
+        update.away_score,
+        status,
+        update.minute
+    );
+
+    // ✅ Broadcast to ALL channels that have this fixture
+    let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
+    let mut cursor = channel_fixtures_col
+        .find(doc! { "fixture_id": &update.fixture_id })
+        .await?;
+
+    let update_payload = json!({
+        "fixture_id": update.fixture_id,
+        "event_type": update.event_type,
+        "home_score": update.home_score,
+        "away_score": update.away_score,
+        "minute": update.minute,
+        "minute_display": update.minute_display,
+        "scorer": update.scorer,
+        "player": update.player,
+        "assist": update.assist,
+        "team": update.team,
+    });
+
+    let mut channel_count = 0;
+    while cursor.advance().await? {
+        let cf = cursor.deserialize_current()?;
+        broadcast_live_match_update(
+            &state,
+            &cf.channel_id,
+            &update.fixture_id,
+            &update.event_type,
+            update_payload.clone(),
+        ).await;
+        channel_count += 1;
+    }
+
+    tracing::info!(
+        "📡 Broadcasted {} event for {} to {} channels",
+        update.event_type,
+        update.fixture_id,
+        channel_count
+    );
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Live update processed and broadcasted",
+        "fixture_id": update.fixture_id,
+        "event_type": update.event_type,
+        "status": status,
+        "channels_notified": channel_count,
+    })))
 }
 // ============================================================================
 // FAST COUNT HANDLERS
@@ -1066,63 +1218,7 @@ pub async fn add_commentary(
         "message": "Commentary added"
     })))
 }
-pub async fn receive_live_update(
-    State(state): State<AppState>,
-    Json(update): Json<LiveGameUpdate>,
-) -> Result<Json<serde_json::Value>> {
-    tracing::info!("🔴 Live update received: {:?}", update);
 
-    let games_col: Collection<Game> = state.db.collection("games");
-    let filter = doc! { "match_id": &update.fixture_id };
-
-    // Determine status based on event_type
-    let (status, is_live, available_for_voting) = match update.event_type.as_str() {
-        "match_end" => ("completed", false, false),
-        "half_time" => ("live", true, false),
-        "second_half" => ("live", true, false),
-        _ => ("live", true, false),
-    };
-
-    let set_doc = doc! {
-        "home_score": update.home_score,
-        "away_score": update.away_score,
-        "time_elapsed": update.minute,
-        "status": status,
-        "is_live": is_live,
-        "available_for_voting": available_for_voting,
-        "scraped_at": BsonDateTime::from_chrono(Utc::now()),
-    };
-
-    games_col
-        .update_one(filter, doc! { "$set": set_doc })
-        .await?;
-
-    tracing::info!(
-        "✅ Updated {}: {}-{} (status: {}, {}')",
-        update.fixture_id,
-        update.home_score,
-        update.away_score,
-        status,
-        update.minute
-    );
-
-    // Broadcast to WebSocket
-    broadcast_live_match_update(
-        &state,
-        &update.fixture_id,
-        &update.event_type,
-        json!(update),
-    )
-    .await;
-
-    Ok(Json(json!({
-        "success": true,
-        "message": "Live update processed",
-        "fixture_id": update.fixture_id,
-        "event_type": update.event_type,
-        "status": status,
-    })))
-}
 
 pub async fn get_match_commentary(
     State(state): State<AppState>,

@@ -30,6 +30,32 @@ pub struct WsQuery {
 }
 
 // ============================================================================
+// BROADCAST FUNCTION
+// ============================================================================
+
+pub async fn broadcast_live_match_update(
+    state: &AppState,
+    channel_id: &str,
+    fixture_id: &str,
+    event_type: &str,
+    data: serde_json::Value,
+) {
+    let room_key = format!("{}_{}", channel_id, fixture_id);
+    let tx = state.get_or_create_broadcaster(&room_key);
+
+    let ws_message = serde_json::json!({
+        "type": event_type,
+        "payload": data,
+        "timestamp": Utc::now().to_rfc3339(),
+    });
+
+    if let Ok(json) = serde_json::to_string(&ws_message) {
+        let _ = tx.send(json);
+        tracing::info!("📡 Broadcasted {} event to room {}", event_type, room_key);
+    }
+}
+
+// ============================================================================
 // UPGRADE HANDLER
 // ============================================================================
 
@@ -39,7 +65,7 @@ pub async fn ws_comments_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let user_id = params.user_id.clone();
-    let username = params.username.clone();
+    let username = params.username.clone().unwrap_or_else(|| "Anonymous".to_string());
     let channel_id = params.channel_id.clone();
     let fixture_id = if params.fixture_id.as_deref() == Some("") {
         None
@@ -58,37 +84,6 @@ pub async fn ws_comments_handler(
         handle_socket(socket, channel_id, fixture_id, user_id, username, state)
     })
 }
-pub async fn ws_test_handler() -> &'static str {
-    "ws route reachable"
-}
-pub async fn ws_debug_handler(
-    headers: axum::http::HeaderMap,
-) -> impl axum::response::IntoResponse {
-    for (key, value) in headers.iter() {
-        tracing::info!("📋 Header: {} = {:?}", key, value);
-    }
-    "debug"
-}
-
-// ============================================================================
-// PARSE ROOM ID
-// ============================================================================
-
-fn parse_room_id(room_id: &str) -> (String, Option<String>) {
-    if room_id.ends_with("_overall") {
-        let channel_id = room_id.trim_end_matches("_overall").to_string();
-        (channel_id, None)
-    } else {
-        let parts: Vec<&str> = room_id.split('_').collect();
-        if parts.len() >= 2 {
-            let channel_id = parts[0].to_string();
-            let fixture_id = Some(parts[1..].join("_"));
-            (channel_id, fixture_id)
-        } else {
-            (room_id.to_string(), None)
-        }
-    }
-}
 
 // ============================================================================
 // PER-CONNECTION LOGIC
@@ -99,25 +94,20 @@ async fn handle_socket(
     channel_id: String,
     fixture_id: Option<String>,
     user_id: String,
-    username: Option<String>,
+    username: String,
     state: AppState,
 ) {
-    let username = username.unwrap_or_else(|| "Anonymous".to_string());
-
-    // Build a display room string just for logging
-    let room_display = match &fixture_id {
+    // Build room key
+    let room_key = match &fixture_id {
         Some(f) => format!("{}_{}", channel_id, f),
         None => format!("{}_overall", channel_id),
     };
 
-    // Use channel_id as broadcaster key
-    let broadcaster_key = room_display.clone();
-    let tx = state.get_or_create_broadcaster(&broadcaster_key);
+    let tx = state.get_or_create_broadcaster(&room_key);
     let mut rx = tx.subscribe();
 
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(Mutex::new(sender));
-    let sender_clone = sender.clone();
 
     // Welcome message
     let welcome = serde_json::json!({
@@ -129,22 +119,18 @@ async fn handle_socket(
 
     if let Ok(welcome_json) = serde_json::to_string(&welcome) {
         let mut sender_guard = sender.lock().await;
-        if sender_guard
-            .send(WsMessage::Text(welcome_json))
-            .await
-            .is_err()
-        {
+        if sender_guard.send(WsMessage::Text(welcome_json)).await.is_err() {
             return;
         }
     }
 
     tracing::info!(
-        "✅ WS connected: user {} to channel {} fixture {:?}",
+        "✅ WS connected: user {} to room {}",
         user_id,
-        channel_id,
-        fixture_id
+        room_key
     );
 
+    let sender_clone = sender.clone();
     let channel_id_clone = channel_id.clone();
     let fixture_id_clone = fixture_id.clone();
     let user_id_clone = user_id.clone();
@@ -209,11 +195,12 @@ async fn handle_socket(
     }
 
     tracing::info!(
-        "🔌 WS disconnected: user {} from channel {}",
+        "🔌 WS disconnected: user {} from room {}",
         user_id,
-        channel_id
+        room_key
     );
 }
+
 // ============================================================================
 // HANDLE INCOMING MESSAGE
 // ============================================================================
@@ -228,18 +215,9 @@ async fn handle_incoming_message(
     broadcaster: &tokio::sync::broadcast::Sender<String>,
 ) {
     tracing::info!("🔥 RAW WS MESSAGE: {}", text);
-    tracing::info!(
-        "🔥 channel_id: {}, fixture_id: {:?}, user_id: {}",
-        channel_id,
-        fixture_id,
-        user_id
-    );
 
     let json_msg = match serde_json::from_str::<Value>(&text) {
-        Ok(v) => {
-            tracing::info!("✅ JSON parsed: {:?}", v);
-            v
-        }
+        Ok(v) => v,
         Err(e) => {
             tracing::error!("❌ JSON PARSE FAILED: {} | raw: {}", e, text);
             return;
@@ -247,17 +225,13 @@ async fn handle_incoming_message(
     };
 
     let message_type = json_msg.get("type").and_then(|t| t.as_str());
-    tracing::info!("🔥 message_type: {:?}", message_type);
 
     match message_type {
         Some("chat.message") => {
             tracing::info!("✅ Matched chat.message");
 
             let payload = match json_msg.get("payload") {
-                Some(p) => {
-                    tracing::info!("✅ Payload: {:?}", p);
-                    p.clone()
-                }
+                Some(p) => p.clone(),
                 None => {
                     tracing::error!("❌ NO PAYLOAD in: {:?}", json_msg);
                     return;
@@ -285,16 +259,15 @@ async fn handle_incoming_message(
             });
 
             match serde_json::to_string(&broadcast_msg) {
-                Ok(broadcast_json) => match broadcaster.send(broadcast_json) {
-                    Ok(n) => tracing::info!("📡 Broadcasted to {} receivers", n),
-                    Err(e) => tracing::error!("❌ Broadcast FAILED: {}", e),
-                },
+                Ok(broadcast_json) => {
+                    let _ = broadcaster.send(broadcast_json);
+                    tracing::info!("📡 Broadcasted to room");
+                }
                 Err(e) => tracing::error!("❌ Serialize FAILED: {}", e),
             }
         }
 
         Some("typing") => {
-            tracing::info!("✅ Matched typing");
             if let Some(payload) = json_msg.get("payload") {
                 let broadcast_msg = serde_json::json!({
                     "type": "typing",
@@ -307,16 +280,7 @@ async fn handle_incoming_message(
             }
         }
 
-        Some("room.join") => {
-            tracing::info!("👋 User {} joined channel {}", user_id, channel_id);
-        }
-
-        Some("room.leave") => {
-            tracing::info!("👋 User {} left channel {}", user_id, channel_id);
-        }
-
         Some("ping") => {
-            tracing::info!("🏓 Ping from {}", user_id);
             let pong = serde_json::json!({
                 "type": "pong",
                 "timestamp": Utc::now().to_rfc3339(),
@@ -326,11 +290,12 @@ async fn handle_incoming_message(
             }
         }
 
-        other => {
-            tracing::warn!("⚠️ UNMATCHED type: {:?} | full: {}", other, text);
+        _ => {
+            tracing::warn!("⚠️ UNMATCHED type: {:?}", message_type);
         }
     }
 }
+
 // ============================================================================
 // SAVE MESSAGE TO DATABASE
 // ============================================================================
@@ -344,8 +309,6 @@ async fn save_message_to_database(
     payload: &Value,
 ) -> Result<(), String> {
     let messages_col = state.db.collection::<Message>("messages");
-    let channels_col = state.db.collection::<Channel>("channels");
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
     let now = BsonDateTime::now();
 
@@ -397,7 +360,7 @@ async fn save_message_to_database(
         fixture_id: fixture_id.clone(),
         sender_id: user_id.to_string(),
         sender_name: username.to_string(),
-        text: message_text.clone(),
+        text: message_text,
         sent_at: now,
         message_id,
         selection,
@@ -420,80 +383,5 @@ async fn save_message_to_database(
         fixture_id
     );
 
-    // Update channel activity
-    channels_col
-        .update_one(
-            doc! { "channel_id": channel_id },
-            doc! {
-                "$inc": {
-                    "activity.total_messages": 1,
-                    "activity.messages_this_week": 1,
-                },
-                "$set": { "activity.last_message_at": now }
-            },
-        )
-        .await
-        .map_err(|e| format!("Failed to update channel activity: {}", e))?;
-
-    // Update member message count
-    channels_col
-        .update_one(
-            doc! {
-                "channel_id": channel_id,
-                "members.user_id": user_id,
-            },
-            doc! { "$inc": { "members.$.msg_count": 1 } },
-        )
-        .await
-        .map_err(|e| format!("Failed to update member count: {}", e))?;
-
-    // Update fixture last message if applicable
-    if let Some(fix_id) = fixture_id {
-        channel_fixtures_col
-            .update_one(
-                doc! {
-                    "channel_id": channel_id,
-                    "fixture_id": fix_id,
-                },
-                doc! {
-                    "$set": {
-                        "last_message": &message_text,
-                        "last_message_at": now,
-                        "last_sender": username,
-                    }
-                },
-            )
-            .await
-            .map_err(|e| format!("Failed to update fixture last message: {}", e))?;
-    }
-
     Ok(())
-}
-
-// ============================================================================
-// BROADCAST HELPER
-// ============================================================================
-
-pub async fn broadcast_live_match_update(
-    state: &AppState,
-    fixture_id: &str,
-    event_type: &str,
-    data: serde_json::Value,
-) {
-    let tx = state.get_or_create_broadcaster(fixture_id);
-
-    let ws_message = serde_json::json!({
-        "type": event_type,
-        "payload": data,
-        "timestamp": Utc::now().to_rfc3339(),
-    });
-
-    if let Ok(json) = serde_json::to_string(&ws_message) {
-        let _ = tx.send(json);
-        tracing::info!(
-            "📡 Broadcasted {} event for fixture {}",
-            event_type,
-            fixture_id
-        );
-    }
 }
