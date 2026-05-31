@@ -149,7 +149,7 @@ async fn build_router(app_state: AppState) -> Router {
 
     // WS route outside CORS — no header interference
     Router::new()
-        .route("/wss/channel", get(ws_comments_handler))
+        .route("/ws/channel", get(ws_comments_handler))
         .route("/ws/channel/test", get(ws_test_handler))
         .merge(api_routes)
         .with_state(app_state)

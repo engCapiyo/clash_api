@@ -45,7 +45,7 @@ md5 = "0.7"
 infer = "0.13"
 
 # Database
-mongodb = "=3.4.1"
+mongodb = { version = "=3.4.1", features = [] }
 bson = { version = "2.8", features = ["chrono-0_4"] }
 validator = { version = "0.18", features = ["derive"] }
 futures = "0.3"
@@ -71,3 +71,12 @@ dotenvy = "0.15"
 dotenv = "0.15"
 headers = "0.3"
 rand = "0.8"
+[dependencies.mongodb-internal-macros]
+version = "=3.4.1"
+
+[patch.crates-io]
+time = { version = "=0.3.36" }
+time-core = { version = "=0.1.2" }
+time-macros = { version = "=0.2.18" }
+
+
