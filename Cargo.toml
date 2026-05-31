@@ -21,7 +21,7 @@ lazy_static = "1.4"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_with = "=3.8.3"
+serde_with = "3.8"
 
 # Authentication & Security
 chrono = { version = "0.4", features = ["serde"] }
@@ -37,7 +37,7 @@ bytes = "1.0"
 mime = "0.3"
 axum-extra = { version = "0.9", features = ["multipart"] }
 futures-util = "0.3"
-thiserror = "=1.0.69"
+thiserror = "1.0"
 anyhow = "1.0.100"
 reqwest = { version = "0.11", features = ["json", "multipart"] }
 base64 = "0.21"
@@ -45,7 +45,7 @@ md5 = "0.7"
 infer = "0.13"
 
 # Database
-mongodb = { version = "=3.4.1", features = [] }
+mongodb = "=3.4.1"
 bson = { version = "2.8", features = ["chrono-0_4"] }
 validator = { version = "0.18", features = ["derive"] }
 futures = "0.3"
@@ -71,12 +71,3 @@ dotenvy = "0.15"
 dotenv = "0.15"
 headers = "0.3"
 rand = "0.8"
-[dependencies.mongodb-internal-macros]
-version = "=3.4.1"
-
-[patch.crates-io]
-time = { version = "=0.3.36" }
-time-core = { version = "=0.1.2" }
-time-macros = { version = "=0.2.18" }
-
-
