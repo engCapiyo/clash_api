@@ -65,6 +65,7 @@ pub async fn register(
         balance: 0.0,
         created_at: now,
         updated_at: now,
+         is_admin: false,
     };
 
     let result = collection.insert_one(&user).await;
@@ -79,6 +80,8 @@ pub async fn register(
                 username: payload.username,
                 phone: payload.phone,
                 balance: 0.0,
+                 is_admin: false,
+
             };
 
             let token = generate_token(&user_response.id, &user_response.username, &user_response.phone);
@@ -121,6 +124,7 @@ pub async fn get_user_by_phone(
                 username: user.username,
                 phone: user.phone,
                 balance: user.balance,
+                 is_admin: user.is_admin,
             };
             
             let token = generate_token(&user_response.id, &user_response.username, &user_response.phone);
@@ -172,6 +176,7 @@ pub async fn get_user_by_username(
                 username: user.username,
                 phone: user.phone,
                 balance: user.balance,
+                 is_admin: user.is_admin,
             };
             
             (
@@ -236,6 +241,7 @@ pub async fn get_all_users(
                         username: user.username,
                         phone: user.phone,
                         balance: user.balance,
+                         is_admin: user.is_admin,
                     })
                 })
                 .collect();

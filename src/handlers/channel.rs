@@ -22,9 +22,11 @@ pub async fn create_channel_handler(
     Json(payload): Json<CreateChannelRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
+    let users_col = state.db.collection::<User>("users");
     let now = DateTime::now();
     let channel_id = Uuid::new_v4().to_string();
 
+    // Build members list with creator as admin
     let mut members = vec![ChannelMember {
         user_id: payload.created_by.clone(),
         username: payload.created_by_username.clone(),
@@ -36,26 +38,30 @@ pub async fn create_channel_handler(
         msg_count: 0,
     }];
 
-    for m in payload.members.unwrap_or_default() {
-        members.push(ChannelMember {
-            user_id: m.user_id,
-            username: m.username,
-            role: "member".to_string(),
-            joined_at: now,
-            season_points: 0,
-            correct_votes: 0,
-            total_votes: 0,
-            msg_count: 0,
-        });
+    // Add additional members
+    if let Some(extra_members) = &payload.members {
+        for m in extra_members {
+            members.push(ChannelMember {
+                user_id: m.user_id.clone(),
+                username: m.username.clone(),
+                role: "member".to_string(),
+                joined_at: now,
+                season_points: 0,
+                correct_votes: 0,
+                total_votes: 0,
+                msg_count: 0,
+            });
+        }
     }
 
     let member_count = members.len() as i32;
 
+    // Create channel document
     let channel = Channel {
         id: None,
         channel_id: channel_id.clone(),
         name: payload.name,
-        created_by: payload.created_by,
+        created_by: payload.created_by.clone(),
         created_at: now,
         members,
         activity: ChannelActivity {
@@ -68,7 +74,18 @@ pub async fn create_channel_handler(
         member_count,
     };
 
+    // Insert channel
     channels_col.insert_one(channel).await?;
+
+    // Update user's is_admin field to true
+    if let Ok(user_obj_id) = ObjectId::parse_str(&payload.created_by) {
+        users_col
+            .update_one(
+                doc! { "_id": user_obj_id },
+                doc! { "$set": { "is_admin": true } },
+            )
+            .await?;
+    }
 
     Ok(Json(json!({
         "success": true,

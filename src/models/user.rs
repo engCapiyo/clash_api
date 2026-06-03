@@ -10,7 +10,10 @@ pub struct User {
     pub balance: f64,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+    pub is_admin: bool,
 }
+
+
 
 #[derive(Debug, Deserialize)]
 pub struct CreateUserRequest {
@@ -24,6 +27,7 @@ pub struct UserResponse {
     pub username: String,
     pub phone: String,
     pub balance: f64,
+     pub is_admin: bool,
 }
 
 #[derive(Debug, Serialize)]
