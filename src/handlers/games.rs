@@ -991,6 +991,8 @@ pub async fn get_fixture_vote_count_fast(
     })))
 }
 
+
+
 pub async fn get_fixture_comment_count_fast(
     State(state): State<AppState>,
     Path(fixture_id): Path<String>,
