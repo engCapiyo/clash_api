@@ -1,3 +1,4 @@
+use crate::models::user::User;
 use axum::{
     extract::{Path, Query, State},
     Json,
@@ -5,7 +6,7 @@ use axum::{
 use mongodb::bson::{doc, DateTime};
 use serde_json::{json, Value};
 use uuid::Uuid;
-use crate::models::user::User;
+
 use bson::oid::ObjectId;
 
 use crate::errors::{AppError, Result};
@@ -113,11 +114,32 @@ pub async fn get_user_channels_handler(
         channels.push(cursor.deserialize_current()?);
     }
 
-    let count = channels.len();
+    // ✅ Transform to include is_admin while keeping all original data
+    let transformed_channels: Vec<serde_json::Value> = channels
+        .into_iter()
+        .map(|channel| {
+            let is_admin = channel
+                .members
+                .iter()
+                .any(|member| member.user_id == user_id && member.role == "admin");
+
+            // Convert channel to JSON value first
+            let mut channel_json = serde_json::to_value(channel).unwrap_or(json!({}));
+
+            // Add is_admin field to the existing object
+            if let Some(obj) = channel_json.as_object_mut() {
+                obj.insert("is_admin".to_string(), json!(is_admin));
+            }
+
+            channel_json
+        })
+        .collect();
+
+    let count = transformed_channels.len();
 
     Ok(Json(json!({
         "success": true,
-        "channels": channels,
+        "channels": transformed_channels,
         "count": count,
     })))
 }
