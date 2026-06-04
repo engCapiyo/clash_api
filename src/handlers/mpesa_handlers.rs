@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{error, info, warn};
 
-use crate::models::transaction::Transaction;
+use crate::models::transaction::{MpesaTransaction, Transaction};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -73,58 +73,50 @@ pub struct CallbackItem {
     pub value: serde_json::Value,
 }
 
+// Helper: current time as an RFC3339 String
+fn now_str() -> String {
+    Utc::now().to_rfc3339()
+}
+
 pub async fn mpesa_validation(
     Json(_payload): Json<serde_json::Value>,
 ) -> AxumJson<serde_json::Value> {
-    println!("✅✅✅ [VALIDATION] Received from Safaricom");
-    println!("✅✅✅ [VALIDATION] Auto-approving transaction");
-
-    AxumJson(json!({
-        "ResultCode": 0,
-        "ResultDesc": "Success"
-    }))
+    println!("✅ [VALIDATION] Received from Safaricom — auto-approving");
+    AxumJson(json!({ "ResultCode": 0, "ResultDesc": "Success" }))
 }
 
 pub async fn initiate_stk_push(
     State(state): State<AppState>,
     Json(request): Json<StkPushRequest>,
 ) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
-    println!("🔵 [STK] === INITIATING STK PUSH ===");
-    println!("📱 Phone: {}", request.phone_number);
-    println!("💰 Amount: {}", request.amount);
+    println!(
+        "🔵 [STK] Initiating STK push — phone: {}, amount: {}",
+        request.phone_number, request.amount
+    );
 
     if request.phone_number.is_empty() || request.amount.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            AxumJson(json!({
-                "success": false,
-                "error": "Phone number and amount are required"
-            })),
+            AxumJson(json!({ "success": false, "error": "Phone number and amount are required" })),
         ));
     }
 
     let amount: f64 = match request.amount.parse() {
-        Ok(amount) if amount > 0.0 => amount,
+        Ok(a) if a > 0.0 => a,
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                AxumJson(json!({
-                    "success": false,
-                    "error": "Amount must be greater than 0"
-                })),
+                AxumJson(json!({ "success": false, "error": "Amount must be greater than 0" })),
             ));
         }
     };
 
     let mpesa_service = match &state.mpesa_service {
-        Some(service) => service,
+        Some(s) => s,
         None => {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                AxumJson(json!({
-                    "success": false,
-                    "error": "M-Pesa service is not available"
-                })),
+                AxumJson(json!({ "success": false, "error": "M-Pesa service is not available" })),
             ));
         }
     };
@@ -138,18 +130,16 @@ pub async fn initiate_stk_push(
         )
         .await
     {
-        Ok(resp) => resp,
+        Ok(r) => r,
         Err(e) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                AxumJson(json!({
-                    "success": false,
-                    "error": e.to_string()
-                })),
+                AxumJson(json!({ "success": false, "error": e.to_string() })),
             ));
         }
     };
 
+    let now = now_str();
     let transaction = Transaction {
         id: None,
         user_id: request
@@ -166,10 +156,9 @@ pub async fn initiate_stk_push(
         status: "pending".to_string(),
         result_code: None,
         result_desc: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
+        created_at: now.clone(),
+        updated_at: now,
         completed_at: None,
-        mpesa_receipt: None,
     };
 
     let collection: Collection<Transaction> = state.db.collection("transactions");
@@ -177,7 +166,8 @@ pub async fn initiate_stk_push(
         println!("⚠️ Failed to save transaction: {}", e);
     }
 
-    let api_response = json!({
+    println!("✅ [STK] Push initiated successfully");
+    Ok(AxumJson(json!({
         "success": true,
         "CheckoutRequestID": response.checkout_request_id,
         "checkout_request_id": response.checkout_request_id,
@@ -185,119 +175,148 @@ pub async fn initiate_stk_push(
         "response_code": response.response_code,
         "response_description": response.response_description,
         "customer_message": response.customer_message,
-    });
-
-    println!("✅ [STK] STK Push initiated successfully");
-    Ok(AxumJson(api_response))
+    })))
 }
 
 pub async fn mpesa_confirmation(
     State(state): State<AppState>,
     Json(payload): Json<MpesaCallback>,
 ) -> AxumJson<serde_json::Value> {
-    println!("🎯 [CALLBACK RECEIVED] ==================================");
-    println!("🎯 Timestamp: {}", Utc::now().to_rfc3339());
-    
+    println!("🎯 [CALLBACK] Received at {}", now_str());
+
     let callback = payload.Body.stk_callback;
     let checkout_id = callback.checkout_request_id.clone();
-    
-    println!("🎯 CheckoutRequestID: {}", checkout_id);
-    println!("🎯 ResultCode: {}", callback.result_code);
-    println!("🎯 ResultDesc: {}", callback.result_desc);
-    println!("🎯 ======================================================");
+
+    println!("🎯 CheckoutRequestID : {}", checkout_id);
+    println!("🎯 ResultCode        : {}", callback.result_code);
+    println!("🎯 ResultDesc        : {}", callback.result_desc);
 
     info!("Received M-Pesa callback for: {}", checkout_id);
 
     if callback.merchant_request_id.is_empty() || callback.checkout_request_id.is_empty() {
         error!("Invalid callback: missing required fields");
-        return AxumJson(json!({
-            "ResultCode": 1,
-            "ResultDesc": "Invalid callback data"
-        }));
+        return AxumJson(json!({ "ResultCode": 1, "ResultDesc": "Invalid callback data" }));
     }
 
-    let collection: Collection<Transaction> = state.db.collection("transactions");
+    let transactions: Collection<Transaction> = state.db.collection("transactions");
+    let mpesa_transactions: Collection<MpesaTransaction> =
+        state.db.collection("mpesa_transactions");
+
     let filter = doc! { "checkout_request_id": &checkout_id };
 
-    match collection.find_one(filter).await {
+    match transactions.find_one(filter).await {
         Ok(Some(transaction)) => {
             println!("✅ Found transaction in database");
-            
-            // Extract amount and receipt from metadata
-            let mut amount = 0.0;
-            let mut mpesa_receipt = None;
-            
+
+            let mut mpesa_receipt_number: Option<String> = None;
+            let mut paid_amount: Option<f64> = None;
+            let mut transaction_date: Option<String> = None;
+            let mut paying_phone: Option<String> = None;
+
             if let Some(metadata) = &callback.callback_metadata {
                 for item in &metadata.items {
                     match item.name.as_str() {
                         "Amount" => {
-                            if let serde_json::Value::Number(num) = &item.value {
-                                amount = num.as_f64().unwrap_or(0.0);
-                                println!("💰 Amount from callback: Ksh {}", amount);
+                            if let serde_json::Value::Number(n) = &item.value {
+                                paid_amount = n.as_f64();
+                                println!("💰 Amount: Ksh {}", paid_amount.unwrap_or(0.0));
                             }
                         }
                         "MpesaReceiptNumber" => {
-                            if let serde_json::Value::String(receipt) = &item.value {
-                                mpesa_receipt = Some(receipt.clone());
-                                println!("🧾 Receipt: {}", receipt);
+                            if let serde_json::Value::String(r) = &item.value {
+                                mpesa_receipt_number = Some(r.clone());
+                                println!("🧾 Receipt: {}", r);
+                            }
+                        }
+                        "TransactionDate" => {
+                            // Safaricom sends this as a number e.g. 20240101120000
+                            transaction_date = Some(item.value.to_string());
+                        }
+                        "PhoneNumber" => {
+                            if let serde_json::Value::Number(n) = &item.value {
+                                paying_phone = Some(n.to_string());
+                            } else if let serde_json::Value::String(s) = &item.value {
+                                paying_phone = Some(s.clone());
                             }
                         }
                         _ => {}
                     }
                 }
             }
-            
+
             let status = if callback.result_code == 0 {
                 "completed"
             } else {
                 "failed"
             };
-            
-            let now = Utc::now();
-            
-            let update = doc! {
-                "$set": {
-                    "status": status,
-                    "result_code": callback.result_code,
-                    "result_desc": &callback.result_desc,
-                    "mpesa_receipt": mpesa_receipt,
-                    "updated_at": now,
-                    "completed_at": now,
-                }
+            let now = now_str();
+
+            // Build the $set doc using only String / primitive values — no DateTime
+            let mut set_doc = doc! {
+                "status": status,
+                "result_code": callback.result_code,
+                "result_desc": &callback.result_desc,
+                "updated_at": &now,
             };
-            
+
+            if callback.result_code == 0 {
+                set_doc.insert("completed_at", &now);
+            }
+
+            let update = doc! { "$set": set_doc };
+
             let id = match &transaction.id {
                 Some(id) => id,
                 None => {
                     error!("Transaction missing _id field!");
-                    return AxumJson(json!({
-                        "ResultCode": 1,
-                        "ResultDesc": "Transaction missing ID field"
-                    }));
+                    return AxumJson(
+                        json!({ "ResultCode": 1, "ResultDesc": "Transaction missing ID" }),
+                    );
                 }
             };
-            
-            match collection.update_one(doc! { "_id": id }, update).await {
-                Ok(result) => {
-                    if result.matched_count > 0 {
-                        println!("✅ SUCCESS: Updated transaction {} to {}", checkout_id, status);
-                        info!("Updated transaction {} to {}", checkout_id, status);
-                        
-                        if callback.result_code == 0 {
-                            println!("🎉 Payment completed successfully!");
-                            info!("💰 Payment successful: Ksh {} for checkout {}", amount, checkout_id);
-                        } else {
-                            println!("❌ Payment failed: {}", callback.result_desc);
-                        }
-                    } else {
-                        println!("⚠️ No document matched the _id!");
-                        error!("Failed to update transaction: no document matched _id");
-                    }
+
+            match transactions.update_one(doc! { "_id": id }, update).await {
+                Ok(r) if r.matched_count > 0 => {
+                    println!("✅ Updated transaction {} → {}", checkout_id, status);
+                    info!("Updated transaction {} to {}", checkout_id, status);
+                }
+                Ok(_) => {
+                    println!("⚠️ No document matched _id");
+                    error!("No document matched _id for transaction update");
                 }
                 Err(e) => {
-                    println!("❌ Database update error: {}", e);
+                    println!("❌ DB update error: {}", e);
                     error!("Failed to update transaction: {}", e);
                 }
+            }
+
+            // If successful, also write a full MpesaTransaction record
+            if callback.result_code == 0 {
+                if let Some(receipt) = mpesa_receipt_number {
+                    let mpesa_tx = MpesaTransaction {
+                        id: None,
+                        paying_phone_number: paying_phone
+                            .unwrap_or_else(|| transaction.phone_number.clone()),
+                        transaction_date: transaction_date.unwrap_or_else(|| now.clone()),
+                        mpesa_receipt_number: receipt,
+                        paid_amount: paid_amount
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| transaction.amount.to_string()),
+                        merchant_request_id: callback.merchant_request_id.clone(),
+                        checkout_request_id: checkout_id.clone(),
+                        created_at: now.clone(),
+                        updated_at: now.clone(),
+                    };
+
+                    if let Err(e) = mpesa_transactions.insert_one(&mpesa_tx).await {
+                        error!("Failed to insert MpesaTransaction record: {}", e);
+                    } else {
+                        println!("🎉 MpesaTransaction record saved");
+                        info!("💰 Payment successful for checkout {}", checkout_id);
+                    }
+                }
+            } else {
+                println!("❌ Payment failed: {}", callback.result_desc);
             }
         }
         Ok(None) => {
@@ -310,73 +329,76 @@ pub async fn mpesa_confirmation(
         }
     }
 
-    println!("📤 Returning success response to Safaricom");
-    println!("🎯 [CALLBACK COMPLETE] =================================");
-
-    AxumJson(json!({
-        "ResultCode": 0,
-        "ResultDesc": "Success"
-    }))
+    println!("📤 Returning success to Safaricom");
+    AxumJson(json!({ "ResultCode": 0, "ResultDesc": "Success" }))
 }
 
 pub async fn check_payment_status(
     State(state): State<AppState>,
     Json(request): Json<StatusRequest>,
 ) -> (StatusCode, AxumJson<serde_json::Value>) {
-    println!("🔍 Checking payment status for: {}", request.checkout_request_id);
+    println!("🔍 Checking status for: {}", request.checkout_request_id);
 
     let collection: Collection<Transaction> = state.db.collection("transactions");
     let filter = doc! { "checkout_request_id": &request.checkout_request_id };
 
     match collection.find_one(filter).await {
-        Ok(Some(transaction)) => {
-            let is_success = transaction.status == "completed";
-            let is_failed = transaction.status == "failed";
+        Ok(Some(t)) => {
+            let is_success = t.status == "completed";
+            let is_failed = t.status == "failed";
 
-            let response = json!({
-                "success": is_success,
-                "failed": is_failed,
-                "status": transaction.status,
-                "result_code": transaction.result_code,
-                "result_desc": transaction.result_desc,
-                "checkout_request_id": transaction.checkout_request_id,
-                "merchant_request_id": transaction.merchant_request_id,
-                "amount": transaction.amount,
-                "phone_number": transaction.phone_number,
-                "mpesa_receipt": transaction.mpesa_receipt,
-                "updated_at": transaction.updated_at.to_rfc3339(),
-                "created_at": transaction.created_at.to_rfc3339(),
-            });
+            // Look up the receipt from mpesa_transactions if completed
+            let receipt = if is_success {
+                let mpesa_col: Collection<MpesaTransaction> =
+                    state.db.collection("mpesa_transactions");
+                mpesa_col
+                    .find_one(doc! { "checkout_request_id": &request.checkout_request_id })
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|m| m.mpesa_receipt_number)
+            } else {
+                None
+            };
 
-            println!("✅ Found transaction: {}", transaction.status);
-            (StatusCode::OK, AxumJson(response))
-        }
-        Ok(None) => {
-            println!("⚠️ Transaction not found, still pending");
             (
                 StatusCode::OK,
                 AxumJson(json!({
-                    "success": false,
-                    "failed": false,
-                    "status": "pending",
-                    "checkout_request_id": request.checkout_request_id,
-                    "message": "Transaction still processing"
+                    "success": is_success,
+                    "failed": is_failed,
+                    "status": t.status,
+                    "result_code": t.result_code,
+                    "result_desc": t.result_desc,
+                    "checkout_request_id": t.checkout_request_id,
+                    "merchant_request_id": t.merchant_request_id,
+                    "amount": t.amount,
+                    "phone_number": t.phone_number,
+                    "mpesa_receipt": receipt,
+                    "updated_at": t.updated_at,
+                    "created_at": t.created_at,
                 })),
             )
         }
-        Err(e) => {
-            println!("❌ Database error: {}", e);
-            (
-                StatusCode::OK,
-                AxumJson(json!({
-                    "success": false,
-                    "failed": false,
-                    "status": "pending",
-                    "checkout_request_id": request.checkout_request_id,
-                    "message": format!("Error checking status: {}", e)
-                })),
-            )
-        }
+        Ok(None) => (
+            StatusCode::OK,
+            AxumJson(json!({
+                "success": false,
+                "failed": false,
+                "status": "pending",
+                "checkout_request_id": request.checkout_request_id,
+                "message": "Transaction still processing"
+            })),
+        ),
+        Err(e) => (
+            StatusCode::OK,
+            AxumJson(json!({
+                "success": false,
+                "failed": false,
+                "status": "pending",
+                "checkout_request_id": request.checkout_request_id,
+                "message": format!("Error checking status: {}", e)
+            })),
+        ),
     }
 }
 
@@ -405,29 +427,40 @@ pub async fn check_transaction_status(
     }
 
     match collection.find_one(filter).await {
-        Ok(Some(t)) => (
-            StatusCode::OK,
-            AxumJson(json!({
-                "success": t.status == "completed",
-                "status": t.status,
-                "result_code": t.result_code,
-                "result_desc": t.result_desc,
-                "mpesa_receipt": t.mpesa_receipt,
-            })),
-        ),
+        Ok(Some(t)) => {
+            // Fetch receipt from mpesa_transactions
+            let receipt = if t.status == "completed" {
+                let mpesa_col: Collection<MpesaTransaction> =
+                    state.db.collection("mpesa_transactions");
+                let key = t.checkout_request_id.clone();
+                mpesa_col
+                    .find_one(doc! { "checkout_request_id": &key })
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|m| m.mpesa_receipt_number)
+            } else {
+                None
+            };
+
+            (
+                StatusCode::OK,
+                AxumJson(json!({
+                    "success": t.status == "completed",
+                    "status": t.status,
+                    "result_code": t.result_code,
+                    "result_desc": t.result_desc,
+                    "mpesa_receipt": receipt,
+                })),
+            )
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
-            AxumJson(json!({
-                "success": false,
-                "error": "Transaction not found"
-            })),
+            AxumJson(json!({ "success": false, "error": "Transaction not found" })),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            AxumJson(json!({
-                "success": false,
-                "error": format!("{}", e)
-            })),
+            AxumJson(json!({ "success": false, "error": format!("{}", e) })),
         ),
     }
 }
@@ -441,16 +474,9 @@ pub async fn get_transactions(State(state): State<AppState>) -> AxumJson<serde_j
                 transactions.push(t);
             }
             let count = transactions.len();
-            AxumJson(json!({
-                "success": true,
-                "transactions": transactions,
-                "count": count
-            }))
+            AxumJson(json!({ "success": true, "transactions": transactions, "count": count }))
         }
-        Err(e) => AxumJson(json!({
-            "success": false,
-            "error": format!("{}", e)
-        })),
+        Err(e) => AxumJson(json!({ "success": false, "error": format!("{}", e) })),
     }
 }
 
@@ -497,29 +523,46 @@ pub async fn simulate_payment(
         .and_then(|v| v.as_str())
         .unwrap_or("test_user");
 
-    let now = Utc::now();
+    let now = now_str();
+    let ts = Utc::now().timestamp();
+
     let transaction = Transaction {
         id: None,
         user_id: user_id.to_string(),
         phone_number: phone.to_string(),
         amount: amount.parse().unwrap_or(10.0),
-        merchant_request_id: format!("SIM-{}", now.timestamp()),
-        checkout_request_id: format!("ws_CO_SIM_{}", now.timestamp()),
+        merchant_request_id: format!("SIM-{}", ts),
+        checkout_request_id: format!("ws_CO_SIM_{}", ts),
         response_code: "0".to_string(),
         response_description: "Success".to_string(),
         customer_message: "Success".to_string(),
         status: "completed".to_string(),
         result_code: Some(0),
         result_desc: Some("Processed successfully".to_string()),
-        created_at: now,
-        updated_at: now,
-        completed_at: Some(now),
-        mpesa_receipt: Some(format!("SIM{}{}", now.timestamp(), "ABCDEF")),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        completed_at: Some(now.clone()),
     };
 
-    let collection: Collection<Transaction> = state.db.collection("transactions");
+    let transactions: Collection<Transaction> = state.db.collection("transactions");
     let checkout_id = transaction.checkout_request_id.clone();
-    let _ = collection.insert_one(&transaction).await;
+    let _ = transactions.insert_one(&transaction).await;
+
+    // Also write a simulated MpesaTransaction record
+    let mpesa_tx = MpesaTransaction {
+        id: None,
+        paying_phone_number: phone.to_string(),
+        transaction_date: now.clone(),
+        mpesa_receipt_number: format!("SIM{}ABCDEF", ts),
+        paid_amount: amount.to_string(),
+        merchant_request_id: format!("SIM-{}", ts),
+        checkout_request_id: checkout_id.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+
+    let mpesa_col: Collection<MpesaTransaction> = state.db.collection("mpesa_transactions");
+    let _ = mpesa_col.insert_one(&mpesa_tx).await;
 
     AxumJson(json!({
         "success": true,

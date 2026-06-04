@@ -5,6 +5,8 @@ use axum::{
 use mongodb::bson::{doc, DateTime};
 use serde_json::{json, Value};
 use uuid::Uuid;
+use crate::models::user::User;
+use bson::oid::ObjectId;
 
 use crate::errors::{AppError, Result};
 use crate::models::channel::{
