@@ -15,11 +15,15 @@ pub fn mpesa_routes() -> Router<AppState> {
         .route("/validation", post(mpesa_handlers::mpesa_validation))
         .route("/confirmation", post(mpesa_handlers::mpesa_confirmation))
         .route("/callback", post(mpesa_handlers::mpesa_confirmation))
-        .route("/check-payment-status", post(mpesa_handlers::check_payment_status))
+        .route(
+            "/check-payment-status",
+            post(mpesa_handlers::check_payment_status),
+        )
         .route("/status", get(mpesa_handlers::check_transaction_status))
         .route("/transactions", get(mpesa_handlers::get_transactions))
         .route("/stats", get(mpesa_handlers::get_stats))
         .route("/simulate", post(mpesa_handlers::simulate_payment))
+        .route("/b2c/send", post(mpesa_handlers::initiate_b2c_payment))
 }
 
 async fn mpesa_health() -> axum::Json<serde_json::Value> {

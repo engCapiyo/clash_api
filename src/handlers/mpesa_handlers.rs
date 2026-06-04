@@ -570,3 +570,76 @@ pub async fn simulate_payment(
         "status": "completed"
     }))
 }
+#[derive(Debug, Deserialize)]
+pub struct B2CPaymentRequest {
+    pub phone_number: String,
+    pub amount: String,
+    pub remarks: String,
+    pub occasion: Option<String>,
+}
+
+pub async fn initiate_b2c_payment(
+    State(state): State<AppState>,
+    Json(request): Json<B2CPaymentRequest>,
+) -> Result<AxumJson<serde_json::Value>, (StatusCode, AxumJson<serde_json::Value>)> {
+    println!(
+        "🔵 [B2C] Initiating B2C payment — phone: {}, amount: {}",
+        request.phone_number, request.amount
+    );
+
+    if request.phone_number.is_empty() || request.amount.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            AxumJson(json!({ "success": false, "error": "Phone number and amount are required" })),
+        ));
+    }
+
+    let amount: f64 = match request.amount.parse() {
+        Ok(a) if a > 0.0 => a,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                AxumJson(json!({ "success": false, "error": "Amount must be greater than 0" })),
+            ));
+        }
+    };
+
+    let mpesa_service = match &state.mpesa_service {
+        Some(s) => s,
+        None => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                AxumJson(json!({ "success": false, "error": "M-Pesa service is not available" })),
+            ));
+        }
+    };
+
+    // Use "BusinessPayment" for payouts to customers
+    let response = match mpesa_service
+        .send_b2c_payment(
+            &request.phone_number,
+            &request.amount,
+            "BusinessPayment", // Command ID for normal payouts
+            &request.remarks,
+            request.occasion.as_deref(),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(json!({ "success": false, "error": e.to_string() })),
+            ));
+        }
+    };
+
+    println!("✅ [B2C] Payment initiated successfully");
+    Ok(AxumJson(json!({
+        "success": true,
+        "conversation_id": response.conversation_id,
+        "originator_conversation_id": response.originator_conversation_id,
+        "response_code": response.response_code,
+        "response_description": response.response_description,
+    })))
+}
