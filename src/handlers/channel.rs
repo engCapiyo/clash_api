@@ -95,6 +95,31 @@ pub async fn create_channel_handler(
         "channel_id": channel_id,
     })))
 }
+// GET /api/channels/:channel_id/fixtures/:fixture_id/user/:user_id/vote
+// ============================================================================
+// CHECK USER VOTE IN CHANNEL
+// ============================================================================
+
+pub async fn check_user_vote_in_channel_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id, user_id)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let votes_col = state.db.collection::<Vote>("votes");
+
+    let vote = votes_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "fixture_id": &fixture_id,
+            "user_id": &user_id,
+        })
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "has_voted": vote.is_some(),
+        "selection": vote.as_ref().map(|v| &v.selection),
+    })))
+}
 
 // ============================================================================
 // GET USER CHANNELS
