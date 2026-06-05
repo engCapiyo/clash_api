@@ -65,7 +65,10 @@ pub async fn ws_comments_handler(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let user_id = params.user_id.clone();
-    let username = params.username.clone().unwrap_or_else(|| "Anonymous".to_string());
+    let username = params
+        .username
+        .clone()
+        .unwrap_or_else(|| "Anonymous".to_string());
     let channel_id = params.channel_id.clone();
     let fixture_id = if params.fixture_id.as_deref() == Some("") {
         None
@@ -88,7 +91,6 @@ pub async fn ws_comments_handler(
 // ============================================================================
 // PER-CONNECTION LOGIC
 // ============================================================================
-
 async fn handle_socket(
     socket: WebSocket,
     channel_id: String,
@@ -119,22 +121,20 @@ async fn handle_socket(
 
     if let Ok(welcome_json) = serde_json::to_string(&welcome) {
         let mut sender_guard = sender.lock().await;
-        if sender_guard.send(WsMessage::Text(welcome_json)).await.is_err() {
+        if sender_guard
+            .send(WsMessage::Text(welcome_json))
+            .await
+            .is_err()
+        {
             return;
         }
     }
 
-    tracing::info!(
-        "✅ WS connected: user {} to room {}",
-        user_id,
-        room_key
-    );
+    tracing::info!("✅ WS connected: user {} to room {}", user_id, room_key);
 
     let sender_clone = sender.clone();
-    let channel_id_clone = channel_id.clone();
-    let fixture_id_clone = fixture_id.clone();
-    let user_id_clone = user_id.clone();
-    let username_clone = username.clone();
+    let state_clone = state.clone();
+    let tx_clone = tx.clone();
 
     // Task 1: forward broadcasts to client
     let mut send_task = tokio::spawn(async move {
@@ -154,24 +154,14 @@ async fn handle_socket(
         }
     });
 
-    // Task 2: handle incoming
-    let state_clone = state.clone();
-    let tx_clone = tx.clone();
-
+    // Task 2: handle incoming - DON'T pass connection params, let handler extract from payload
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 WsMessage::Text(text) => {
-                    handle_incoming_message(
-                        text,
-                        &state_clone,
-                        &channel_id_clone,
-                        &fixture_id_clone,
-                        &user_id_clone,
-                        &username_clone,
-                        &tx_clone,
-                    )
-                    .await;
+                    // ✅ Pass ONLY state and broadcaster
+                    // The handler will extract channel_id, fixture_id, user_id from payload
+                    handle_incoming_message(text, &state_clone, &tx_clone).await;
                 }
                 WsMessage::Close(_) => break,
                 WsMessage::Ping(_) => {
@@ -200,18 +190,13 @@ async fn handle_socket(
         room_key
     );
 }
-
 // ============================================================================
-// HANDLE INCOMING MESSAGE
+// HANDLE INCOMING MESSAGE - EXTRACT FROM PAYLOAD
 // ============================================================================
 
 async fn handle_incoming_message(
     text: String,
     state: &AppState,
-    channel_id: &str,
-    fixture_id: &Option<String>,
-    user_id: &str,
-    username: &str,
     broadcaster: &tokio::sync::broadcast::Sender<String>,
 ) {
     tracing::info!("🔥 RAW WS MESSAGE: {}", text);
@@ -238,10 +223,49 @@ async fn handle_incoming_message(
                 }
             };
 
-            tracing::info!("💾 Saving to DB...");
+            // ✅ Extract from payload
+            let channel_id = payload
+                .get("channelId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let fixture_id = payload
+                .get("fixtureId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let user_id = payload.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+
+            let username = payload
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Anonymous");
+
+            // ✅ Validate required fields
+            if channel_id.is_empty() {
+                tracing::error!("❌ Missing channelId in message payload");
+                return;
+            }
+
+            if user_id.is_empty() {
+                tracing::error!("❌ Missing userId in message payload");
+                return;
+            }
+
+            tracing::info!(
+                "💾 Saving to DB - channel: {}, fixture: {:?}, user: {}",
+                channel_id,
+                fixture_id,
+                user_id
+            );
 
             match save_message_to_database(
-                state, channel_id, fixture_id, user_id, username, &payload,
+                state,
+                &channel_id,
+                &fixture_id,
+                &user_id,
+                &username,
+                &payload,
             )
             .await
             {
@@ -250,6 +274,11 @@ async fn handle_incoming_message(
                     tracing::error!("❌ DB SAVE FAILED: {}", e);
                     return;
                 }
+            }
+
+            // ✅ Update channel activity
+            if let Err(e) = update_channel_activity(state, &channel_id, &user_id).await {
+                tracing::error!("❌ Failed to update channel activity: {}", e);
             }
 
             let broadcast_msg = serde_json::json!({
@@ -382,6 +411,54 @@ async fn save_message_to_database(
         channel_id,
         fixture_id
     );
+
+    Ok(())
+}
+
+// ============================================================================
+// UPDATE CHANNEL ACTIVITY
+// ============================================================================
+
+async fn update_channel_activity(
+    state: &AppState,
+    channel_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    let channels_col = state
+        .db
+        .collection::<crate::models::channel::Channel>("channels");
+    let now = BsonDateTime::now();
+
+    // Update channel activity
+    channels_col
+        .update_one(
+            mongodb::bson::doc! { "channel_id": channel_id },
+            mongodb::bson::doc! {
+                "$inc": {
+                    "activity.total_messages": 1,
+                    "activity.messages_this_week": 1,
+                },
+                "$set": {
+                    "activity.last_message_at": now,
+                },
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to update channel activity: {}", e))?;
+
+    // Update member message count
+    channels_col
+        .update_one(
+            mongodb::bson::doc! {
+                "channel_id": channel_id,
+                "members.user_id": user_id,
+            },
+            mongodb::bson::doc! {
+                "$inc": { "members.$.msg_count": 1 },
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to update member msg count: {}", e))?;
 
     Ok(())
 }
