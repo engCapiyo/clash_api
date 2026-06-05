@@ -197,7 +197,7 @@ async fn handle_socket(
 async fn handle_incoming_message(
     text: String,
     state: &AppState,
-    broadcaster: &tokio::sync::broadcast::Sender<String>,
+    _broadcaster: &tokio::sync::broadcast::Sender<String>, // ← Rename with _ to indicate unused
 ) {
     tracing::info!("🔥 RAW WS MESSAGE: {}", text);
 
@@ -223,7 +223,7 @@ async fn handle_incoming_message(
                 }
             };
 
-            // ✅ Extract from payload
+            // Extract from payload
             let channel_id = payload
                 .get("channelId")
                 .and_then(|v| v.as_str())
@@ -241,7 +241,6 @@ async fn handle_incoming_message(
                 .and_then(|v| v.as_str())
                 .unwrap_or("Anonymous");
 
-            // ✅ Validate required fields
             if channel_id.is_empty() {
                 tracing::error!("❌ Missing channelId in message payload");
                 return;
@@ -276,10 +275,19 @@ async fn handle_incoming_message(
                 }
             }
 
-            // ✅ Update channel activity
+            // ✅ FIX: Update channel activity
             if let Err(e) = update_channel_activity(state, &channel_id, &user_id).await {
                 tracing::error!("❌ Failed to update channel activity: {}", e);
             }
+
+            // ✅ FIX: Create the room key based on channel_id and fixture_id
+            let room_key = match &fixture_id {
+                Some(f) => format!("{}_{}", channel_id, f),
+                None => format!("{}_overall", channel_id),
+            };
+
+            // ✅ FIX: Get the ROOM's broadcaster (shared among all clients in this room)
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
 
             let broadcast_msg = serde_json::json!({
                 "type": "chat.message",
@@ -287,10 +295,11 @@ async fn handle_incoming_message(
                 "timestamp": Utc::now().to_rfc3339(),
             });
 
+            // ✅ FIX: Broadcast to the ROOM, not the individual connection
             match serde_json::to_string(&broadcast_msg) {
                 Ok(broadcast_json) => {
-                    let _ = broadcaster.send(broadcast_json);
-                    tracing::info!("📡 Broadcasted to room");
+                    let _ = room_broadcaster.send(broadcast_json);
+                    tracing::info!("📡 Broadcasted to room: {}", room_key);
                 }
                 Err(e) => tracing::error!("❌ Serialize FAILED: {}", e),
             }
@@ -298,13 +307,34 @@ async fn handle_incoming_message(
 
         Some("typing") => {
             if let Some(payload) = json_msg.get("payload") {
-                let broadcast_msg = serde_json::json!({
-                    "type": "typing",
-                    "payload": payload,
-                    "timestamp": Utc::now().to_rfc3339(),
-                });
-                if let Ok(broadcast_json) = serde_json::to_string(&broadcast_msg) {
-                    let _ = broadcaster.send(broadcast_json);
+                // Extract room info from typing payload
+                let channel_id = payload
+                    .get("channelId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let fixture_id = payload
+                    .get("fixtureId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                if !channel_id.is_empty() {
+                    let room_key = match &fixture_id {
+                        Some(f) => format!("{}_{}", channel_id, f),
+                        None => format!("{}_overall", channel_id),
+                    };
+
+                    let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+                    let broadcast_msg = serde_json::json!({
+                        "type": "typing",
+                        "payload": payload,
+                        "timestamp": Utc::now().to_rfc3339(),
+                    });
+
+                    if let Ok(broadcast_json) = serde_json::to_string(&broadcast_msg) {
+                        let _ = room_broadcaster.send(broadcast_json);
+                    }
                 }
             }
         }
@@ -315,7 +345,8 @@ async fn handle_incoming_message(
                 "timestamp": Utc::now().to_rfc3339(),
             });
             if let Ok(pong_json) = serde_json::to_string(&pong) {
-                let _ = broadcaster.send(pong_json);
+                // For ping, we can still use the connection's broadcaster
+                let _ = _broadcaster.send(pong_json);
             }
         }
 
