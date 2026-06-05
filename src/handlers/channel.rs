@@ -120,6 +120,34 @@ pub async fn check_user_vote_in_channel_handler(
         "selection": vote.as_ref().map(|v| &v.selection),
     })))
 }
+// ============================================================================
+// GET USER VOTES FOR CHANNEL
+// ============================================================================
+
+pub async fn get_user_channel_votes_handler(
+    State(state): State<AppState>,
+    Path((channel_id, user_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let votes_col = state.db.collection::<Vote>("votes");
+
+    let mut cursor = votes_col
+        .find(doc! {
+            "channel_id": &channel_id,
+            "user_id": &user_id,
+        })
+        .await?;
+
+    let mut votes = Vec::new();
+    while cursor.advance().await? {
+        // ✅ FIXED: Remove ::<Vote> - deserialize_current() infers the type
+        votes.push(cursor.deserialize_current()?);
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "votes": votes,
+    })))
+}
 
 // ============================================================================
 // GET USER CHANNELS
