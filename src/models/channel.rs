@@ -1,5 +1,6 @@
 use mongodb::bson::{oid::ObjectId, DateTime};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Channel {
@@ -60,9 +61,14 @@ pub struct ChannelFixture {
     pub channel_id: String,
     pub fixture_id: String,
     pub match_name: String,
-    pub kickoff_time: String, // was DateTime, now String
+    pub kickoff_time: String,
     pub status: String,
     pub vote_counts: VoteCounts,
+
+    // NEW FIELDS FOR COMMENT TRACKING
+    pub comment_count: i32,                  // Total comments
+    pub unread_counts: HashMap<String, i32>, // Per-user unread counts
+
     pub last_message: Option<String>,
     pub last_message_at: Option<DateTime>,
     pub last_sender: Option<String>,

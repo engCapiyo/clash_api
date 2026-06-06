@@ -328,6 +328,7 @@ pub async fn initialize_fixture_chat_handler(
 ) -> Result<Json<serde_json::Value>> {
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
     let fixtures_col = state.db.collection::<Fixture>("fixtures");
+    let channels_col = state.db.collection::<Channel>("channels");
     let now = DateTime::now();
 
     let existing = channel_fixtures_col
@@ -350,6 +351,18 @@ pub async fn initialize_fixture_chat_handler(
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
+    // Get all channel members to initialize unread_counts
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &payload.channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    // Initialize unread_counts map with 0 for all members
+    let mut unread_counts = std::collections::HashMap::new();
+    for member in &channel.members {
+        unread_counts.insert(member.user_id.clone(), 0);
+    }
+
     let new_chat = ChannelFixture {
         id: None,
         channel_id: payload.channel_id,
@@ -362,6 +375,10 @@ pub async fn initialize_fixture_chat_handler(
             away: 0,
             draw: 0,
         },
+        // NEW FIELDS
+        comment_count: 0,
+        unread_counts: unread_counts,
+        // Existing fields
         last_message: None,
         last_message_at: None,
         last_sender: None,
@@ -745,18 +762,21 @@ pub async fn reset_weekly_messages_handler(
 }
 
 // GET /api/channels/:channel_id/fixtures/:fixture_id/comments/count
+// GET /api/channels/:channel_id/fixtures/:fixture_id/comments/count
 pub async fn get_fixture_comment_count_handler(
     State(state): State<AppState>,
     Path((channel_id, fixture_id)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
-    let messages_col = state.db.collection::<Message>("messages");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
-    let filter = doc! {
-        "channel_id": &channel_id,
-        "fixture_id": &fixture_id,
-    };
+    let result = channel_fixtures_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "fixture_id": &fixture_id,
+        })
+        .await?;
 
-    let count = messages_col.count_documents(filter).await?;
+    let count = result.map(|cf| cf.comment_count).unwrap_or(0);
 
     Ok(Json(json!({
         "success": true,
@@ -765,7 +785,6 @@ pub async fn get_fixture_comment_count_handler(
         "count": count,
     })))
 }
-
 // GET /api/channels/:channel_id/fixtures/:fixture_id/comments/latest
 pub async fn get_fixture_latest_comment_handler(
     State(state): State<AppState>,
@@ -803,6 +822,52 @@ pub async fn get_fixture_latest_comment_handler(
         "channel_id": channel_id,
         "fixture_id": fixture_id,
         "latest_comment": latest_comment,
+    })))
+}
+
+// PUT /api/channels/:channel_id/fixtures/:fixture_id/read/:user_id
+pub async fn mark_chat_as_read_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id, user_id)): Path<(String, String, String)>,
+) -> Result<Json<Value>> {
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+
+    channel_fixtures_col
+        .update_one(
+            doc! {
+                "channel_id": &channel_id,
+                "fixture_id": &fixture_id,
+            },
+            doc! { "$set": { format!("unread_counts.{}", user_id): 0 } },
+        )
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Chat marked as read",
+    })))
+}
+// GET /api/channels/:channel_id/fixtures/:fixture_id/unread/:user_id
+pub async fn get_user_unread_count_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id, user_id)): Path<(String, String, String)>,
+) -> Result<Json<Value>> {
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+
+    let result = channel_fixtures_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "fixture_id": &fixture_id,
+        })
+        .await?;
+
+    let unread_count = result
+        .and_then(|cf| cf.unread_counts.get(&user_id).copied())
+        .unwrap_or(0);
+
+    Ok(Json(json!({
+        "success": true,
+        "unread_count": unread_count,
     })))
 }
 

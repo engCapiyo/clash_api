@@ -197,7 +197,7 @@ async fn handle_socket(
 async fn handle_incoming_message(
     text: String,
     state: &AppState,
-    _broadcaster: &tokio::sync::broadcast::Sender<String>, // ← Rename with _ to indicate unused
+    _broadcaster: &tokio::sync::broadcast::Sender<String>,
 ) {
     tracing::info!("🔥 RAW WS MESSAGE: {}", text);
 
@@ -258,6 +258,11 @@ async fn handle_incoming_message(
                 user_id
             );
 
+            // save_message_to_database already handles:
+            // 1. Insert message
+            // 2. Update channel activity (total_messages, messages_this_week)
+            // 3. Update member's msg_count
+            // 4. Update channel_fixtures (comment_count, unread_counts, last_message)
             match save_message_to_database(
                 state,
                 &channel_id,
@@ -275,18 +280,13 @@ async fn handle_incoming_message(
                 }
             }
 
-            // ✅ FIX: Update channel activity
-            if let Err(e) = update_channel_activity(state, &channel_id, &user_id).await {
-                tracing::error!("❌ Failed to update channel activity: {}", e);
-            }
-
-            // ✅ FIX: Create the room key based on channel_id and fixture_id
+            // Create the room key based on channel_id and fixture_id
             let room_key = match &fixture_id {
                 Some(f) => format!("{}_{}", channel_id, f),
                 None => format!("{}_overall", channel_id),
             };
 
-            // ✅ FIX: Get the ROOM's broadcaster (shared among all clients in this room)
+            // Get the ROOM's broadcaster (shared among all clients in this room)
             let room_broadcaster = state.get_or_create_broadcaster(&room_key);
 
             let broadcast_msg = serde_json::json!({
@@ -295,7 +295,7 @@ async fn handle_incoming_message(
                 "timestamp": Utc::now().to_rfc3339(),
             });
 
-            // ✅ FIX: Broadcast to the ROOM, not the individual connection
+            // Broadcast to the ROOM, not the individual connection
             match serde_json::to_string(&broadcast_msg) {
                 Ok(broadcast_json) => {
                     let _ = room_broadcaster.send(broadcast_json);
@@ -345,7 +345,6 @@ async fn handle_incoming_message(
                 "timestamp": Utc::now().to_rfc3339(),
             });
             if let Ok(pong_json) = serde_json::to_string(&pong) {
-                // For ping, we can still use the connection's broadcaster
                 let _ = _broadcaster.send(pong_json);
             }
         }
@@ -355,11 +354,9 @@ async fn handle_incoming_message(
         }
     }
 }
-
 // ============================================================================
 // SAVE MESSAGE TO DATABASE
 // ============================================================================
-
 async fn save_message_to_database(
     state: &AppState,
     channel_id: &str,
@@ -369,6 +366,8 @@ async fn save_message_to_database(
     payload: &Value,
 ) -> Result<(), String> {
     let messages_col = state.db.collection::<Message>("messages");
+    let channels_col = state.db.collection::<Channel>("channels");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
     let now = BsonDateTime::now();
 
@@ -420,10 +419,10 @@ async fn save_message_to_database(
         fixture_id: fixture_id.clone(),
         sender_id: user_id.to_string(),
         sender_name: username.to_string(),
-        text: message_text,
+        text: message_text.clone(),
         sent_at: now,
-        message_id,
-        selection,
+        message_id: message_id.clone(),
+        selection: selection.clone(),
         image_url,
         video_url,
         is_image,
@@ -431,10 +430,80 @@ async fn save_message_to_database(
         reply_to,
     };
 
+    // 1. Insert message
     messages_col
         .insert_one(&message)
         .await
         .map_err(|e| format!("Failed to insert message: {}", e))?;
+
+    // 2. Update channel activity
+    channels_col
+        .update_one(
+            doc! { "channel_id": channel_id },
+            doc! {
+                "$inc": {
+                    "activity.total_messages": 1,
+                    "activity.messages_this_week": 1
+                },
+                "$set": { "activity.last_message_at": now }
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to update channel activity: {}", e))?;
+
+    // 3. Update member's message count
+    channels_col
+        .update_one(
+            doc! {
+                "channel_id": channel_id,
+                "members.user_id": user_id
+            },
+            doc! { "$inc": { "members.$.msg_count": 1 } },
+        )
+        .await
+        .map_err(|e| format!("Failed to update member msg_count: {}", e))?;
+
+    // 4. UPDATE CHANNEL FIXTURE with comment_count and unread_counts
+    if let Some(fixture_id) = fixture_id {
+        // Get channel to get all member IDs
+        let channel = channels_col
+            .find_one(doc! { "channel_id": channel_id })
+            .await
+            .map_err(|e| format!("Failed to get channel: {}", e))?;
+
+        if let Some(channel) = channel {
+            // Build inc_doc for unread counts
+            let mut inc_doc = doc! {
+                "comment_count": 1,
+            };
+
+            // Add unread count increments for each member (except sender)
+            for member in &channel.members {
+                if member.user_id != user_id {
+                    inc_doc.insert(format!("unread_counts.{}", member.user_id), 1);
+                }
+            }
+
+            // Update channel fixture
+            channel_fixtures_col
+                .update_one(
+                    doc! {
+                        "channel_id": channel_id,
+                        "fixture_id": fixture_id,
+                    },
+                    doc! {
+                        "$inc": inc_doc,
+                        "$set": {
+                            "last_message": &message_text,
+                            "last_message_at": now,
+                            "last_sender": username,
+                        }
+                    },
+                )
+                .await
+                .map_err(|e| format!("Failed to update channel fixture: {}", e))?;
+        }
+    }
 
     tracing::info!(
         "✅ Message saved — user: {}, channel: {}, fixture: {:?}",
@@ -442,54 +511,6 @@ async fn save_message_to_database(
         channel_id,
         fixture_id
     );
-
-    Ok(())
-}
-
-// ============================================================================
-// UPDATE CHANNEL ACTIVITY
-// ============================================================================
-
-async fn update_channel_activity(
-    state: &AppState,
-    channel_id: &str,
-    user_id: &str,
-) -> Result<(), String> {
-    let channels_col = state
-        .db
-        .collection::<crate::models::channel::Channel>("channels");
-    let now = BsonDateTime::now();
-
-    // Update channel activity
-    channels_col
-        .update_one(
-            mongodb::bson::doc! { "channel_id": channel_id },
-            mongodb::bson::doc! {
-                "$inc": {
-                    "activity.total_messages": 1,
-                    "activity.messages_this_week": 1,
-                },
-                "$set": {
-                    "activity.last_message_at": now,
-                },
-            },
-        )
-        .await
-        .map_err(|e| format!("Failed to update channel activity: {}", e))?;
-
-    // Update member message count
-    channels_col
-        .update_one(
-            mongodb::bson::doc! {
-                "channel_id": channel_id,
-                "members.user_id": user_id,
-            },
-            mongodb::bson::doc! {
-                "$inc": { "members.$.msg_count": 1 },
-            },
-        )
-        .await
-        .map_err(|e| format!("Failed to update member msg count: {}", e))?;
 
     Ok(())
 }

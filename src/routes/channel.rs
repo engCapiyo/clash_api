@@ -1,5 +1,5 @@
 use axum::{
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 
@@ -7,9 +7,10 @@ use crate::handlers::channel::{
     add_members_to_channel_handler, cast_vote_handler, check_user_vote_in_channel_handler,
     create_channel_handler, finalize_fixture_result_handler, get_channel_fixtures_handler,
     get_channel_handler, get_channel_leaderboard_handler, get_fixture_comment_count_handler,
-    get_fixture_latest_comment_handler, get_messages_handler, get_user_channel_count_handler,
-    get_user_channel_votes_handler, get_user_channels_handler, get_weekly_top_channel_handler,
-    initialize_fixture_chat_handler, leave_channel_handler, reset_weekly_messages_handler,
+    get_fixture_latest_comment_handler, get_messages_handler, get_user_all_unread_handler,
+    get_user_channel_count_handler, get_user_channel_votes_handler, get_user_channels_handler,
+    get_user_unread_count_handler, get_weekly_top_channel_handler, initialize_fixture_chat_handler,
+    leave_channel_handler, mark_chat_as_read_handler, reset_weekly_messages_handler,
 };
 use crate::handlers::ws_handler::ws_comments_handler;
 use crate::AppState;
@@ -46,14 +47,26 @@ pub fn channel_routes() -> Router<AppState> {
             "/:channel_id/fixtures/:fixture_id/user/:user_id/vote",
             get(check_user_vote_in_channel_handler),
         )
-        // NEW: Comment count endpoint
+        // Comment endpoints
         .route(
             "/:channel_id/fixtures/:fixture_id/comments/count",
             get(get_fixture_comment_count_handler),
         )
-        // NEW: Latest comment endpoint
         .route(
             "/:channel_id/fixtures/:fixture_id/comments/latest",
             get(get_fixture_latest_comment_handler),
+        )
+        // UNREAD MESSAGE ENDPOINTS
+        .route(
+            "/:channel_id/fixtures/:fixture_id/unread/:user_id",
+            get(get_user_unread_count_handler),
+        )
+        .route(
+            "/:channel_id/fixtures/:fixture_id/read/:user_id",
+            put(mark_chat_as_read_handler),
+        )
+        .route(
+            "/:channel_id/user/:user_id/unread/all",
+            get(get_user_all_unread_handler),
         )
 }
