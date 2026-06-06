@@ -11,9 +11,12 @@ pub struct User {
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub is_admin: bool,
+
+    // GLOBAL POINTS FIELDS
+    pub season_points: i32,
+    pub correct_votes: i32,
+    pub total_votes: i32,
 }
-
-
 
 #[derive(Debug, Deserialize)]
 pub struct CreateUserRequest {
@@ -27,7 +30,10 @@ pub struct UserResponse {
     pub username: String,
     pub phone: String,
     pub balance: f64,
-     pub is_admin: bool,
+    pub is_admin: bool,
+    pub season_points: i32,
+    pub correct_votes: i32,
+    pub total_votes: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,4 +48,11 @@ pub struct Claims {
     pub username: String,
     pub phone: String,
     pub exp: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateUserPointsRequest {
+    pub season_points: i32,
+    pub correct_votes: i32,
+    pub total_votes: i32,
 }

@@ -1,24 +1,24 @@
 use axum::{
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 
-use crate::state::AppState;
+use crate::handlers::auth::{
+    get_all_users, get_user_by_id, get_user_by_username, login, register, update_user_phone,
+    update_user_points,
+};
+use crate::AppState;
 
-pub fn auth_routes() -> Router<AppState> {
+pub fn user_routes() -> Router<AppState> {
     Router::new()
-        // Registration
-        .route("/register", post(crate::handlers::auth::register))
-        // Get users
-        .route("/users", get(crate::handlers::auth::get_all_users))
-        // Get user by phone (login)
-        .route(
-            "/user/phone/:phone",
-            get(crate::handlers::auth::get_user_by_phone),
-        )
-        // Get user by username (check availability)
-        .route(
-            "/user/username/:username",
-            get(crate::handlers::auth::get_user_by_username),
-        )
+        // Auth routes
+        .route("/register", post(register))
+        .route("/login", post(login))
+        // User retrieval routes
+        .route("/users", get(get_all_users))
+        .route("/user/id/:user_id", get(get_user_by_id))
+        .route("/user/username/:username", get(get_user_by_username))
+        // User update routes
+        .route("/user/:user_id/points", put(update_user_points))
+        .route("/user/:user_id/phone", put(update_user_phone))
 }

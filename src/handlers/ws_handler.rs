@@ -1,4 +1,5 @@
-use crate::models::channel::{Channel, ChannelFixture, Message, ReplyToData};
+use crate::models::channel::{Channel, ChannelFixture, Message, ReplyToData, Vote};
+use crate::models::user::User;
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
@@ -6,7 +7,7 @@ use axum::{
     },
     response::IntoResponse,
 };
-use bson::{doc, DateTime as BsonDateTime};
+use bson::{doc, oid::ObjectId, DateTime as BsonDateTime};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,7 @@ pub async fn ws_comments_handler(
 // ============================================================================
 // PER-CONNECTION LOGIC
 // ============================================================================
+
 async fn handle_socket(
     socket: WebSocket,
     channel_id: String,
@@ -154,13 +156,11 @@ async fn handle_socket(
         }
     });
 
-    // Task 2: handle incoming - DON'T pass connection params, let handler extract from payload
+    // Task 2: handle incoming
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 WsMessage::Text(text) => {
-                    // ✅ Pass ONLY state and broadcaster
-                    // The handler will extract channel_id, fixture_id, user_id from payload
                     handle_incoming_message(text, &state_clone, &tx_clone).await;
                 }
                 WsMessage::Close(_) => break,
@@ -190,8 +190,9 @@ async fn handle_socket(
         room_key
     );
 }
+
 // ============================================================================
-// HANDLE INCOMING MESSAGE - EXTRACT FROM PAYLOAD
+// HANDLE INCOMING MESSAGE
 // ============================================================================
 
 async fn handle_incoming_message(
@@ -258,11 +259,6 @@ async fn handle_incoming_message(
                 user_id
             );
 
-            // save_message_to_database already handles:
-            // 1. Insert message
-            // 2. Update channel activity (total_messages, messages_this_week)
-            // 3. Update member's msg_count
-            // 4. Update channel_fixtures (comment_count, unread_counts, last_message)
             match save_message_to_database(
                 state,
                 &channel_id,
@@ -286,7 +282,6 @@ async fn handle_incoming_message(
                 None => format!("{}_overall", channel_id),
             };
 
-            // Get the ROOM's broadcaster (shared among all clients in this room)
             let room_broadcaster = state.get_or_create_broadcaster(&room_key);
 
             let broadcast_msg = serde_json::json!({
@@ -295,7 +290,6 @@ async fn handle_incoming_message(
                 "timestamp": Utc::now().to_rfc3339(),
             });
 
-            // Broadcast to the ROOM, not the individual connection
             match serde_json::to_string(&broadcast_msg) {
                 Ok(broadcast_json) => {
                     let _ = room_broadcaster.send(broadcast_json);
@@ -307,7 +301,6 @@ async fn handle_incoming_message(
 
         Some("typing") => {
             if let Some(payload) = json_msg.get("payload") {
-                // Extract room info from typing payload
                 let channel_id = payload
                     .get("channelId")
                     .and_then(|v| v.as_str())
@@ -339,6 +332,91 @@ async fn handle_incoming_message(
             }
         }
 
+        Some("vote") => {
+            tracing::info!("✅ Matched vote");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ NO PAYLOAD for vote");
+                    return;
+                }
+            };
+
+            let fixture_id = payload
+                .get("fixtureId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let user_id = payload.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+
+            let selection = payload
+                .get("selection")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if fixture_id.is_empty() || user_id.is_empty() || selection.is_empty() {
+                tracing::error!("❌ Missing vote fields");
+                return;
+            }
+
+            // Save vote to database (global - no channel_id)
+            match save_vote_to_database(state, &fixture_id, &user_id, &selection).await {
+                Ok(_) => {
+                    tracing::info!(
+                        "✅ Vote saved for user {} on fixture {}",
+                        user_id,
+                        fixture_id
+                    );
+
+                    // Broadcast vote update to all channels this fixture is in
+                    // Get all channel fixtures for this fixture
+                    let channel_fixtures_col =
+                        state.db.collection::<ChannelFixture>("channel_fixtures");
+                    // NEW (correct)
+                    let mut cursor = match channel_fixtures_col
+                        .find(doc! { "fixture_id": &fixture_id })
+                        .await
+                    {
+                        Ok(cursor) => cursor,
+                        Err(e) => {
+                            tracing::error!("Failed to find channel fixtures: {}", e);
+                            return;
+                        }
+                    };
+                    let mut channel_ids = Vec::new();
+                    while let Ok(true) = cursor.advance().await {
+                        if let Ok(cf) = cursor.deserialize_current() {
+                            channel_ids.push(cf.channel_id);
+                        }
+                    }
+
+                    // Broadcast to each channel
+                    for channel_id in channel_ids {
+                        let room_key = format!("{}_{}", channel_id, fixture_id);
+                        let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+                        let broadcast_msg = serde_json::json!({
+                            "type": "vote.update",
+                            "payload": {
+                                "fixture_id": fixture_id,
+                                "user_id": user_id,
+                                "selection": selection,
+                            },
+                            "timestamp": Utc::now().to_rfc3339(),
+                        });
+
+                        if let Ok(broadcast_json) = serde_json::to_string(&broadcast_msg) {
+                            let _ = room_broadcaster.send(broadcast_json);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("❌ Failed to save vote: {}", e);
+                }
+            }
+        }
+
         Some("ping") => {
             let pong = serde_json::json!({
                 "type": "pong",
@@ -354,9 +432,68 @@ async fn handle_incoming_message(
         }
     }
 }
+
+// ============================================================================
+// SAVE VOTE TO DATABASE (GLOBAL - No channel_id)
+// ============================================================================
+
+async fn save_vote_to_database(
+    state: &AppState,
+    fixture_id: &str,
+    user_id: &str,
+    selection: &str,
+) -> Result<(), String> {
+    let votes_col = state.db.collection::<Vote>("votes");
+    let now = BsonDateTime::now();
+
+    // Check if user already voted on this fixture
+    let existing = votes_col
+        .find_one(doc! {
+            "fixture_id": fixture_id,
+            "user_id": user_id,
+        })
+        .await
+        .map_err(|e| format!("Failed to check existing vote: {}", e))?;
+
+    if existing.is_some() {
+        return Err("Already voted on this fixture".to_string());
+    }
+
+    let vote = Vote {
+        id: None,
+        fixture_id: fixture_id.to_string(),
+        user_id: user_id.to_string(),
+        selection: selection.to_string(),
+        is_correct: None,
+        points_awarded: None,
+        voted_at: now,
+    };
+
+    votes_col
+        .insert_one(&vote)
+        .await
+        .map_err(|e| format!("Failed to insert vote: {}", e))?;
+
+    // Also update user's total_votes count
+    let users_col = state.db.collection::<User>("users");
+    let user_object_id =
+        ObjectId::parse_str(user_id).map_err(|e| format!("Invalid user ID: {}", e))?;
+
+    users_col
+        .update_one(
+            doc! { "_id": user_object_id },
+            doc! { "$inc": { "total_votes": 1 } },
+        )
+        .await
+        .map_err(|e| format!("Failed to update user vote count: {}", e))?;
+
+    Ok(())
+}
+
 // ============================================================================
 // SAVE MESSAGE TO DATABASE
 // ============================================================================
+
 async fn save_message_to_database(
     state: &AppState,
     channel_id: &str,
@@ -465,26 +602,22 @@ async fn save_message_to_database(
 
     // 4. UPDATE CHANNEL FIXTURE with comment_count and unread_counts
     if let Some(fixture_id) = fixture_id {
-        // Get channel to get all member IDs
         let channel = channels_col
             .find_one(doc! { "channel_id": channel_id })
             .await
             .map_err(|e| format!("Failed to get channel: {}", e))?;
 
         if let Some(channel) = channel {
-            // Build inc_doc for unread counts
             let mut inc_doc = doc! {
                 "comment_count": 1,
             };
 
-            // Add unread count increments for each member (except sender)
             for member in &channel.members {
                 if member.user_id != user_id {
                     inc_doc.insert(format!("unread_counts.{}", member.user_id), 1);
                 }
             }
 
-            // Update channel fixture
             channel_fixtures_col
                 .update_one(
                     doc! {

@@ -16,15 +16,15 @@ pub struct Channel {
     pub member_count: i32,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChannelMember {
     pub user_id: String,
     pub username: String,
     pub role: String,
     pub joined_at: DateTime,
-    pub season_points: i32,
-    pub correct_votes: i32,
-    pub total_votes: i32,
+    pub season_points: i32, // Denormalized from User
+    pub correct_votes: i32, // Denormalized from User
+    pub total_votes: i32,   // Denormalized from User
     pub msg_count: i32,
 }
 
@@ -129,17 +129,16 @@ pub struct Message {
 }
 
 // ============================================================================
-// VOTE MODEL
+// VOTE MODEL - NO channel_id (Global Vote)
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Vote {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
-    pub channel_id: String,
     pub fixture_id: String,
     pub user_id: String,
-    pub selection: String,
+    pub selection: String, // "home", "away", "draw"
     pub is_correct: Option<bool>,
     pub points_awarded: Option<i32>,
     pub voted_at: DateTime,

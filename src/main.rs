@@ -1,4 +1,3 @@
-
 use axum::extract::State;
 use axum::{http::Method, response::Json, routing::get, Router};
 use serde_json::{json, Value};
@@ -127,7 +126,7 @@ async fn build_router(app_state: AppState) -> Router {
         .route("/api/health", get(api_health_check))
         .route("/debug/fcm", get(debug_fcm))
         .route("/api/simple_health_check", get(simple_health_check))
-        .nest("/api/auth", routes::auth::auth_routes())
+        .nest("/api/auth", routes::auth::user_routes())
         .nest("/api/games", routes::games::routes())
         .nest("/api/comrades", routes::comrade_route::comrade_routes())
         .nest("/api/posts", routes::posts::routes())
@@ -141,7 +140,10 @@ async fn build_router(app_state: AppState) -> Router {
         .nest("/ws/channel", routes::channel::ws_channel_routes())
         .nest("/comments", routes::posts::comment_routes())
         .nest("/api/channels", routes::channel::channel_routes())
-        .nest("/api/notifications", routes::vote_routes::notification_routes())
+        .nest(
+            "/api/notifications",
+            routes::vote_routes::notification_routes(),
+        )
         .nest("/api/profile", routes::user_profile::user_profile_routes())
         .nest("/api", routes::posts::upload_routes())
         .layer(cors)
