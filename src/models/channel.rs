@@ -2,20 +2,6 @@ use mongodb::bson::{oid::ObjectId, DateTime};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct Fixture {
-    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    pub id: Option<ObjectId>,
-    pub fixture_id: String,
-    pub home_team: String,
-    pub away_team: String,
-    pub kickoff_time: DateTime,
-    pub status: String,
-    pub result: Option<String>,
-    pub home_score: Option<i32>,
-    pub away_score: Option<i32>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct Channel {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
@@ -50,13 +36,31 @@ pub struct ChannelActivity {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct Fixture {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "match_id")]
+    pub fixture_id: String,
+    pub home_team: String,
+    pub away_team: String,
+    #[serde(rename = "date_iso")]
+    pub date_iso: String,
+    #[serde(rename = "time")]
+    pub time: String,
+    pub status: String,
+    pub result: Option<String>,
+    pub home_score: Option<i32>,
+    pub away_score: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ChannelFixture {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub channel_id: String,
     pub fixture_id: String,
     pub match_name: String,
-    pub kickoff_time: DateTime,
+    pub kickoff_time: String, // was DateTime, now String
     pub status: String,
     pub vote_counts: VoteCounts,
     pub last_message: Option<String>,

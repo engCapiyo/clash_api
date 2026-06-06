@@ -346,7 +346,7 @@ pub async fn initialize_fixture_chat_handler(
     }
 
     let fixture = fixtures_col
-        .find_one(doc! { "fixture_id": &payload.fixture_id })
+        .find_one(doc! { "match_id": &payload.fixture_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -355,7 +355,7 @@ pub async fn initialize_fixture_chat_handler(
         channel_id: payload.channel_id,
         fixture_id: payload.fixture_id,
         match_name: format!("{} vs {}", fixture.home_team, fixture.away_team),
-        kickoff_time: fixture.kickoff_time,
+        kickoff_time: format!("{} {}", fixture.date_iso, fixture.time),
         status: fixture.status,
         vote_counts: VoteCounts {
             home: 0,
