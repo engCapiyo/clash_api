@@ -195,6 +195,10 @@ async fn handle_socket(
 // HANDLE INCOMING MESSAGE
 // ============================================================================
 
+// ============================================================================
+// HANDLE INCOMING MESSAGE - CLEANED (NO VOTE)
+// ============================================================================
+
 async fn handle_incoming_message(
     text: String,
     state: &AppState,
@@ -284,6 +288,32 @@ async fn handle_incoming_message(
 
             let room_broadcaster = state.get_or_create_broadcaster(&room_key);
 
+            // Also broadcast comment count update to all clients in the room
+            // Get updated comment count
+            if let Some(fixture_id) = &fixture_id {
+                let channel_fixtures_col =
+                    state.db.collection::<ChannelFixture>("channel_fixtures");
+                if let Ok(Some(cf)) = channel_fixtures_col
+                    .find_one(doc! {
+                        "channel_id": &channel_id,
+                        "fixture_id": fixture_id,
+                    })
+                    .await
+                {
+                    let count_msg = serde_json::json!({
+                        "type": "comment.count",
+                        "payload": {
+                            "fixture_id": fixture_id,
+                            "count": cf.comment_count,
+                        },
+                        "timestamp": Utc::now().to_rfc3339(),
+                    });
+                    if let Ok(count_json) = serde_json::to_string(&count_msg) {
+                        let _ = room_broadcaster.send(count_json);
+                    }
+                }
+            }
+
             let broadcast_msg = serde_json::json!({
                 "type": "chat.message",
                 "payload": payload,
@@ -328,91 +358,6 @@ async fn handle_incoming_message(
                     if let Ok(broadcast_json) = serde_json::to_string(&broadcast_msg) {
                         let _ = room_broadcaster.send(broadcast_json);
                     }
-                }
-            }
-        }
-
-        Some("vote") => {
-            tracing::info!("✅ Matched vote");
-
-            let payload = match json_msg.get("payload") {
-                Some(p) => p.clone(),
-                None => {
-                    tracing::error!("❌ NO PAYLOAD for vote");
-                    return;
-                }
-            };
-
-            let fixture_id = payload
-                .get("fixtureId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let user_id = payload.get("userId").and_then(|v| v.as_str()).unwrap_or("");
-
-            let selection = payload
-                .get("selection")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            if fixture_id.is_empty() || user_id.is_empty() || selection.is_empty() {
-                tracing::error!("❌ Missing vote fields");
-                return;
-            }
-
-            // Save vote to database (global - no channel_id)
-            match save_vote_to_database(state, &fixture_id, &user_id, &selection).await {
-                Ok(_) => {
-                    tracing::info!(
-                        "✅ Vote saved for user {} on fixture {}",
-                        user_id,
-                        fixture_id
-                    );
-
-                    // Broadcast vote update to all channels this fixture is in
-                    // Get all channel fixtures for this fixture
-                    let channel_fixtures_col =
-                        state.db.collection::<ChannelFixture>("channel_fixtures");
-                    // NEW (correct)
-                    let mut cursor = match channel_fixtures_col
-                        .find(doc! { "fixture_id": &fixture_id })
-                        .await
-                    {
-                        Ok(cursor) => cursor,
-                        Err(e) => {
-                            tracing::error!("Failed to find channel fixtures: {}", e);
-                            return;
-                        }
-                    };
-                    let mut channel_ids = Vec::new();
-                    while let Ok(true) = cursor.advance().await {
-                        if let Ok(cf) = cursor.deserialize_current() {
-                            channel_ids.push(cf.channel_id);
-                        }
-                    }
-
-                    // Broadcast to each channel
-                    for channel_id in channel_ids {
-                        let room_key = format!("{}_{}", channel_id, fixture_id);
-                        let room_broadcaster = state.get_or_create_broadcaster(&room_key);
-
-                        let broadcast_msg = serde_json::json!({
-                            "type": "vote.update",
-                            "payload": {
-                                "fixture_id": fixture_id,
-                                "user_id": user_id,
-                                "selection": selection,
-                            },
-                            "timestamp": Utc::now().to_rfc3339(),
-                        });
-
-                        if let Ok(broadcast_json) = serde_json::to_string(&broadcast_msg) {
-                            let _ = room_broadcaster.send(broadcast_json);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("❌ Failed to save vote: {}", e);
                 }
             }
         }
