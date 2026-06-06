@@ -744,6 +744,68 @@ pub async fn reset_weekly_messages_handler(
     ))
 }
 
+// GET /api/channels/:channel_id/fixtures/:fixture_id/comments/count
+pub async fn get_fixture_comment_count_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    let messages_col = state.db.collection::<Message>("messages");
+
+    let filter = doc! {
+        "channel_id": &channel_id,
+        "fixture_id": &fixture_id,
+    };
+
+    let count = messages_col.count_documents(filter).await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel_id,
+        "fixture_id": fixture_id,
+        "count": count,
+    })))
+}
+
+// GET /api/channels/:channel_id/fixtures/:fixture_id/comments/latest
+pub async fn get_fixture_latest_comment_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    let messages_col = state.db.collection::<Message>("messages");
+
+    let filter = doc! {
+        "channel_id": &channel_id,
+        "fixture_id": &fixture_id,
+    };
+
+    let mut cursor = messages_col
+        .find(filter)
+        .sort(doc! { "sent_at": -1 })
+        .limit(1)
+        .await?;
+
+    let latest_comment = if cursor.advance().await? {
+        let message: Message = cursor.deserialize_current()?;
+        Some(json!({
+            "id": message.message_id,
+            "user_id": message.sender_id,
+            "username": message.sender_name,
+            "comment": message.text,
+            "selection": message.selection,
+            "timestamp": message.sent_at,
+        }))
+    } else {
+        None
+    };
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel_id,
+        "fixture_id": fixture_id,
+        "latest_comment": latest_comment,
+    })))
+}
+
 // ============================================================================
 // REQUEST TYPES
 // ============================================================================
