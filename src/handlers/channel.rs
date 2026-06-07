@@ -502,6 +502,7 @@ pub async fn cast_vote_handler(
     Json(payload): Json<CastVoteRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let votes_col = state.db.collection::<Vote>("votes");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
     let now = DateTime::now();
 
     // Check if user already voted on this fixture
@@ -520,9 +521,9 @@ pub async fn cast_vote_handler(
 
     let vote = Vote {
         id: None,
-        fixture_id: payload.fixture_id,
-        user_id: payload.user_id,
-        selection: payload.selection,
+        fixture_id: payload.fixture_id.clone(),
+        user_id: payload.user_id.clone(),
+        selection: payload.selection.clone(),
         is_correct: None,
         points_awarded: None,
         voted_at: now,
@@ -530,12 +531,37 @@ pub async fn cast_vote_handler(
 
     votes_col.insert_one(vote).await?;
 
+    // ✅ UPDATE ALL CHANNEL FIXTURES FOR THIS FIXTURE
+    let increment_field = match payload.selection.as_str() {
+        "home" => "vote_counts.home",
+        "away" => "vote_counts.away",
+        "draw" => "vote_counts.draw",
+        _ => return Err(AppError::ValidationError("Invalid selection".to_string())),
+    };
+
+    channel_fixtures_col
+        .update_many(
+            doc! { "fixture_id": &payload.fixture_id },
+            doc! { "$inc": { increment_field: 1 } },
+        )
+        .await?;
+
+    // Also update user's total_votes count
+    let users_col = state.db.collection::<User>("users");
+    let user_object_id = ObjectId::parse_str(&payload.user_id)?;
+
+    users_col
+        .update_one(
+            doc! { "_id": user_object_id },
+            doc! { "$inc": { "total_votes": 1 } },
+        )
+        .await?;
+
     Ok(Json(json!({
         "success": true,
         "message": "Vote cast successfully"
     })))
 }
-
 // ============================================================================
 // FINALIZE FIXTURE RESULT (Global Points + Sync to All Channels)
 // ============================================================================
