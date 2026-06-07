@@ -1,6 +1,13 @@
 use mongodb::bson::{oid::ObjectId, DateTime};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+// Add this new struct
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PendingRequest {
+    pub user_id: String,
+    pub username: String,
+    pub requested_at: DateTime,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Channel {
@@ -14,8 +21,11 @@ pub struct Channel {
     pub activity: ChannelActivity,
     pub season: String,
     pub member_count: i32,
-}
 
+    // NEW FIELDS
+    pub invite_code: String,
+    pub pending_requests: Vec<PendingRequest>,
+}
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChannelMember {
     pub user_id: String,

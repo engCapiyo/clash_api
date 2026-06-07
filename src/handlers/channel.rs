@@ -11,8 +11,8 @@ use bson::oid::ObjectId;
 
 use crate::errors::{AppError, Result};
 use crate::models::channel::{
-    Channel, ChannelActivity, ChannelFixture, ChannelMember, Fixture, Message, ReplyToData, Vote,
-    VoteCounts,
+    Channel, ChannelActivity, ChannelFixture, ChannelMember, Fixture, Message, PendingRequest,
+    ReplyToData, Vote, VoteCounts,
 };
 use crate::AppState;
 
@@ -35,6 +35,150 @@ pub struct NewMember {
     pub username: String,
 }
 
+// ============================================================================
+// FINALIZE FIXTURE RESULT (Global Points + Sync to All Channels)
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct FinalizeFixtureRequest {
+    pub fixture_id: String,
+    pub result: String, // "home", "away", "draw"
+}
+
+pub async fn finalize_fixture_result_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<FinalizeFixtureRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let votes_col = state.db.collection::<Vote>("votes");
+    let channels_col = state.db.collection::<Channel>("channels");
+    let users_col = state.db.collection::<User>("users");
+    let fixtures_col = state.db.collection::<Fixture>("fixtures");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+
+    // Update fixture status
+    fixtures_col
+        .update_one(
+            doc! { "fixture_id": &payload.fixture_id },
+            doc! {
+                "$set": {
+                    "result": &payload.result,
+                    "status": "completed",
+                }
+            },
+        )
+        .await?;
+
+    // Update all channel fixtures
+    channel_fixtures_col
+        .update_many(
+            doc! { "fixture_id": &payload.fixture_id },
+            doc! { "$set": { "status": "completed" } },
+        )
+        .await?;
+
+    // Find all votes for this fixture that haven't been processed
+    let mut cursor = votes_col
+        .find(doc! {
+            "fixture_id": &payload.fixture_id,
+            "is_correct": null
+        })
+        .await?;
+
+    let mut updates = Vec::new();
+
+    while cursor.advance().await? {
+        let vote: Vote = cursor.deserialize_current()?;
+
+        // Determine points based on result
+        let is_correct = vote.selection == payload.result;
+        let points = if is_correct {
+            // Win = +3 points
+            3
+        } else if vote.selection == "draw" && payload.result != "draw" {
+            // Draw vote but match not draw = -1
+            -1
+        } else if vote.selection != "draw" && payload.result == "draw" {
+            // Team vote but match draw = -1
+            -1
+        } else {
+            // Wrong team = -3
+            -3
+        };
+
+        // Update vote with result
+        votes_col
+            .update_one(
+                doc! { "_id": vote.id },
+                doc! {
+                    "$set": {
+                        "is_correct": is_correct,
+                        "points_awarded": points,
+                    }
+                },
+            )
+            .await?;
+
+        // 1. UPDATE USER GLOBAL POINTS
+        let user_result = users_col
+            .update_one(
+                doc! { "_id": ObjectId::parse_str(&vote.user_id)? },
+                doc! {
+                    "$inc": {
+                        "season_points": points,
+                        "correct_votes": if is_correct { 1 } else { 0 },
+                    }
+                },
+            )
+            .await?;
+
+        if user_result.matched_count > 0 {
+            updates.push(vote.user_id);
+        }
+    }
+
+    // 2. SYNC UPDATED POINTS TO ALL CHANNELS
+    for user_id in &updates {
+        // Get current user data
+        let user = users_col
+            .find_one(doc! { "_id": ObjectId::parse_str(user_id)? })
+            .await?;
+
+        if let Some(user) = user {
+            // Find all channels this user belongs to
+            let mut channel_cursor = channels_col
+                .find(doc! { "members.user_id": user_id })
+                .await?;
+
+            while channel_cursor.advance().await? {
+                let channel: Channel = channel_cursor.deserialize_current()?;
+
+                // Update the member's denormalized points in this channel
+                channels_col
+                    .update_one(
+                        doc! {
+                            "channel_id": &channel.channel_id,
+                            "members.user_id": user_id,
+                        },
+                        doc! {
+                            "$set": {
+                                "members.$.season_points": user.season_points,
+                                "members.$.correct_votes": user.correct_votes,
+                                "members.$.total_votes": user.total_votes,
+                            }
+                        },
+                    )
+                    .await?;
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "processed": true,
+        "users_updated": updates.len()
+    })))
+}
+
 pub async fn create_channel_handler(
     State(state): State<AppState>,
     Json(payload): Json<CreateChannelRequest>,
@@ -44,8 +188,11 @@ pub async fn create_channel_handler(
     let now = DateTime::now();
     let channel_id = Uuid::new_v4().to_string();
 
+    // Generate invite code (6 characters uppercase)
+    let invite_code = Uuid::new_v4().to_string().to_uppercase()[0..6].to_string();
+
     // Build members list with creator as admin
-    let mut members = vec![ChannelMember {
+    let members = vec![ChannelMember {
         user_id: payload.created_by.clone(),
         username: payload.created_by_username.clone(),
         role: "admin".to_string(),
@@ -56,25 +203,9 @@ pub async fn create_channel_handler(
         msg_count: 0,
     }];
 
-    // Add additional members
-    if let Some(extra_members) = &payload.members {
-        for m in extra_members {
-            members.push(ChannelMember {
-                user_id: m.user_id.clone(),
-                username: m.username.clone(),
-                role: "member".to_string(),
-                joined_at: now,
-                season_points: 0,
-                correct_votes: 0,
-                total_votes: 0,
-                msg_count: 0,
-            });
-        }
-    }
-
     let member_count = members.len() as i32;
 
-    // Create channel document
+    // Create channel document with invite_code and pending_requests
     let channel = Channel {
         id: None,
         channel_id: channel_id.clone(),
@@ -90,6 +221,8 @@ pub async fn create_channel_handler(
         },
         season: payload.season,
         member_count,
+        invite_code: invite_code.clone(),
+        pending_requests: vec![],
     };
 
     // Insert channel
@@ -108,7 +241,46 @@ pub async fn create_channel_handler(
     Ok(Json(json!({
         "success": true,
         "channel_id": channel_id,
+        "invite_code": invite_code,
     })))
+}
+
+// ============================================================================
+// CHECK USER VOTE IN CHANNEL (for backward compatibility)
+// ============================================================================
+
+pub async fn check_user_vote_in_channel_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id, user_id)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    // This is deprecated - votes are now global
+    // Redirect to global check
+    let votes_col = state.db.collection::<Vote>("votes");
+
+    let vote = votes_col
+        .find_one(doc! {
+            "fixture_id": &fixture_id,
+            "user_id": &user_id,
+        })
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "has_voted": vote.is_some(),
+        "selection": vote.as_ref().map(|v| &v.selection),
+    })))
+}
+
+// ============================================================================
+// GET USER CHANNEL VOTES (deprecated - redirect to global)
+// ============================================================================
+
+pub async fn get_user_channel_votes_handler(
+    State(state): State<AppState>,
+    Path((channel_id, user_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    // Deprecated - votes are now global, channel_id ignored
+    get_user_votes_handler(State(state), Path(user_id)).await
 }
 
 // ============================================================================
@@ -494,7 +666,7 @@ pub async fn get_messages_handler(
 pub struct CastVoteRequest {
     pub fixture_id: String,
     pub user_id: String,
-    pub selection: String, // "home", "away", "draw"
+    pub selection: String,
 }
 
 pub async fn cast_vote_handler(
@@ -505,7 +677,6 @@ pub async fn cast_vote_handler(
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
     let now = DateTime::now();
 
-    // Check if user already voted on this fixture
     let existing = votes_col
         .find_one(doc! {
             "fixture_id": &payload.fixture_id,
@@ -531,7 +702,6 @@ pub async fn cast_vote_handler(
 
     votes_col.insert_one(vote).await?;
 
-    // ✅ UPDATE ALL CHANNEL FIXTURES FOR THIS FIXTURE
     let increment_field = match payload.selection.as_str() {
         "home" => "vote_counts.home",
         "away" => "vote_counts.away",
@@ -546,7 +716,6 @@ pub async fn cast_vote_handler(
         )
         .await?;
 
-    // Also update user's total_votes count
     let users_col = state.db.collection::<User>("users");
     let user_object_id = ObjectId::parse_str(&payload.user_id)?;
 
@@ -562,149 +731,256 @@ pub async fn cast_vote_handler(
         "message": "Vote cast successfully"
     })))
 }
+
 // ============================================================================
-// FINALIZE FIXTURE RESULT (Global Points + Sync to All Channels)
+// USER REQUESTS TO JOIN CHANNEL
 // ============================================================================
 
 #[derive(Debug, serde::Deserialize)]
-pub struct FinalizeFixtureRequest {
-    pub fixture_id: String,
-    pub result: String, // "home", "away", "draw"
+pub struct RequestJoinRequest {
+    pub channel_id: String,
+    pub user_id: String,
+    pub username: String,
 }
 
-pub async fn finalize_fixture_result_handler(
+pub async fn request_join_channel_handler(
     State(state): State<AppState>,
-    Json(payload): Json<FinalizeFixtureRequest>,
+    Json(payload): Json<RequestJoinRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    let votes_col = state.db.collection::<Vote>("votes");
+    let channels_col = state.db.collection::<Channel>("channels");
+    let now = DateTime::now();
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &payload.channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let is_member = channel.members.iter().any(|m| m.user_id == payload.user_id);
+    if is_member {
+        return Err(AppError::ValidationError(
+            "Already a member of this channel".to_string(),
+        ));
+    }
+
+    let is_pending = channel
+        .pending_requests
+        .iter()
+        .any(|r| r.user_id == payload.user_id);
+    if is_pending {
+        return Err(AppError::ValidationError(
+            "Join request already pending".to_string(),
+        ));
+    }
+
+    let new_request = PendingRequest {
+        user_id: payload.user_id,
+        username: payload.username,
+        requested_at: now,
+    };
+
+    let bson_request = bson::to_bson(&new_request)
+        .map_err(|e| AppError::ValidationError(format!("Failed to serialize: {}", e)))?;
+
+    channels_col
+        .update_one(
+            doc! { "channel_id": &payload.channel_id },
+            doc! { "$push": { "pending_requests": bson_request } },
+        )
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Join request sent to admin"
+    })))
+}
+
+// ============================================================================
+// GET PENDING REQUESTS FOR ADMIN
+// ============================================================================
+
+pub async fn get_pending_requests_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "pending_requests": channel.pending_requests,
+        "count": channel.pending_requests.len(),
+    })))
+}
+
+// ============================================================================
+// ADMIN APPROVES JOIN REQUEST
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ApproveRequestRequest {
+    pub channel_id: String,
+    pub user_id: String,
+    pub username: String,
+}
+
+pub async fn approve_join_request_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<ApproveRequestRequest>,
+) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
     let users_col = state.db.collection::<User>("users");
-    let fixtures_col = state.db.collection::<Fixture>("fixtures");
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+    let now = DateTime::now();
 
-    // Update fixture status
-    fixtures_col
+    let user_obj_id = ObjectId::parse_str(&payload.user_id)?;
+    let user = users_col.find_one(doc! { "_id": user_obj_id }).await?;
+
+    let (season_points, correct_votes, total_votes) = if let Some(u) = user {
+        (u.season_points, u.correct_votes, u.total_votes)
+    } else {
+        (0, 0, 0)
+    };
+
+    let new_member = ChannelMember {
+        user_id: payload.user_id.clone(),
+        username: payload.username.clone(),
+        role: "member".to_string(),
+        joined_at: now,
+        season_points,
+        correct_votes,
+        total_votes,
+        msg_count: 0,
+    };
+
+    let bson_member = bson::to_bson(&new_member)
+        .map_err(|e| AppError::ValidationError(format!("Failed to serialize: {}", e)))?;
+
+    let result = channels_col
         .update_one(
-            doc! { "fixture_id": &payload.fixture_id },
+            doc! { "channel_id": &payload.channel_id },
             doc! {
-                "$set": {
-                    "result": &payload.result,
-                    "status": "completed",
-                }
+                "$pull": { "pending_requests": { "user_id": &payload.user_id } },
+                "$push": { "members": bson_member },
+                "$inc": { "member_count": 1 }
             },
         )
         .await?;
 
-    // Update all channel fixtures
-    channel_fixtures_col
-        .update_many(
-            doc! { "fixture_id": &payload.fixture_id },
-            doc! { "$set": { "status": "completed" } },
-        )
-        .await?;
-
-    // Find all votes for this fixture that haven't been processed
-    let mut cursor = votes_col
-        .find(doc! {
-            "fixture_id": &payload.fixture_id,
-            "is_correct": null
-        })
-        .await?;
-
-    let mut updates = Vec::new();
-
-    while cursor.advance().await? {
-        let vote: Vote = cursor.deserialize_current()?;
-
-        // Determine points based on result
-        let is_correct = vote.selection == payload.result;
-        let points = if is_correct {
-            // Win = +3 points
-            3
-        } else if vote.selection == "draw" && payload.result != "draw" {
-            // Draw vote but match not draw = -1
-            -1
-        } else if vote.selection != "draw" && payload.result == "draw" {
-            // Team vote but match draw = -1
-            -1
-        } else {
-            // Wrong team = -3
-            -3
-        };
-
-        // Update vote with result
-        votes_col
-            .update_one(
-                doc! { "_id": vote.id },
-                doc! {
-                    "$set": {
-                        "is_correct": is_correct,
-                        "points_awarded": points,
-                    }
-                },
-            )
-            .await?;
-
-        // 1. UPDATE USER GLOBAL POINTS
-        let user_result = users_col
-            .update_one(
-                doc! { "_id": ObjectId::parse_str(&vote.user_id).unwrap() },
-                doc! {
-                    "$inc": {
-                        "season_points": points,
-                        "correct_votes": if is_correct { 1 } else { 0 },
-                        "total_votes": 1,
-                    }
-                },
-            )
-            .await?;
-
-        if user_result.matched_count > 0 {
-            updates.push(vote.user_id);
-        }
-    }
-
-    // 2. SYNC UPDATED POINTS TO ALL CHANNELS
-    // ✅ FIXED: Use &updates (borrow) instead of updates (move)
-    for user_id in &updates {
-        // Get current user data
-        let user = users_col
-            .find_one(doc! { "_id": ObjectId::parse_str(user_id).unwrap() })
-            .await?;
-
-        if let Some(user) = user {
-            // Find all channels this user belongs to
-            let mut channel_cursor = channels_col
-                .find(doc! { "members.user_id": user_id })
-                .await?;
-
-            while channel_cursor.advance().await? {
-                let channel: Channel = channel_cursor.deserialize_current()?;
-
-                // Update the member's denormalized points in this channel
-                channels_col
-                    .update_one(
-                        doc! {
-                            "channel_id": &channel.channel_id,
-                            "members.user_id": user_id,
-                        },
-                        doc! {
-                            "$set": {
-                                "members.$.season_points": user.season_points,
-                                "members.$.correct_votes": user.correct_votes,
-                                "members.$.total_votes": user.total_votes,
-                            }
-                        },
-                    )
-                    .await?;
-            }
-        }
+    if result.matched_count == 0 {
+        return Err(AppError::DocumentNotFound);
     }
 
     Ok(Json(json!({
         "success": true,
-        "processed": true,
-        "users_updated": updates.len()
+        "message": "User approved and added to channel"
+    })))
+}
+
+// ============================================================================
+// ADMIN REJECTS JOIN REQUEST
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RejectRequestRequest {
+    pub channel_id: String,
+    pub user_id: String,
+}
+
+pub async fn reject_join_request_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<RejectRequestRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let result = channels_col
+        .update_one(
+            doc! { "channel_id": &payload.channel_id },
+            doc! { "$pull": { "pending_requests": { "user_id": &payload.user_id } } },
+        )
+        .await?;
+
+    if result.matched_count == 0 {
+        return Err(AppError::DocumentNotFound);
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Join request rejected"
+    })))
+}
+
+// ============================================================================
+// JOIN CHANNEL VIA INVITE CODE (AUTO-APPROVED)
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct JoinByCodeRequest {
+    pub invite_code: String,
+    pub user_id: String,
+    pub username: String,
+}
+
+pub async fn join_channel_by_code_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<JoinByCodeRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+    let users_col = state.db.collection::<User>("users");
+    let now = DateTime::now();
+
+    let channel = channels_col
+        .find_one(doc! { "invite_code": &payload.invite_code })
+        .await?
+        .ok_or(AppError::ValidationError("Invalid invite code".to_string()))?;
+
+    let is_member = channel.members.iter().any(|m| m.user_id == payload.user_id);
+    if is_member {
+        return Err(AppError::ValidationError(
+            "Already a member of this channel".to_string(),
+        ));
+    }
+
+    let user_obj_id = ObjectId::parse_str(&payload.user_id)?;
+    let user = users_col.find_one(doc! { "_id": user_obj_id }).await?;
+
+    let (season_points, correct_votes, total_votes) = if let Some(u) = user {
+        (u.season_points, u.correct_votes, u.total_votes)
+    } else {
+        (0, 0, 0)
+    };
+
+    let new_member = ChannelMember {
+        user_id: payload.user_id,
+        username: payload.username,
+        role: "member".to_string(),
+        joined_at: now,
+        season_points,
+        correct_votes,
+        total_votes,
+        msg_count: 0,
+    };
+
+    let bson_member = bson::to_bson(&new_member)
+        .map_err(|e| AppError::ValidationError(format!("Failed to serialize: {}", e)))?;
+
+    channels_col
+        .update_one(
+            doc! { "channel_id": &channel.channel_id },
+            doc! {
+                "$push": { "members": bson_member },
+                "$inc": { "member_count": 1 }
+            },
+        )
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel.channel_id,
+        "channel_name": channel.name,
+        "message": "Joined channel successfully"
     })))
 }
 
@@ -729,7 +1005,6 @@ pub async fn add_members_to_channel_handler(
     let mut members_to_add = Vec::new();
 
     for member in &payload.members {
-        // Fetch user's current points
         let user_obj_id = match ObjectId::parse_str(&member.user_id) {
             Ok(id) => id,
             Err(_) => continue,
@@ -865,6 +1140,27 @@ pub async fn get_fixture_comment_count_handler(
     Ok(Json(json!({
         "success": true,
         "count": count,
+    })))
+}
+
+// ============================================================================
+// GET CHANNEL INVITE CODE
+// ============================================================================
+
+pub async fn get_channel_invite_code_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "invite_code": channel.invite_code,
     })))
 }
 
