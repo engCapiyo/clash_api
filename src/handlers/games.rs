@@ -810,6 +810,8 @@ pub async fn update_game_status(
     Path(match_id): Path<String>,
     Json(payload): Json<GameStatusUpdate>,
 ) -> Result<Json<Game>> {
+    use crate::handlers::channel::finalize_fixture_result_handler;
+    use crate::handlers::channel::FinalizeFixtureRequest;
     use crate::handlers::ws_handler::broadcast_live_match_update;
     use crate::models::channel::ChannelFixture;
     use mongodb::Collection;
@@ -837,7 +839,51 @@ pub async fn update_game_status(
 
     collection.update_one(filter.clone(), update).await?;
 
-    // ✅ Broadcast to ALL channels that have this fixture
+    // ✅ AUTO-FINALIZE WHEN MATCH BECOMES COMPLETED
+    if payload.status == "completed" {
+        tracing::info!(
+            "🏁 Match {} status set to completed! Auto-finalizing points...",
+            match_id
+        );
+
+        // Get final scores from database
+        if let Some(game) = collection.find_one(filter.clone()).await? {
+            let home_score = game.home_score.unwrap_or(0);
+            let away_score = game.away_score.unwrap_or(0);
+
+            let result = if home_score > away_score {
+                "home"
+            } else if away_score > home_score {
+                "away"
+            } else {
+                "draw"
+            };
+
+            let finalize_request = FinalizeFixtureRequest {
+                fixture_id: match_id.clone(),
+                result: result.to_string(),
+            };
+
+            match finalize_fixture_result_handler(State(state.clone()), Json(finalize_request))
+                .await
+            {
+                Ok(response) => {
+                    tracing::info!(
+                        "✅ Match {} auto-finalized with result: {} ({}-{})",
+                        match_id,
+                        result,
+                        home_score,
+                        away_score
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("❌ Failed to auto-finalize match {}: {:?}", match_id, e);
+                }
+            }
+        }
+    }
+
+    // Broadcast to ALL channels that have this fixture
     let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
     let mut cursor = channel_fixtures_col
         .find(doc! { "fixture_id": &match_id })
@@ -876,7 +922,6 @@ pub async fn update_game_status(
         None => Err(AppError::DocumentNotFound),
     }
 }
-
 // ============================================================================
 // RECEIVE LIVE UPDATE - From Python Poller, Broadcasts to ALL channels
 // ============================================================================
@@ -945,11 +990,15 @@ pub async fn store_lineups(
             .collect(),
     );
 
+    // ✅ FIX: Convert bson::to_document result properly
+    let bson_doc = bson::to_document(&doc).map_err(|e| {
+        AppError::InternalServerError(format!("Failed to serialize lineups: {}", e))
+    })?;
+
     lineups_col
         .update_one(
             doc! { "match_id": &payload.fixture_id },
-            doc! { "$set": bson::to_document(&doc).map_err(|e| AppError::InternalServerError(e.to_string()))? },
-           
+            doc! { "$set": bson_doc },
         )
         .upsert(true)
         .await?;
@@ -1014,6 +1063,8 @@ pub async fn receive_live_update(
     State(state): State<AppState>,
     Json(update): Json<LiveGameUpdate>,
 ) -> Result<Json<serde_json::Value>> {
+    use crate::handlers::channel::finalize_fixture_result_handler;
+    use crate::handlers::channel::FinalizeFixtureRequest;
     use crate::handlers::ws_handler::broadcast_live_match_update;
     use crate::models::channel::ChannelFixture;
     use mongodb::Collection;
@@ -1054,7 +1105,47 @@ pub async fn receive_live_update(
         update.minute
     );
 
-    // ✅ Broadcast to ALL channels that have this fixture
+    // ✅ AUTO-FINALIZE WHEN MATCH ENDS
+    if update.event_type == "match_end" {
+        tracing::info!(
+            "🏁 Match {} ended! Auto-finalizing points...",
+            update.fixture_id
+        );
+
+        // Determine result based on final score
+        let result = if update.home_score > update.away_score {
+            "home"
+        } else if update.away_score > update.home_score {
+            "away"
+        } else {
+            "draw"
+        };
+
+        // Call the finalize handler
+        let finalize_request = FinalizeFixtureRequest {
+            fixture_id: update.fixture_id.clone(),
+            result: result.to_string(),
+        };
+
+        match finalize_fixture_result_handler(State(state.clone()), Json(finalize_request)).await {
+            Ok(response) => {
+                tracing::info!(
+                    "✅ Match {} auto-finalized with result: {}",
+                    update.fixture_id,
+                    result
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    "❌ Failed to auto-finalize match {}: {:?}",
+                    update.fixture_id,
+                    e
+                );
+            }
+        }
+    }
+
+    // Broadcast to ALL channels that have this fixture
     let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
     let mut cursor = channel_fixtures_col
         .find(doc! { "fixture_id": &update.fixture_id })
