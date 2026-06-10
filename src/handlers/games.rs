@@ -11,7 +11,6 @@ use serde_json::json;
 use std::collections::HashMap;
 use tracing; // Add if missing
 
-use crate::errors::{AppError, Result};
 use crate::handlers::ws_handler::broadcast_live_match_update;
 use crate::models::game::{
     CommentaryEntry, Game, GameQuery, GameStatusUpdate, HistoryGame, LiveGameUpdate,
@@ -19,6 +18,10 @@ use crate::models::game::{
 };
 use crate::models::notification::FCMToken;
 use crate::state::AppState;
+use crate::{
+    errors::{AppError, Result},
+    models::line_up::LineupsUpdate,
+};
 
 // ============================================================================
 // TEST NOTIFICATION REQUEST
@@ -748,7 +751,7 @@ pub async fn update_game_score(
     let update_result = collection
         .update_one(filter.clone(), doc! { "$set": update_doc })
         .await?;
-    
+
     if update_result.matched_count == 0 {
         return Err(AppError::DocumentNotFound);
     }
@@ -756,7 +759,8 @@ pub async fn update_game_score(
     // ✅ Broadcast to ALL channels that have this fixture
     if payload.home_score.is_some() || payload.away_score.is_some() {
         if let Some(game) = collection.find_one(filter.clone()).await? {
-            let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
+            let channel_fixtures_col: Collection<ChannelFixture> =
+                state.db.collection("channel_fixtures");
             let mut cursor = channel_fixtures_col
                 .find(doc! { "fixture_id": &match_id })
                 .await?;
@@ -772,12 +776,13 @@ pub async fn update_game_score(
             while cursor.advance().await? {
                 let cf = cursor.deserialize_current()?;
                 broadcast_live_match_update(
-                    &state, 
-                    &cf.channel_id, 
-                    &match_id, 
-                    "score", 
-                    score_payload.clone()
-                ).await;
+                    &state,
+                    &cf.channel_id,
+                    &match_id,
+                    "score",
+                    score_payload.clone(),
+                )
+                .await;
                 channel_count += 1;
             }
 
@@ -854,7 +859,8 @@ pub async fn update_game_status(
             &match_id,
             "status",
             status_payload.clone(),
-        ).await;
+        )
+        .await;
         channel_count += 1;
     }
 
@@ -874,6 +880,135 @@ pub async fn update_game_status(
 // ============================================================================
 // RECEIVE LIVE UPDATE - From Python Poller, Broadcasts to ALL channels
 // ============================================================================
+
+pub async fn store_lineups(
+    State(state): State<AppState>,
+    Json(payload): Json<LineupsUpdate>,
+) -> Result<Json<serde_json::Value>> {
+    use crate::models::line_up::{LineupsDocument, Player};
+
+    tracing::info!("📋 Storing lineups for fixture: {}", payload.fixture_id);
+
+    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let lineups_col: Collection<LineupsDocument> = state.db.collection("lineups");
+
+    let game = games_col
+        .find_one(doc! { "match_id": &payload.fixture_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let map_player = |p: crate::models::line_up::RawPlayer| Player {
+        name: p.name,
+        position: p.position,
+        jersey_number: p.jersey_number,
+        captain: p.captain,
+        lineup: p.lineup,
+        player_id: p.player_id,
+        rating: None,
+    };
+
+    let doc = LineupsDocument::new(
+        payload.fixture_id.clone(),
+        game.home_team.clone(),
+        game.away_team.clone(),
+        payload.lineups.home.formation,
+        payload.lineups.away.formation,
+        payload.lineups.home.coach.name,
+        payload.lineups.away.coach.name,
+        payload
+            .lineups
+            .home
+            .players
+            .into_iter()
+            .map(map_player)
+            .collect(),
+        payload
+            .lineups
+            .home
+            .bench
+            .into_iter()
+            .map(map_player)
+            .collect(),
+        payload
+            .lineups
+            .away
+            .players
+            .into_iter()
+            .map(map_player)
+            .collect(),
+        payload
+            .lineups
+            .away
+            .bench
+            .into_iter()
+            .map(map_player)
+            .collect(),
+    );
+
+    lineups_col
+        .update_one(
+            doc! { "match_id": &payload.fixture_id },
+            doc! { "$set": bson::to_document(&doc).map_err(|e| AppError::InternalServerError(e.to_string()))? },
+           
+        )
+        .upsert(true)
+        .await?;
+
+    games_col
+        .update_one(
+            doc! { "match_id": &payload.fixture_id },
+            doc! { "$set": { "lineups_fetched": true } },
+        )
+        .await?;
+
+    tracing::info!("✅ Lineups stored for {}", payload.fixture_id);
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": payload.fixture_id,
+        "home_players": doc.home_starting_xi.len(),
+        "away_players": doc.away_starting_xi.len(),
+    })))
+}
+
+pub async fn get_lineups(
+    State(state): State<AppState>,
+    Path(match_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    use crate::models::line_up::LineupsDocument;
+
+    let lineups_col: Collection<LineupsDocument> = state.db.collection("lineups");
+
+    match lineups_col.find_one(doc! { "match_id": &match_id }).await? {
+        Some(doc) => Ok(Json(json!({
+            "success": true,
+            "fixture_id": match_id,
+            "lineups": {
+                "home": {
+                    "formation": doc.home_formation,
+                    "coach": doc.home_coach,
+                    "players": doc.home_starting_xi,
+                    "bench": doc.home_bench,
+                },
+                "away": {
+                    "formation": doc.away_formation,
+                    "coach": doc.away_coach,
+                    "players": doc.away_starting_xi,
+                    "bench": doc.away_bench,
+                },
+            },
+            "fetched_at": doc.fetched_at.to_chrono().to_rfc3339(),
+        }))),
+        None => Ok(Json(json!({
+            "success": false,
+            "fixture_id": match_id,
+            "lineups": {
+                "home": { "players": [] },
+                "away": { "players": [] },
+            },
+        }))),
+    }
+}
 
 pub async fn receive_live_update(
     State(state): State<AppState>,
@@ -947,7 +1082,8 @@ pub async fn receive_live_update(
             &update.fixture_id,
             &update.event_type,
             update_payload.clone(),
-        ).await;
+        )
+        .await;
         channel_count += 1;
     }
 
@@ -990,8 +1126,6 @@ pub async fn get_fixture_vote_count_fast(
         "timestamp": Utc::now().to_rfc3339(),
     })))
 }
-
-
 
 pub async fn get_fixture_comment_count_fast(
     State(state): State<AppState>,
@@ -1220,7 +1354,6 @@ pub async fn add_commentary(
         "message": "Commentary added"
     })))
 }
-
 
 pub async fn get_match_commentary(
     State(state): State<AppState>,

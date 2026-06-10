@@ -156,9 +156,9 @@ pub struct LiveGameUpdate {
     pub player_in: Option<String>,
     pub on_target: Option<bool>,
     pub blocked: Option<bool>,
-    pub timestamp: BsonDateTime,
+    #[serde(skip_deserializing)]
+    pub timestamp: Option<BsonDateTime>,
 }
-
 // ========== COMMENTARY UPDATE FROM PYTHON POLLER ==========
 #[derive(Debug, Deserialize)]
 pub struct CommentaryUpdate {
