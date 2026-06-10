@@ -8,6 +8,7 @@ use mongodb::Collection;
 use serde_json::json;
 use tracing;
 
+use crate::errors::AppError;
 use crate::errors::Result;
 use crate::models::statistics::{MatchStatistics, StatisticsRequest};
 use crate::state::AppState;
@@ -87,16 +88,21 @@ pub async fn add_statistics_snapshot(
     Json(req): Json<StatisticsRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let stats = MatchStatistics::from_request(req);
-
     let collection: Collection<MatchStatistics> = state.db.collection("statistics");
-    collection.insert_one(&stats).await?;
+
+    collection
+        .update_one(
+            doc! { "_id": &stats.id },
+            doc! { "$set": bson::to_document(&stats).map_err(|e| AppError::InternalServerError(e.to_string()))? },
+        )
+        .upsert(true)
+        .await?;
 
     Ok(Json(json!({
         "success": true,
-        "message": "Statistics snapshot added",
+        "message": "Statistics snapshot saved",
     })))
 }
-
 // BULK add statistics
 pub async fn bulk_update_statistics(
     State(state): State<AppState>,
