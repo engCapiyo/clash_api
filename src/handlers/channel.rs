@@ -1,6 +1,8 @@
 use crate::models::user::User;
+
 use axum::{
     extract::{Path, Query, State},
+    response::IntoResponse,
     Json,
 };
 use mongodb::bson::{doc, DateTime};
@@ -1180,6 +1182,50 @@ pub async fn get_channel_invite_code_handler(
         "success": true,
         "invite_code": channel.invite_code,
     })))
+}
+
+pub async fn get_fixture_vote_count_handler(
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let collection = state.db.collection::<ChannelFixture>("channel_fixtures");
+
+    let filter = doc! {
+        "channel_id": &channel_id,
+        "fixture_id": &fixture_id
+    };
+
+    match collection.find_one(filter).await {
+        Ok(Some(channel_fixture)) => {
+            let vote_counts = channel_fixture.vote_counts;
+
+            Json(json!({
+                "success": true,
+                "fixture_id": fixture_id,
+                "channel_id": channel_id,
+                "home_votes": vote_counts.home,
+                "away_votes": vote_counts.away,
+                "draw_votes": vote_counts.draw,
+                "total_votes": vote_counts.home + vote_counts.away + vote_counts.draw
+            }))
+        }
+        Ok(None) => Json(json!({
+            "success": false,
+            "message": "Fixture not found in this channel",
+            "home_votes": 0,
+            "away_votes": 0,
+            "draw_votes": 0,
+            "total_votes": 0
+        })),
+        Err(e) => Json(json!({
+            "success": false,
+            "message": format!("Database error: {}", e),
+            "home_votes": 0,
+            "away_votes": 0,
+            "draw_votes": 0,
+            "total_votes": 0
+        })),
+    }
 }
 
 // ============================================================================
