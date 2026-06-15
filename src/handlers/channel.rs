@@ -270,7 +270,25 @@ pub async fn check_user_vote_in_channel_handler(
         "selection": vote.as_ref().map(|v| &v.selection),
     })))
 }
+pub async fn get_single_fixture_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
+    let fixture = channel_fixtures_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "fixture_id": &fixture_id,
+        })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture": fixture,
+    })))
+}
 // ============================================================================
 // GET USER CHANNEL VOTES (deprecated - redirect to global)
 // ============================================================================

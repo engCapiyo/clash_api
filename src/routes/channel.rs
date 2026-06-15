@@ -9,11 +9,11 @@ use crate::handlers::channel::{
     finalize_fixture_result_handler, get_channel_fixtures_handler, get_channel_handler,
     get_channel_invite_code_handler, get_channel_leaderboard_handler,
     get_fixture_comment_count_handler, get_fixture_latest_comment_handler, get_messages_handler,
-    get_pending_requests_handler, get_user_channel_count_handler, get_user_channel_votes_handler,
-    get_user_channels_handler, get_user_unread_count_handler, get_user_votes_handler,
-    get_weekly_top_channel_handler, initialize_fixture_chat_handler, join_channel_by_code_handler,
-    leave_channel_handler, mark_chat_as_read_handler, reject_join_request_handler,
-    request_join_channel_handler, reset_weekly_messages_handler,
+    get_pending_requests_handler, get_single_fixture_handler, get_user_channel_count_handler,
+    get_user_channel_votes_handler, get_user_channels_handler, get_user_unread_count_handler,
+    get_user_votes_handler, get_weekly_top_channel_handler, initialize_fixture_chat_handler,
+    join_channel_by_code_handler, leave_channel_handler, mark_chat_as_read_handler,
+    reject_join_request_handler, request_join_channel_handler, reset_weekly_messages_handler,
 };
 use crate::handlers::ws_handler::ws_comments_handler;
 use crate::AppState;
@@ -102,6 +102,11 @@ pub fn channel_routes() -> Router<AppState> {
         .route(
             "/:channel_id/fixtures/:fixture_id/comments/count",
             get(get_fixture_comment_count_handler),
+        )
+        // GET single fixture data (❌ MISSING)
+        .route(
+            "/:channel_id/fixtures/:fixture_id",
+            get(get_single_fixture_handler),
         )
         .route(
             "/:channel_id/fixtures/:fixture_id/comments/latest",
