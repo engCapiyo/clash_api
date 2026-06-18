@@ -9,6 +9,7 @@ use mongodb::bson::{doc, DateTime};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::services::fcm_service::FCMService;
 use bson::oid::ObjectId;
 
 use crate::errors::{AppError, Result};
@@ -761,20 +762,29 @@ pub struct RequestJoinRequest {
     pub channel_id: String,
     pub user_id: String,
     pub username: String,
+    pub user_nickname: Option<String>,
 }
-
 pub async fn request_join_channel_handler(
     State(state): State<AppState>,
     Json(payload): Json<RequestJoinRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    let channels_col = state.db.collection::<Channel>("channels");
-    let now = DateTime::now();
+    println!(
+        "📥 [REQUEST-JOIN] User: {} requesting to join channel: {}",
+        payload.user_id, payload.channel_id
+    );
 
+    let channels_col = state.db.collection::<Channel>("channels");
+    let now = mongodb::bson::DateTime::now();
+
+    // 1. Get the channel
     let channel = channels_col
         .find_one(doc! { "channel_id": &payload.channel_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
+    println!("📢 [REQUEST-JOIN] Found channel: {}", channel.name);
+
+    // 2. Check if already a member
     let is_member = channel.members.iter().any(|m| m.user_id == payload.user_id);
     if is_member {
         return Err(AppError::ValidationError(
@@ -782,6 +792,7 @@ pub async fn request_join_channel_handler(
         ));
     }
 
+    // 3. Check if request already pending
     let is_pending = channel
         .pending_requests
         .iter()
@@ -792,15 +803,17 @@ pub async fn request_join_channel_handler(
         ));
     }
 
+    // 4. Create pending request
     let new_request = PendingRequest {
-        user_id: payload.user_id,
-        username: payload.username,
+        user_id: payload.user_id.clone(),
+        username: payload.username.clone(),
         requested_at: now,
     };
 
     let bson_request = bson::to_bson(&new_request)
         .map_err(|e| AppError::ValidationError(format!("Failed to serialize: {}", e)))?;
 
+    // 5. Add to pending requests
     channels_col
         .update_one(
             doc! { "channel_id": &payload.channel_id },
@@ -808,9 +821,68 @@ pub async fn request_join_channel_handler(
         )
         .await?;
 
+    println!("✅ [REQUEST-JOIN] Added to pending requests");
+
+    // 6. 🔔 SEND NOTIFICATION TO ALL ADMINS
+    let admin_user_ids: Vec<String> = channel
+        .members
+        .iter()
+        .filter(|m| m.role == "admin")
+        .map(|m| m.user_id.clone())
+        .collect();
+
+    if !admin_user_ids.is_empty() {
+        let display_name = payload.user_nickname.unwrap_or(payload.username.clone());
+
+        let notification_data = json!({
+            "type": "join_request",
+            "channel_id": payload.channel_id,
+            "channel_name": channel.name,
+            "user_id": payload.user_id,
+            "username": payload.username,
+            "request_id": format!("{}_{}", payload.user_id, payload.channel_id),
+            "notificationType": "join_request",
+        });
+
+        let title = "📥 Join Request";
+        let body = format!("{} wants to join '{}'", display_name, channel.name);
+
+        // ✅ FIX: Check if FCM service exists
+        if let Some(fcm_service) = &state.fcm_service {
+            for admin_id in &admin_user_ids {
+                println!(
+                    "📱 [REQUEST-JOIN] Sending notification to admin: {}",
+                    admin_id
+                );
+
+                let _ = fcm_service
+                    .send_to_user(
+                        &state,
+                        admin_id,
+                        title,
+                        &body,
+                        notification_data.clone(),
+                        "join_request",
+                    )
+                    .await;
+            }
+            println!(
+                "📱 [REQUEST-JOIN] Sent notifications to {} admins",
+                admin_user_ids.len()
+            );
+        } else {
+            println!("⚠️ [REQUEST-JOIN] FCM service not available, skipping notifications");
+        }
+    } else {
+        println!("⚠️ [REQUEST-JOIN] No admins found in channel");
+    }
+
+    println!("✅ [REQUEST-JOIN] Join request processed successfully");
+
     Ok(Json(json!({
         "success": true,
-        "message": "Join request sent to admin"
+        "message": "Join request sent to admin",
+        "pending_requests_count": channel.pending_requests.len() + 1,
     })))
 }
 
@@ -853,8 +925,15 @@ pub async fn approve_join_request_handler(
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
     let users_col = state.db.collection::<User>("users");
-    let now = DateTime::now();
+    let now = mongodb::bson::DateTime::now();
 
+    // 1. Get the channel
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &payload.channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    // 2. Get user data for points
     let user_obj_id = ObjectId::parse_str(&payload.user_id)?;
     let user = users_col.find_one(doc! { "_id": user_obj_id }).await?;
 
@@ -864,6 +943,7 @@ pub async fn approve_join_request_handler(
         (0, 0, 0)
     };
 
+    // 3. Create member
     let new_member = ChannelMember {
         user_id: payload.user_id.clone(),
         username: payload.username.clone(),
@@ -878,6 +958,7 @@ pub async fn approve_join_request_handler(
     let bson_member = bson::to_bson(&new_member)
         .map_err(|e| AppError::ValidationError(format!("Failed to serialize: {}", e)))?;
 
+    // 4. Add to channel and remove from pending
     let result = channels_col
         .update_one(
             doc! { "channel_id": &payload.channel_id },
@@ -893,6 +974,31 @@ pub async fn approve_join_request_handler(
         return Err(AppError::DocumentNotFound);
     }
 
+    // 5. 🔔 NOTIFY USER THAT REQUEST WAS APPROVED
+    if let Some(fcm_service) = &state.fcm_service {
+        let notification_data = json!({
+            "type": "join_approved",
+            "channel_id": payload.channel_id,
+            "channel_name": channel.name,
+            "action": "open_channel",
+            "notificationType": "join_approved",
+        });
+
+        let title = "✅ Request Approved!";
+        let body = format!("You have been added to '{}' 🎉", channel.name);
+
+        let _ = fcm_service
+            .send_to_user(
+                &state,
+                &payload.user_id,
+                title,
+                &body,
+                notification_data,
+                "join_approved",
+            )
+            .await;
+    }
+
     Ok(Json(json!({
         "success": true,
         "message": "User approved and added to channel"
@@ -902,7 +1008,6 @@ pub async fn approve_join_request_handler(
 // ============================================================================
 // ADMIN REJECTS JOIN REQUEST
 // ============================================================================
-
 #[derive(Debug, serde::Deserialize)]
 pub struct RejectRequestRequest {
     pub channel_id: String,
@@ -915,15 +1020,49 @@ pub async fn reject_join_request_handler(
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
 
+    // 1. Get the channel to get name for notification
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &payload.channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    // 2. Remove from pending
     let result = channels_col
         .update_one(
-            doc! { "channel_id": &payload.channel_id },
+            doc! {
+                "channel_id": &payload.channel_id,
+                "pending_requests.user_id": &payload.user_id
+            },
             doc! { "$pull": { "pending_requests": { "user_id": &payload.user_id } } },
         )
         .await?;
 
     if result.matched_count == 0 {
         return Err(AppError::DocumentNotFound);
+    }
+
+    // 3. 🔔 NOTIFY USER THAT REQUEST WAS REJECTED
+    if let Some(fcm_service) = &state.fcm_service {
+        let notification_data = json!({
+            "type": "join_rejected",
+            "channel_id": payload.channel_id,
+            "channel_name": channel.name,
+            "notificationType": "join_rejected",
+        });
+
+        let title = "❌ Request Declined";
+        let body = format!("Your request to join '{}' was declined", channel.name);
+
+        let _ = fcm_service
+            .send_to_user(
+                &state,
+                &payload.user_id,
+                title,
+                &body,
+                notification_data,
+                "join_rejected",
+            )
+            .await;
     }
 
     Ok(Json(json!({
