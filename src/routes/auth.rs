@@ -4,16 +4,20 @@ use axum::{
 };
 
 use crate::handlers::auth::{
-    get_all_users, get_user_by_id, get_user_by_username, login, register, update_user_phone,
-    update_user_points,
+    check_user_exists, get_all_users, get_user_by_id, get_user_by_username, login, pin_login,
+    register, set_pin, update_user_phone, update_user_points,
 };
 use crate::AppState;
 
 pub fn user_routes() -> Router<AppState> {
     Router::new()
-        // Auth routes
+        // Auth routes - Firebase OTP
         .route("/register", post(register))
         .route("/login", post(login))
+        // Auth routes - PIN fallback
+        .route("/pin-login", post(pin_login))
+        .route("/check-user/:phone", get(check_user_exists))
+        .route("/set-pin/:user_id", post(set_pin))
         // User retrieval routes
         .route("/users", get(get_all_users))
         .route("/user/id/:user_id", get(get_user_by_id))

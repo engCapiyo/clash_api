@@ -65,6 +65,7 @@ yup-oauth2 = "=8.3.2"
 hyper = { version = "0.14", features = ["full"] }
 hyper-rustls = "0.24"
 rs-firebase-admin-sdk = "=2.4.0"
+sha2 = "0.10"       # for hashing
 
 # Misc
 dotenvy = "0.15"

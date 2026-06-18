@@ -9,10 +9,13 @@ use mongodb::{
     bson::{doc, oid::ObjectId, DateTime},
     Collection,
 };
+use rand::Rng;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::models::user::{
-    AuthResponse, Claims, CreateUserRequest, UpdateUserPointsRequest, User, UserResponse,
+    AuthResponse, Claims, CreateUserRequest, PinLoginRequest, SetPinRequest,
+    UpdateUserPointsRequest, User, UserResponse,
 };
 use crate::state::AppState;
 
@@ -36,6 +39,24 @@ fn generate_token(user_id: &str, username: &str, phone: &str) -> String {
         &EncodingKey::from_secret(secret.as_ref()),
     )
     .unwrap_or_else(|_| "".to_string())
+}
+
+// ============================================================================
+// HELPER: Hash PIN with salt
+// ============================================================================
+
+fn hash_pin(pin: &str, salt: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}{}", pin, salt).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn generate_salt() -> String {
+    rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(16)
+        .map(char::from)
+        .collect()
 }
 
 // ============================================================================
@@ -118,6 +139,12 @@ pub async fn register(
         season_points: 0,
         correct_votes: 0,
         total_votes: 0,
+        pin_hash: None,
+        pin_salt: None,
+        is_pin_enabled: false,
+        firebase_uid: None,
+        auth_methods: vec![],
+        last_login: None,
     };
 
     match collection.insert_one(&user).await {
@@ -137,6 +164,7 @@ pub async fn register(
                 season_points: 0,
                 correct_votes: 0,
                 total_votes: 0,
+                has_pin: false,
             };
 
             let token = generate_token(
@@ -170,7 +198,7 @@ pub async fn register(
 }
 
 // ============================================================================
-// LOGIN / GET USER BY PHONE
+// LOGIN / GET USER BY PHONE (Firebase flow)
 // ============================================================================
 
 pub async fn login(
@@ -185,6 +213,15 @@ pub async fn login(
         Ok(Some(user)) => {
             println!("✅ User found: {}", user.username);
 
+            // Update last login
+            let now = DateTime::from_millis(Utc::now().timestamp_millis());
+            let _ = collection
+                .update_one(
+                    doc! { "_id": user.id.clone().unwrap() },
+                    doc! { "$set": { "last_login": now } },
+                )
+                .await;
+
             let user_response = UserResponse {
                 id: user.id.unwrap().to_hex(),
                 username: user.username,
@@ -194,6 +231,292 @@ pub async fn login(
                 season_points: user.season_points,
                 correct_votes: user.correct_votes,
                 total_votes: user.total_votes,
+                has_pin: user.is_pin_enabled,
+            };
+
+            let token = generate_token(
+                &user_response.id,
+                &user_response.username,
+                &user_response.phone,
+            );
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "user": user_response,
+                    "token": token
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => {
+            println!("❌ User not found with phone: {}", payload.phone);
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "success": false,
+                    "message": "User not found"
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            println!("❌ Database error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": format!("Database error: {}", e)
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ============================================================================
+// CHECK IF USER EXISTS (for PIN fallback)
+// ============================================================================
+
+pub async fn check_user_exists(
+    State(state): State<AppState>,
+    Path(phone): Path<String>,
+) -> impl IntoResponse {
+    println!("🔍 Checking if user exists: {}", phone);
+
+    let collection: Collection<User> = state.db.collection("users");
+
+    match collection.find_one(doc! { "phone": &phone }).await {
+        Ok(Some(user)) => {
+            println!("✅ User exists: {}", user.username);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "exists": true,
+                    "has_pin": user.is_pin_enabled,
+                    "user": {
+                        "id": user.id.unwrap().to_hex(),
+                        "username": user.username,
+                        "phone": user.phone,
+                        "has_pin": user.is_pin_enabled,
+                    }
+                })),
+            )
+                .into_response()
+        }
+        Ok(None) => {
+            println!("❌ User not found: {}", phone);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "exists": false,
+                    "has_pin": false,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            println!("❌ Database error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": format!("Database error: {}", e)
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ============================================================================
+// SET PIN FOR USER (after Firebase registration or fallback)
+// ============================================================================
+
+pub async fn set_pin(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+    Json(payload): Json<SetPinRequest>,
+) -> impl IntoResponse {
+    println!("🔐 Setting PIN for user: {}", user_id);
+
+    let collection: Collection<User> = state.db.collection("users");
+
+    let object_id = match ObjectId::parse_str(&user_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "message": "Invalid user ID format"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate PIN format
+    if payload.pin.len() != 4 || !payload.pin.chars().all(|c| c.is_ascii_digit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "PIN must be exactly 4 digits"
+            })),
+        )
+            .into_response();
+    }
+
+    let salt = generate_salt();
+    let pin_hash = hash_pin(&payload.pin, &salt);
+    let now = DateTime::from_millis(Utc::now().timestamp_millis());
+
+    match collection
+        .update_one(
+            doc! { "_id": object_id },
+            doc! {
+                "$set": {
+                    "pin_hash": pin_hash,
+                    "pin_salt": salt,
+                    "is_pin_enabled": true,
+                    "updated_at": now,
+                }
+            },
+        )
+        .await
+    {
+        Ok(result) => {
+            if result.matched_count == 0 {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "success": false,
+                        "message": "User not found"
+                    })),
+                )
+                    .into_response();
+            }
+
+            println!("✅ PIN set for user: {}", user_id);
+
+            // Get updated user
+            match collection.find_one(doc! { "_id": object_id }).await {
+                Ok(Some(user)) => {
+                    let user_response = UserResponse {
+                        id: user.id.unwrap().to_hex(),
+                        username: user.username,
+                        phone: user.phone,
+                        balance: user.balance,
+                        is_admin: user.is_admin,
+                        season_points: user.season_points,
+                        correct_votes: user.correct_votes,
+                        total_votes: user.total_votes,
+                        has_pin: true,
+                    };
+
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "success": true,
+                            "message": "PIN set successfully",
+                            "user": user_response,
+                        })),
+                    )
+                        .into_response()
+                }
+                _ => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "success": true,
+                        "message": "PIN set successfully",
+                    })),
+                )
+                    .into_response(),
+            }
+        }
+        Err(e) => {
+            println!("❌ Failed to set PIN: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": format!("Failed to set PIN: {}", e)
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ============================================================================
+// PIN LOGIN (fallback for Firebase failures)
+// ============================================================================
+
+pub async fn pin_login(
+    State(state): State<AppState>,
+    Json(payload): Json<PinLoginRequest>,
+) -> impl IntoResponse {
+    println!("🔐 PIN login attempt for: {}", payload.phone);
+
+    let collection: Collection<User> = state.db.collection("users");
+
+    // Find user by phone
+    match collection.find_one(doc! { "phone": &payload.phone }).await {
+        Ok(Some(user)) => {
+            // Check if PIN is enabled
+            if !user.is_pin_enabled {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "success": false,
+                        "message": "PIN not set for this account"
+                    })),
+                )
+                    .into_response();
+            }
+
+            // Verify PIN
+            let salt = user.pin_salt.as_deref().unwrap_or("");
+            let expected_hash = user.pin_hash.as_deref().unwrap_or("");
+            let provided_hash = hash_pin(&payload.pin, salt);
+
+            if provided_hash != expected_hash {
+                println!("❌ Invalid PIN for user: {}", payload.phone);
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "success": false,
+                        "message": "Invalid PIN"
+                    })),
+                )
+                    .into_response();
+            }
+
+            println!("✅ PIN login successful for: {}", payload.phone);
+
+            // Update last login
+            let now = DateTime::from_millis(Utc::now().timestamp_millis());
+            let _ = collection
+                .update_one(
+                    doc! { "_id": user.id.clone().unwrap() },
+                    doc! { "$set": { "last_login": now } },
+                )
+                .await;
+
+            let user_response = UserResponse {
+                id: user.id.unwrap().to_hex(),
+                username: user.username,
+                phone: user.phone,
+                balance: user.balance,
+                is_admin: user.is_admin,
+                season_points: user.season_points,
+                correct_votes: user.correct_votes,
+                total_votes: user.total_votes,
+                has_pin: true,
             };
 
             let token = generate_token(
@@ -274,6 +597,7 @@ pub async fn get_user_by_id(
                 season_points: user.season_points,
                 correct_votes: user.correct_votes,
                 total_votes: user.total_votes,
+                has_pin: user.is_pin_enabled,
             };
 
             (
@@ -330,6 +654,7 @@ pub async fn get_user_by_username(
                 season_points: user.season_points,
                 correct_votes: user.correct_votes,
                 total_votes: user.total_votes,
+                has_pin: user.is_pin_enabled,
             };
 
             (
@@ -401,6 +726,7 @@ pub async fn get_all_users(State(state): State<AppState>) -> impl IntoResponse {
                         season_points: user.season_points,
                         correct_votes: user.correct_votes,
                         total_votes: user.total_votes,
+                        has_pin: user.is_pin_enabled,
                     })
                 })
                 .collect();

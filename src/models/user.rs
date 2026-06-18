@@ -16,12 +16,31 @@ pub struct User {
     pub season_points: i32,
     pub correct_votes: i32,
     pub total_votes: i32,
+
+    // PIN AUTH FIELDS (new)
+    pub pin_hash: Option<String>,
+    pub pin_salt: Option<String>,
+    pub is_pin_enabled: bool,
+    pub firebase_uid: Option<String>,
+    pub auth_methods: Vec<String>,
+    pub last_login: Option<DateTime>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CreateUserRequest {
     pub username: String,
     pub phone: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PinLoginRequest {
+    pub phone: String,
+    pub pin: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetPinRequest {
+    pub pin: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -34,6 +53,7 @@ pub struct UserResponse {
     pub season_points: i32,
     pub correct_votes: i32,
     pub total_votes: i32,
+    pub has_pin: bool,
 }
 
 #[derive(Debug, Serialize)]
