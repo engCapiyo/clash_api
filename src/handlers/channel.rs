@@ -917,6 +917,25 @@ pub async fn get_all_channels_handler(
 // ============================================================================
 // GET PENDING REQUESTS FOR ADMIN
 // ============================================================================
+pub async fn get_invite_channel_handler(
+    State(state): State<AppState>,
+    Path(invite_code): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "invite_code": &invite_code })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel.channel_id,
+        "channel_name": channel.name,
+        "member_count": channel.member_count,
+        "created_by": channel.created_by,
+    })))
+}
 
 pub async fn get_pending_requests_handler(
     State(state): State<AppState>,
