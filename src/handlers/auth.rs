@@ -20,6 +20,32 @@ use crate::models::user::{
 use crate::state::AppState;
 
 // ============================================================================
+// HELPER: Normalize phone number (country-code agnostic)
+// ============================================================================
+// Strips everything but digits, drops a leading trunk '0', then keeps only
+// the last 9 digits. This makes "+254705306867", "254705306867", and
+// "0705306867" all collapse to the same value: "705306867".
+fn normalize_phone(phone: &str) -> String {
+    let mut cleaned: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+    if cleaned.starts_with('0') {
+        cleaned = cleaned[1..].to_string();
+    }
+    if cleaned.len() > 9 {
+        cleaned = cleaned[cleaned.len() - 9..].to_string();
+    }
+    cleaned
+}
+
+// Builds a Mongo query that matches any stored phone ending in the same
+// digits, regardless of how it was originally formatted/stored.
+// Safe to format directly into regex: normalize_phone only ever returns
+// ASCII digits, so there are no characters that need escaping.
+fn phone_query(phone: &str) -> mongodb::bson::Document {
+    let normalized = normalize_phone(phone);
+    doc! { "phone": { "$regex": format!("{}$", normalized) } }
+}
+
+// ============================================================================
 // HELPER: Generate JWT Token
 // ============================================================================
 
@@ -71,8 +97,8 @@ pub async fn register(
 
     let collection: Collection<User> = state.db.collection("users");
 
-    // Check if phone already exists
-    match collection.find_one(doc! { "phone": &payload.phone }).await {
+    // Check if phone already exists — normalized match, not exact string
+    match collection.find_one(phone_query(&payload.phone)).await {
         Ok(Some(_)) => {
             return (
                 StatusCode::CONFLICT,
@@ -209,7 +235,7 @@ pub async fn login(
 
     let collection: Collection<User> = state.db.collection("users");
 
-    match collection.find_one(doc! { "phone": &payload.phone }).await {
+    match collection.find_one(phone_query(&payload.phone)).await {
         Ok(Some(user)) => {
             println!("✅ User found: {}", user.username);
 
@@ -287,7 +313,7 @@ pub async fn check_user_exists(
 
     let collection: Collection<User> = state.db.collection("users");
 
-    match collection.find_one(doc! { "phone": &phone }).await {
+    match collection.find_one(phone_query(&phone)).await {
         Ok(Some(user)) => {
             println!("✅ User exists: {}", user.username);
             (
@@ -464,8 +490,8 @@ pub async fn pin_login(
 
     let collection: Collection<User> = state.db.collection("users");
 
-    // Find user by phone
-    match collection.find_one(doc! { "phone": &payload.phone }).await {
+    // Find user by phone — normalized match
+    match collection.find_one(phone_query(&payload.phone)).await {
         Ok(Some(user)) => {
             // Check if PIN is enabled
             if !user.is_pin_enabled {
@@ -845,9 +871,9 @@ pub async fn update_user_phone(
     Path(user_id): Path<String>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let phone = payload.get("phone").and_then(|p| p.as_str()).unwrap_or("");
+    let raw_phone = payload.get("phone").and_then(|p| p.as_str()).unwrap_or("");
 
-    if phone.is_empty() {
+    if raw_phone.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
@@ -874,6 +900,77 @@ pub async fn update_user_phone(
         }
     };
 
+    // Validate: digits-only count (after stripping symbols) must look like
+    // a real phone number, not garbage.
+    let digit_count = raw_phone.chars().filter(|c| c.is_ascii_digit()).count();
+    if digit_count < 9 || digit_count > 15 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Phone number must contain between 9 and 15 digits"
+            })),
+        )
+            .into_response();
+    }
+
+    // Reject anything that isn't digits, spaces, dashes, parens, or a
+    // leading '+' — guards against junk data ending up in the phone field.
+    let is_valid_format = raw_phone
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')'));
+    if !is_valid_format {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "success": false,
+                "message": "Phone number contains invalid characters"
+            })),
+        )
+            .into_response();
+    }
+
+    // Store a cleaned version: keep a leading '+' if present, strip
+    // everything else that isn't a digit (spaces, dashes, parens).
+    let cleaned_phone: String = {
+        let has_plus = raw_phone.trim_start().starts_with('+');
+        let digits_only: String = raw_phone.chars().filter(|c| c.is_ascii_digit()).collect();
+        if has_plus {
+            format!("+{}", digits_only)
+        } else {
+            digits_only
+        }
+    };
+
+    // Check no *other* user already has this number (normalized match,
+    // so "+254705306867" vs "0705306867" are correctly seen as the same).
+    match collection.find_one(phone_query(&cleaned_phone)).await {
+        Ok(Some(existing)) => {
+            if existing.id != Some(object_id) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "success": false,
+                        "message": "Phone number is already in use by another account"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+        Err(e) => {
+            println!("❌ Database error checking phone uniqueness: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "Database error"
+                })),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+    }
+
     let now = DateTime::from_millis(Utc::now().timestamp_millis());
 
     match collection
@@ -881,7 +978,7 @@ pub async fn update_user_phone(
             doc! { "_id": object_id },
             doc! {
                 "$set": {
-                    "phone": phone,
+                    "phone": &cleaned_phone,
                     "updated_at": now,
                 }
             },
@@ -900,13 +997,17 @@ pub async fn update_user_phone(
                     .into_response();
             }
 
-            println!("✅ Updated phone for user: {}", user_id);
+            println!(
+                "✅ Updated phone for user: {} -> {}",
+                user_id, cleaned_phone
+            );
 
             (
                 StatusCode::OK,
                 Json(json!({
                     "success": true,
-                    "message": "Phone number updated"
+                    "message": "Phone number updated",
+                    "phone": cleaned_phone,
                 })),
             )
                 .into_response()
