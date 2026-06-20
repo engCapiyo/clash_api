@@ -372,12 +372,154 @@ async fn handle_incoming_message(
             }
         }
 
+        // ================================================================
+        // ✅ NEW: JOIN REQUEST HANDLER
+        // ================================================================
+        Some("join.request") => {
+            tracing::info!("📨 Join request via WebSocket");
+
+            if let Some(payload) = json_msg.get("payload") {
+                let channel_id = payload
+                    .get("channel_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let user_id = payload
+                    .get("user_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let username = payload
+                    .get("username")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown");
+
+                let channel_name = payload
+                    .get("channel_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown Channel");
+
+                if channel_id.is_empty() || user_id.is_empty() {
+                    tracing::warn!("⚠️ Missing channel_id or user_id in join.request");
+                    return;
+                }
+
+                tracing::info!(
+                    "📨 User {} wants to join channel {} ({})",
+                    username,
+                    channel_name,
+                    channel_id
+                );
+
+                // Get channel admins and notify them in real-time
+                let channels_col = state.db.collection::<Channel>("channels");
+
+                match channels_col
+                    .find_one(doc! { "channel_id": &channel_id })
+                    .await
+                {
+                    Ok(Some(channel)) => {
+                        let admin_user_ids: Vec<String> = channel
+                            .members
+                            .iter()
+                            .filter(|m| m.role == "admin")
+                            .map(|m| m.user_id.clone())
+                            .collect();
+
+                        if admin_user_ids.is_empty() {
+                            tracing::warn!("⚠️ No admins found for channel {}", channel_name);
+                        } else {
+                            tracing::info!(
+                                "📨 Sending real-time notification to {} admins",
+                                admin_user_ids.len()
+                            );
+                        }
+
+                        // Broadcast to all admins in real-time
+                        for admin_id in &admin_user_ids {
+                            let admin_room = format!("user_{}", admin_id);
+                            let admin_tx = state.get_or_create_broadcaster(&admin_room);
+
+                            let notification = serde_json::json!({
+                                "type": "join_request_received",
+                                "payload": {
+                                    "channel_id": channel_id,
+                                    "channel_name": channel_name,
+                                    "requester_id": user_id,
+                                    "requester_name": username,
+                                    "request_id": format!("{}_{}", user_id, channel_id),
+                                    "timestamp": Utc::now().to_rfc3339(),
+                                }
+                            });
+
+                            if let Ok(json) = serde_json::to_string(&notification) {
+                                if let Err(e) = admin_tx.send(json) {
+                                    tracing::error!(
+                                        "❌ Failed to send to admin {}: {}",
+                                        admin_id,
+                                        e
+                                    );
+                                } else {
+                                    tracing::info!("📨 Sent join request to admin {}", admin_id);
+                                }
+                            }
+                        }
+
+                        // Also broadcast to the channel's room so other admins see it
+                        let channel_room_key = format!("channel_{}", channel_id);
+                        let channel_tx = state.get_or_create_broadcaster(&channel_room_key);
+
+                        let channel_notification = serde_json::json!({
+                            "type": "join_request",
+                            "payload": {
+                                "channel_id": channel_id,
+                                "channel_name": channel_name,
+                                "requester_id": user_id,
+                                "requester_name": username,
+                                "timestamp": Utc::now().to_rfc3339(),
+                            }
+                        });
+
+                        if let Ok(json) = serde_json::to_string(&channel_notification) {
+                            let _ = channel_tx.send(json);
+                        }
+
+                        // Send confirmation back to the requester
+                        let confirmation = serde_json::json!({
+                            "type": "join.response",
+                            "payload": {
+                                "channel_id": channel_id,
+                                "status": "pending",
+                                "message": format!("Join request sent to admins of {}", channel_name),
+                                "timestamp": Utc::now().to_rfc3339(),
+                            }
+                        });
+
+                        if let Ok(json) = serde_json::to_string(&confirmation) {
+                            let _ = _broadcaster.send(json);
+                        }
+
+                        tracing::info!(
+                            "✅ Join request notification sent for {} to {} admins",
+                            channel_name,
+                            admin_user_ids.len()
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::error!("❌ Channel not found: {}", channel_id);
+                    }
+                    Err(e) => {
+                        tracing::error!("❌ Database error: {}", e);
+                    }
+                }
+            }
+        }
+
         _ => {
             tracing::warn!("⚠️ UNMATCHED type: {:?}", message_type);
         }
     }
 }
-
 // ============================================================================
 // SAVE VOTE TO DATABASE (GLOBAL - No channel_id)
 // ============================================================================
