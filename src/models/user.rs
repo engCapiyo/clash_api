@@ -10,19 +10,30 @@ pub struct User {
     pub balance: f64,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+    #[serde(default)]
     pub is_admin: bool,
 
     // GLOBAL POINTS FIELDS
+    #[serde(default)]
     pub season_points: i32,
+    #[serde(default)]
     pub correct_votes: i32,
+    #[serde(default)]
     pub total_votes: i32,
 
-    // PIN AUTH FIELDS (new)
+    // PIN AUTH FIELDS (new) — defaulted so legacy documents without
+    // these keys at all still deserialize successfully.
+    #[serde(default)]
     pub pin_hash: Option<String>,
+    #[serde(default)]
     pub pin_salt: Option<String>,
+    #[serde(default)]
     pub is_pin_enabled: bool,
+    #[serde(default)]
     pub firebase_uid: Option<String>,
+    #[serde(default)]
     pub auth_methods: Vec<String>,
+    #[serde(default)]
     pub last_login: Option<DateTime>,
 }
 
