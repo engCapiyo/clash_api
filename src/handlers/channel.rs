@@ -885,6 +885,34 @@ pub async fn request_join_channel_handler(
         "pending_requests_count": channel.pending_requests.len() + 1,
     })))
 }
+pub async fn get_all_channels_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let mut cursor = channels_col
+        .find(doc! {})
+        .sort(doc! { "member_count": -1 })
+        .await?;
+
+    let mut channels = Vec::new();
+    while cursor.advance().await? {
+        let channel: Channel = cursor.deserialize_current()?;
+        channels.push(json!({
+            "channel_id": channel.channel_id,
+            "name": channel.name,
+            "member_count": channel.member_count,
+            "created_by": channel.created_by,
+            "season": channel.season,
+        }));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "channels": channels,
+        "count": channels.len(),
+    })))
+}
 
 // ============================================================================
 // GET PENDING REQUESTS FOR ADMIN
