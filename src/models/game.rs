@@ -13,6 +13,12 @@ pub struct Voter {
     #[serde(rename = "selection")]
     pub selection: String,
 
+    #[serde(rename = "isCorrect", skip_serializing_if = "Option::is_none")]
+    pub is_correct: Option<bool>,
+
+    #[serde(rename = "pointsAwarded", skip_serializing_if = "Option::is_none")]
+    pub points_awarded: Option<i32>,
+
     #[serde(rename = "votedAt")]
     pub voted_at: BsonDateTime,
 }
@@ -88,6 +94,9 @@ pub struct Game {
     #[serde(rename = "time_elapsed", default)]
     pub time_elapsed: i32,
 
+    #[serde(rename = "result", skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>, // "home", "away", "draw"
+
     #[serde(rename = "source")]
     pub source: String,
 
@@ -159,6 +168,7 @@ pub struct LiveGameUpdate {
     #[serde(skip_deserializing)]
     pub timestamp: Option<BsonDateTime>,
 }
+
 // ========== COMMENTARY UPDATE FROM PYTHON POLLER ==========
 #[derive(Debug, Deserialize)]
 pub struct CommentaryUpdate {

@@ -9,8 +9,9 @@ use mongodb::bson::{doc, DateTime};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::models::game::Game;
 use crate::services::fcm_service::FCMService;
-use bson::oid::ObjectId;
+use bson::oid::ObjectId; // ✅ MUST HAVE THIS
 
 use crate::errors::{AppError, Result};
 use crate::models::channel::{
@@ -678,51 +679,79 @@ pub async fn get_messages_handler(
         "count": messages.len(),
     })))
 }
-
 // ============================================================================
-// CAST VOTE (GLOBAL - No channel_id)
+// CAST VOTE (GLOBAL - No channel_id, No votes collection)
 // ============================================================================
 
 #[derive(Debug, serde::Deserialize)]
 pub struct CastVoteRequest {
     pub fixture_id: String,
     pub user_id: String,
-    pub selection: String,
+    pub selection: String, // "home", "away", "draw"
 }
 
 pub async fn cast_vote_handler(
     State(state): State<AppState>,
     Json(payload): Json<CastVoteRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    let votes_col = state.db.collection::<Vote>("votes");
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
-    let now = DateTime::now();
+    use bson::{doc, DateTime as BsonDateTime};
+    use mongodb::Collection;
 
-    let existing = votes_col
+    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+    let users_col = state.db.collection::<User>("users");
+    let now = BsonDateTime::from_chrono(chrono::Utc::now());
+
+    // 1. Check if user already voted (check embedded voters array)
+    let existing_voter = games_col
         .find_one(doc! {
-            "fixture_id": &payload.fixture_id,
-            "user_id": &payload.user_id,
+            "match_id": &payload.fixture_id,
+            "voters.userId": &payload.user_id,
         })
         .await?;
 
-    if existing.is_some() {
+    if existing_voter.is_some() {
         return Err(AppError::ValidationError(
             "Already voted on this fixture".to_string(),
         ));
     }
 
-    let vote = Vote {
-        id: None,
-        fixture_id: payload.fixture_id.clone(),
-        user_id: payload.user_id.clone(),
-        selection: payload.selection.clone(),
-        is_correct: None,
-        points_awarded: None,
-        voted_at: now,
+    // 2. Get user info for voter display
+    let user_id_obj = ObjectId::parse_str(&payload.user_id)?;
+    let user = users_col
+        .find_one(doc! { "_id": user_id_obj })
+        .await?
+        .ok_or_else(|| AppError::DocumentNotFound)?;
+
+    // Convert selection: "home" -> "home_team", "away" -> "away_team", "draw" -> "draw"
+    let display_selection = match payload.selection.as_str() {
+        "home" => "home_team",
+        "away" => "away_team",
+        "draw" => "draw",
+        _ => &payload.selection,
     };
 
-    votes_col.insert_one(vote).await?;
+    // 3. ✅ UPDATE FIXTURE - Add voter to voters array, increment vote count
+    games_col
+        .update_one(
+            doc! { "match_id": &payload.fixture_id },
+            doc! {
+                "$inc": { "votes": 1 },
+                "$push": {
+                    "voters": {
+                        "userId": &payload.user_id,
+                        "userName": &user.username,
+                        "selection": display_selection,
+                        "isCorrect": null,        // Unknown until match finalized
+                        "pointsAwarded": null,    // Unknown until match finalized
+                        "votedAt": now,
+                    }
+                }
+            },
+        )
+        .await?;
 
+    // 4. Update all channel_fixtures vote_counts
     let increment_field = match payload.selection.as_str() {
         "home" => "vote_counts.home",
         "away" => "vote_counts.away",
@@ -737,21 +766,24 @@ pub async fn cast_vote_handler(
         )
         .await?;
 
-    let users_col = state.db.collection::<User>("users");
-    let user_object_id = ObjectId::parse_str(&payload.user_id)?;
-
+    // 5. Update user total_votes
     users_col
         .update_one(
-            doc! { "_id": user_object_id },
+            doc! { "_id": user_id_obj },
             doc! { "$inc": { "total_votes": 1 } },
         )
         .await?;
 
     Ok(Json(json!({
         "success": true,
-        "message": "Vote cast successfully"
+        "message": "Vote cast successfully",
+        "fixture_id": payload.fixture_id,
+        "selection": payload.selection,
     })))
 }
+// ============================================================================
+// CAST VOTE (GLOBAL - No channel_id)
+// ============================================================================
 
 // ============================================================================
 // USER REQUESTS TO JOIN CHANNEL

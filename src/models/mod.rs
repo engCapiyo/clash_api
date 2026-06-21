@@ -20,6 +20,7 @@ pub use sub_fixture::*;
 
 pub(crate) mod channel;
 pub(crate) mod comrade;
+pub(crate) mod votes_visibility;
 
 pub(crate) mod line_up;
 pub(crate) mod statistics;
