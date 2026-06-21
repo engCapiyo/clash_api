@@ -5,10 +5,11 @@ use axum::{
 use chrono::Utc;
 use futures_util::TryStreamExt;
 use mongodb::{
-    bson::{doc, oid::ObjectId},
+    bson::{doc, oid::ObjectId, DateTime as BsonDateTime},
     Collection,
 };
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::{
     errors::{AppError, Result},
@@ -16,6 +17,7 @@ use crate::{
         Bet, BetResponse, CreateBetRequest, PledgeId, SuccessResponse, UpdateBalanceRequest,
         UpdateBetRequest, UpdatePledgeStatusRequest,
     },
+    models::game::{Bettor, Game, Pledger},
     models::pledges::Pledge,
     state::AppState,
 };
@@ -77,7 +79,10 @@ pub async fn get_bets(
     Ok(Json(responses))
 }
 
-// Create a new bet
+// ============================================================================
+// CREATE BET (ACCEPT PLEDGE) - Moves pledger → bettor
+// ============================================================================
+
 pub async fn create_bet(
     State(state): State<AppState>,
     Json(payload): Json<CreateBetRequest>,
@@ -127,12 +132,114 @@ pub async fn create_bet(
         ));
     }
 
+    // ========================================================================
+    // 1. GET THE FIXTURE
+    // ========================================================================
+    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let fixture_filter = doc! { "match_id": &payload.match_id };
+
+    let _fixture = games_col
+        .find_one(fixture_filter.clone())
+        .await?
+        .ok_or_else(|| AppError::DocumentNotFound)?;
+
+    // ========================================================================
+    // 2. FIND AND REMOVE PLEDGER (starter) FROM PLEDGERS ARRAY
+    // ========================================================================
+    let update_result = games_col
+        .update_one(
+            doc! {
+                "match_id": &payload.match_id,
+                "pledgers.userId": &payload.starter_id
+            },
+            doc! {
+                "$pull": {
+                    "pledgers": { "userId": &payload.starter_id }
+                },
+                "$inc": { "pledges": -1 }
+            },
+        )
+        .await?;
+
+    if update_result.matched_count == 0 {
+        return Err(AppError::ValidationError(
+            "Pledger not found for this fixture".to_string(),
+        ));
+    }
+
+    // ========================================================================
+    // 3. ADD BOTH USERS TO BETTORS ARRAY
+    // ========================================================================
+    let now = BsonDateTime::from_chrono(Utc::now());
+    let bet_id = ObjectId::new();
+    let bet_id_str = bet_id.to_hex();
+
+    let starter_bettor = Bettor {
+        user_id: payload.starter_id.clone(),
+        user_name: payload.starter_username.clone(),
+        selection: payload.starter_selection.clone(),
+        amount: payload.starter_amount,
+        opponent_id: payload.finisher_id.clone(),
+        opponent_name: payload.finisher_username.clone(),
+        opponent_selection: payload.finisher_selection.clone(),
+        opponent_amount: finisher_amount,
+        total_pot: payload.total_pot,
+        bet_id: bet_id_str.clone(),
+        status: Some("active".to_string()),
+        winner: None,
+        payout: None,
+        matched_at: now,
+        resolved_at: None,
+    };
+
+    let finisher_bettor = Bettor {
+        user_id: payload.finisher_id.clone(),
+        user_name: payload.finisher_username.clone(),
+        selection: payload.finisher_selection.clone(),
+        amount: finisher_amount,
+        opponent_id: payload.starter_id.clone(),
+        opponent_name: payload.starter_username.clone(),
+        opponent_selection: payload.starter_selection.clone(),
+        opponent_amount: payload.starter_amount,
+        total_pot: payload.total_pot,
+        bet_id: bet_id_str.clone(),
+        status: Some("active".to_string()),
+        winner: None,
+        payout: None,
+        matched_at: now,
+        resolved_at: None,
+    };
+
+    // Convert to BSON for push
+    let starter_bson = bson::to_bson(&starter_bettor)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to serialize: {}", e)))?;
+    let finisher_bson = bson::to_bson(&finisher_bettor)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to serialize: {}", e)))?;
+
+    games_col
+        .update_one(
+            doc! { "match_id": &payload.match_id },
+            doc! {
+                "$push": {
+                    "bettors": {
+                        "$each": [starter_bson, finisher_bson]
+                    }
+                },
+                "$inc": { "bets": 1 }
+            },
+        )
+        .await?;
+
+    // ========================================================================
+    // 4. CREATE BET DOCUMENT
+    // ========================================================================
     let collection: Collection<Bet> = state.db.collection("bets");
-    let now = Utc::now();
+    let now_chrono = Utc::now();
 
     let bet: Bet = Bet {
-        id: Some(ObjectId::new()),
+        id: Some(bet_id),
         pledge_id: payload.pledge_id.to_string(),
+        match_id: payload.match_id.clone(),
         starter_id: payload.starter_id.clone(),
         starter_username: payload.starter_username.clone(),
         starter_selection: payload.starter_selection.clone(),
@@ -149,22 +256,38 @@ pub async fn create_bet(
         league: payload.league.clone(),
         sport_type: payload.sport_type.clone(),
         total_pot: payload.total_pot,
-        status: payload.status.clone(),
-        winner_id: payload.winner_id,
-        winner_username: payload.winner_username,
-        winning_selection: payload.winning_selection,
+        status: "active".to_string(),
+        winner_id: None,
+        winner_username: None,
+        winning_selection: None,
         odds: payload.odds.clone(),
-        created_at: now,
-        updated_at: now,
+        created_at: now_chrono,
+        updated_at: now_chrono,
         completed_at: None,
     };
 
     collection.insert_one(&bet).await?;
 
+    // ========================================================================
+    // 5. UPDATE PLEDGE STATUS TO "matched"
+    // ========================================================================
+    let pledges_col: Collection<Pledge> = state.db.collection("pledges");
+    pledges_col
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&payload.pledge_id.to_string())? },
+            doc! {
+                "$set": {
+                    "status": "matched",
+                    "bet_id": &bet_id_str,
+                    "updated_at": now_chrono
+                }
+            },
+        )
+        .await?;
+
     println!(
         "✅ Successfully created bet: {} - Total Pot: ₿{}",
-        bet.id.as_ref().map(|id| id.to_hex()).unwrap_or_default(),
-        payload.total_pot
+        bet_id_str, payload.total_pot
     );
 
     let response = BetResponse::from(bet);
@@ -217,7 +340,6 @@ pub async fn get_user_bets(
 ) -> Result<Json<Vec<BetResponse>>> {
     println!("👤 Getting user bets...");
 
-    // user_id is required for this endpoint
     let user_id = query
         .user_id
         .ok_or_else(|| AppError::MissingRequiredField("user_id".to_string()))?;
@@ -277,7 +399,10 @@ pub async fn get_bet_by_id(
     Ok(Json(response))
 }
 
-// Update bet status
+// ============================================================================
+// UPDATE BET STATUS (Match Result) - Updates bettors with winner/loser
+// ============================================================================
+
 pub async fn update_bet_status(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -292,13 +417,47 @@ pub async fn update_bet_status(
         ));
     }
 
+    // ========================================================================
+    // 1. GET THE BET
+    // ========================================================================
     let collection: Collection<Bet> = state.db.collection("bets");
-
     let filter = doc! { "_id": ObjectId::parse_str(&id)? };
+
+    let bet = collection
+        .find_one(filter.clone())
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    // ========================================================================
+    // 2. DETERMINE WINNER (starter or finisher)
+    // ========================================================================
+    let winner_id = if bet.starter_selection == payload.winning_selection {
+        Some(bet.starter_id.clone())
+    } else if bet.finisher_selection == payload.winning_selection {
+        Some(bet.finisher_id.clone())
+    } else {
+        None // Draw or no winner
+    };
+
+    let winner_username = if let Some(ref wid) = winner_id {
+        if wid == &bet.starter_id {
+            Some(bet.starter_username.clone())
+        } else if wid == &bet.finisher_id {
+            Some(bet.finisher_username.clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // ========================================================================
+    // 3. UPDATE BET DOCUMENT
+    // ========================================================================
     let update = doc! {
         "$set": {
-            "winner_id": &payload.winner_id,
-            "winner_username": &payload.winner_username,
+            "winner_id": &winner_id,
+            "winner_username": &winner_username,
             "winning_selection": &payload.winning_selection,
             "status": &payload.status,
             "completed_at": Utc::now(),
@@ -306,16 +465,88 @@ pub async fn update_bet_status(
         }
     };
 
-    let options = mongodb::options::FindOneAndUpdateOptions::builder()
-        .return_document(mongodb::options::ReturnDocument::After)
-        .build();
-
-    let bet = collection
+    let updated_bet = collection
         .find_one_and_update(filter, update)
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
-    let response = BetResponse::from(bet);
+    // ========================================================================
+    // 4. UPDATE FIXXTURE BETTORS WITH WINNER/LOSER
+    // ========================================================================
+    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let now_bson = BsonDateTime::from_chrono(Utc::now());
+
+    // Update each bettor with winner/loser status
+    for (user_id, is_winner) in [
+        (
+            &updated_bet.starter_id,
+            Some(&updated_bet.starter_id) == winner_id.as_ref(),
+        ),
+        (
+            &updated_bet.finisher_id,
+            Some(&updated_bet.finisher_id) == winner_id.as_ref(),
+        ),
+    ] {
+        let status = if is_winner { "won" } else { "lost" };
+
+        games_col
+            .update_one(
+                doc! {
+                    "match_id": &updated_bet.match_id,
+                    "bettors.userId": user_id,
+                    "bettors.betId": &id
+                },
+                doc! {
+                    "$set": {
+                        "bettors.$.status": status,
+                        "bettors.$.winner": is_winner,
+                        "bettors.$.payout": if is_winner {
+                            updated_bet.total_pot
+                        } else {
+                            0.0
+                        },
+                        "bettors.$.resolved_at": now_bson
+                    }
+                },
+            )
+            .await?;
+    }
+
+    // ========================================================================
+    // 5. UPDATE USER BALANCES
+    // ========================================================================
+    let users_col: Collection<mongodb::bson::Document> = state.db.collection("users");
+
+    if let Some(winner_id) = &winner_id {
+        // Winner gets the total pot
+        users_col
+            .update_one(
+                doc! { "id": winner_id },
+                doc! {
+                    "$inc": { "balance": updated_bet.total_pot }
+                },
+            )
+            .await?;
+
+        // Loser loses their amount
+        let loser_id = if &updated_bet.starter_id == winner_id {
+            &updated_bet.finisher_id
+        } else {
+            &updated_bet.starter_id
+        };
+
+        users_col
+            .update_one(
+                doc! { "id": loser_id },
+                doc! {
+                    "$inc": { "total_bets_lost": 1 }
+                },
+            )
+            .await?;
+    }
+
+    println!("✅ Successfully updated bet status");
+    let response = BetResponse::from(updated_bet);
     Ok(Json(response))
 }
 

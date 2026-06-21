@@ -1,13 +1,20 @@
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use mongodb::bson::{oid::ObjectId, serde_helpers};
+use serde::{Deserialize, Serialize};
 
-// Model for creating a new bet (when user accepts a pledge)
+// ============================================================================
+// CREATE BET REQUEST (Accept a pledge)
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct CreateBetRequest {
     // Pledge info
     #[serde(rename = "pledge_id")]
     pub pledge_id: PledgeId,
+
+    // Match info (link to fixture)
+    #[serde(rename = "match_id")]
+    pub match_id: String, // ✅ ADDED - links bet to fixture
 
     // Starter info (original bet creator)
     pub starter_id: String,
@@ -50,7 +57,10 @@ pub struct CreateBetRequest {
     pub winning_selection: Option<String>,
 }
 
-// Bet odds structure
+// ============================================================================
+// BET ODDS
+// ============================================================================
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BetOdds {
     pub home_win: String,
@@ -58,12 +68,18 @@ pub struct BetOdds {
     pub draw: String,
 }
 
-// Handle MongoDB ObjectId in JSON (both string and object formats)
+// ============================================================================
+// PLEDGE ID (Handles both string and ObjectId formats)
+// ============================================================================
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum PledgeId {
     String(String),
-    ObjectId { #[serde(rename = "$oid")] oid: String },
+    ObjectId {
+        #[serde(rename = "$oid")]
+        oid: String,
+    },
 }
 
 impl PledgeId {
@@ -75,7 +91,10 @@ impl PledgeId {
     }
 }
 
-// Database model for Bets collection (MongoDB)
+// ============================================================================
+// BET MODEL (Database)
+// ============================================================================
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Bet {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -83,6 +102,10 @@ pub struct Bet {
 
     // Pledge reference
     pub pledge_id: String,
+
+    // ✅ Match reference (links to fixture)
+    #[serde(rename = "match_id")]
+    pub match_id: String,
 
     // Starter info
     pub starter_id: String,
@@ -117,28 +140,35 @@ pub struct Bet {
     // Odds
     pub odds: BetOdds,
 
-    // Timestamps - removed the problematic serde helpers
+    // Timestamps
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
 }
 
-// Model for updating bet status (when match completes)
+// ============================================================================
+// UPDATE BET STATUS REQUEST
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct UpdateBetRequest {
     pub bet_id: String, // ObjectId as string
     pub winner_id: String,
     pub winner_username: String,
     pub winning_selection: String, // "home_win", "away_win", or "draw"
-    pub status: String, // "completed"
+    pub status: String,            // "completed"
 }
 
-// Model for bet response
+// ============================================================================
+// BET RESPONSE
+// ============================================================================
+
 #[derive(Debug, Serialize)]
 pub struct BetResponse {
     pub id: String, // ObjectId as string
     pub pledge_id: String,
+    pub match_id: String, // ✅ ADDED
 
     pub starter_id: String,
     pub starter_username: String,
@@ -171,25 +201,35 @@ pub struct BetResponse {
     pub completed_at: Option<DateTime<Utc>>,
 }
 
-// Model for user balance update
+// ============================================================================
+// USER BALANCE UPDATE
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct UpdateBalanceRequest {
     pub user_id: String,
     pub balance: f64,
 }
 
-// Model for updating pledge status
+// ============================================================================
+// UPDATE PLEDGE STATUS
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct UpdatePledgeStatusRequest {
     pub status: String, // "matched", "completed", "cancelled"
 }
 
-// Helper function to convert Bet to BetResponse
+// ============================================================================
+// CONVERSIONS
+// ============================================================================
+
 impl From<Bet> for BetResponse {
     fn from(bet: Bet) -> Self {
         BetResponse {
             id: bet.id.map(|id| id.to_hex()).unwrap_or_default(),
             pledge_id: bet.pledge_id,
+            match_id: bet.match_id, // ✅ ADDED
             starter_id: bet.starter_id,
             starter_username: bet.starter_username,
             starter_selection: bet.starter_selection,
@@ -218,57 +258,19 @@ impl From<Bet> for BetResponse {
     }
 }
 
-// Error response model
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub error: String,
-    pub message: String,
-}
-
-// Success response model
-#[derive(Debug, Serialize)]
-pub struct SuccessResponse {
-    pub success: bool,
-    pub message: String,
-    pub data: Option<serde_json::Value>,
-}
-
-// Helper function to deserialize numbers to f64 (accepts both integer and float)
-fn deserialize_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum IntOrFloat {
-        Int(i64),
-        Float(f64),
-    }
-
-    match IntOrFloat::deserialize(deserializer)? {
-        IntOrFloat::Int(i) => Ok(i as f64),
-        IntOrFloat::Float(f) => Ok(f),
-    }
-}
-
-// Default status function
-fn default_status() -> String {
-    "active".to_string()
-}
-
-// Helper to convert CreateBetRequest to Bet for database insertion
 impl From<CreateBetRequest> for Bet {
     fn from(req: CreateBetRequest) -> Self {
         let now = Utc::now();
 
         // Calculate finisher_amount if not provided
-        let finisher_amount = req.finisher_amount
+        let finisher_amount = req
+            .finisher_amount
             .unwrap_or_else(|| req.total_pot - req.starter_amount);
 
         Bet {
             id: None, // Will be set by MongoDB
             pledge_id: req.pledge_id.to_string(),
+            match_id: req.match_id, // ✅ ADDED
             starter_id: req.starter_id,
             starter_username: req.starter_username,
             starter_selection: req.starter_selection,
@@ -295,4 +297,47 @@ impl From<CreateBetRequest> for Bet {
             completed_at: None,
         }
     }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn deserialize_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrFloat {
+        Int(i64),
+        Float(f64),
+    }
+
+    match IntOrFloat::deserialize(deserializer)? {
+        IntOrFloat::Int(i) => Ok(i as f64),
+        IntOrFloat::Float(f) => Ok(f),
+    }
+}
+
+fn default_status() -> String {
+    "active".to_string()
+}
+
+// ============================================================================
+// RESPONSE MODELS
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+pub struct ErrorResponse {
+    pub error: String,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SuccessResponse {
+    pub success: bool,
+    pub message: String,
+    pub data: Option<serde_json::Value>,
 }

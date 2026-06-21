@@ -23,6 +23,74 @@ pub struct Voter {
     pub voted_at: BsonDateTime,
 }
 
+// ========== PLEDGER STRUCT ==========
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pledger {
+    #[serde(rename = "userId")]
+    pub user_id: String,
+
+    #[serde(rename = "userName")]
+    pub user_name: String,
+
+    #[serde(rename = "selection")]
+    pub selection: String, // "home_team", "away_team", "draw"
+
+    #[serde(rename = "amount")]
+    pub amount: f64,
+
+    #[serde(rename = "pledgedAt")]
+    pub pledged_at: BsonDateTime,
+}
+
+// ========== BETTOR STRUCT ==========
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bettor {
+    #[serde(rename = "userId")]
+    pub user_id: String,
+
+    #[serde(rename = "userName")]
+    pub user_name: String,
+
+    #[serde(rename = "selection")]
+    pub selection: String, // "home_team", "away_team", "draw"
+
+    #[serde(rename = "amount")]
+    pub amount: f64,
+
+    #[serde(rename = "opponentId")]
+    pub opponent_id: String,
+
+    #[serde(rename = "opponentName")]
+    pub opponent_name: String,
+
+    #[serde(rename = "opponentSelection")]
+    pub opponent_selection: String,
+
+    #[serde(rename = "opponentAmount")]
+    pub opponent_amount: f64,
+
+    #[serde(rename = "totalPot")]
+    pub total_pot: f64,
+
+    #[serde(rename = "betId")]
+    pub bet_id: String,
+
+    #[serde(rename = "status", skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>, // "active", "won", "lost"
+
+    #[serde(rename = "winner", skip_serializing_if = "Option::is_none")]
+    pub winner: Option<bool>,
+
+    #[serde(rename = "payout", skip_serializing_if = "Option::is_none")]
+    pub payout: Option<f64>,
+
+    #[serde(rename = "matchedAt")]
+    pub matched_at: BsonDateTime,
+
+    #[serde(rename = "resolvedAt", skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<BsonDateTime>,
+}
+
 // ========== COMMENTARY ENTRY STRUCT ==========
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentaryEntry {
@@ -103,14 +171,30 @@ pub struct Game {
     #[serde(rename = "scraped_at")]
     pub scraped_at: BsonDateTime,
 
+    // ========== VOTES (Free) ==========
     #[serde(rename = "votes", default)]
     pub votes: i64,
 
-    #[serde(rename = "comments", default)]
-    pub comments: i64,
-
     #[serde(rename = "voters", default)]
     pub voters: Vec<Voter>,
+
+    // ========== PLEDGES (Pending - waiting for opponent) ==========
+    #[serde(rename = "pledges", default)]
+    pub pledges: i64,
+
+    #[serde(rename = "pledgers", default)]
+    pub pledgers: Vec<Pledger>,
+
+    // ========== BETS (Active - matched with opponent) ==========
+    #[serde(rename = "bets", default)]
+    pub bets: i64,
+
+    #[serde(rename = "bettors", default)]
+    pub bettors: Vec<Bettor>,
+
+    // ========== COMMENTS ==========
+    #[serde(rename = "comments", default)]
+    pub comments: i64,
 
     // ========== COMMENTARY FIELDS ==========
     #[serde(default)]
