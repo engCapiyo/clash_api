@@ -191,11 +191,9 @@ pub async fn create_channel_handler(
     let users_col = state.db.collection::<User>("users");
     let now = DateTime::now();
     let channel_id = Uuid::new_v4().to_string();
-
-    // Generate invite code (6 characters uppercase)
     let invite_code = Uuid::new_v4().to_string().to_uppercase()[0..6].to_string();
 
-    // ✅ FIX: Start with creator as admin
+    // Start with creator as admin
     let mut members = vec![ChannelMember {
         user_id: payload.created_by.clone(),
         username: payload.created_by_username.clone(),
@@ -207,21 +205,21 @@ pub async fn create_channel_handler(
         msg_count: 0,
     }];
 
-    // ✅ FIX: Add requested members
+    // Add members
     if let Some(requested_members) = payload.members {
         for new_member in requested_members {
-            // Skip if already the creator
             if new_member.user_id == payload.created_by {
                 continue;
             }
 
-            // Get user data for points
-            let user_obj_id = match ObjectId::parse_str(&new_member.user_id) {
-                Ok(id) => id,
-                Err(_) => continue,
+            // ✅ Try to find user by ObjectId OR user_id
+            let filter = if let Ok(oid) = ObjectId::parse_str(&new_member.user_id) {
+                doc! { "_id": oid }
+            } else {
+                doc! { "user_id": &new_member.user_id }
             };
 
-            let user = users_col.find_one(doc! { "_id": user_obj_id }).await?;
+            let user = users_col.find_one(filter).await?;
 
             let (season_points, correct_votes, total_votes) = if let Some(u) = user {
                 (u.season_points, u.correct_votes, u.total_votes)
@@ -244,7 +242,6 @@ pub async fn create_channel_handler(
 
     let member_count = members.len() as i32;
 
-    // Create channel document
     let channel = Channel {
         id: None,
         channel_id: channel_id.clone(),
@@ -264,16 +261,12 @@ pub async fn create_channel_handler(
         pending_requests: vec![],
     };
 
-    // Insert channel
     channels_col.insert_one(channel).await?;
 
-    // Update user's is_admin field to true
-    if let Ok(user_obj_id) = ObjectId::parse_str(&payload.created_by) {
+    // Update creator as admin
+    if let Ok(oid) = ObjectId::parse_str(&payload.created_by) {
         users_col
-            .update_one(
-                doc! { "_id": user_obj_id },
-                doc! { "$set": { "is_admin": true } },
-            )
+            .update_one(doc! { "_id": oid }, doc! { "$set": { "is_admin": true } })
             .await?;
     }
 
@@ -284,7 +277,6 @@ pub async fn create_channel_handler(
         "member_count": member_count,
     })))
 }
-
 // ============================================================================
 // CHECK USER VOTE IN CHANNEL (for backward compatibility)
 // ============================================================================
