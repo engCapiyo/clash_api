@@ -195,8 +195,8 @@ pub async fn create_channel_handler(
     // Generate invite code (6 characters uppercase)
     let invite_code = Uuid::new_v4().to_string().to_uppercase()[0..6].to_string();
 
-    // Build members list with creator as admin
-    let members = vec![ChannelMember {
+    // ✅ FIX: Start with creator as admin
+    let mut members = vec![ChannelMember {
         user_id: payload.created_by.clone(),
         username: payload.created_by_username.clone(),
         role: "admin".to_string(),
@@ -207,9 +207,44 @@ pub async fn create_channel_handler(
         msg_count: 0,
     }];
 
+    // ✅ FIX: Add requested members
+    if let Some(requested_members) = payload.members {
+        for new_member in requested_members {
+            // Skip if already the creator
+            if new_member.user_id == payload.created_by {
+                continue;
+            }
+
+            // Get user data for points
+            let user_obj_id = match ObjectId::parse_str(&new_member.user_id) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+
+            let user = users_col.find_one(doc! { "_id": user_obj_id }).await?;
+
+            let (season_points, correct_votes, total_votes) = if let Some(u) = user {
+                (u.season_points, u.correct_votes, u.total_votes)
+            } else {
+                (0, 0, 0)
+            };
+
+            members.push(ChannelMember {
+                user_id: new_member.user_id,
+                username: new_member.username,
+                role: "member".to_string(),
+                joined_at: now,
+                season_points,
+                correct_votes,
+                total_votes,
+                msg_count: 0,
+            });
+        }
+    }
+
     let member_count = members.len() as i32;
 
-    // Create channel document with invite_code and pending_requests
+    // Create channel document
     let channel = Channel {
         id: None,
         channel_id: channel_id.clone(),
@@ -246,6 +281,7 @@ pub async fn create_channel_handler(
         "success": true,
         "channel_id": channel_id,
         "invite_code": invite_code,
+        "member_count": member_count,
     })))
 }
 
