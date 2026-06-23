@@ -8,7 +8,29 @@ use serde::{Deserialize, Serialize};
 pub struct VotesVisibility {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
-    pub key: String, // e.g., "votes_button_show"
+    pub key: String,
     pub value: bool,
+    #[serde(default = "Utc::now")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default = "default_description")]
+    pub description: String,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_description() -> String {
+    "Show/hide votes button globally".to_string()
+}
+
+impl VotesVisibility {
+    pub fn new(key: String, value: bool) -> Self {
+        let now = Utc::now();
+        Self {
+            id: None,
+            key,
+            value,
+            created_at: now,
+            description: "Show/hide votes button globally".to_string(),
+            updated_at: now,
+        }
+    }
 }

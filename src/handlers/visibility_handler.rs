@@ -58,44 +58,46 @@ pub async fn get_visibility(
 }
 
 // POST /visibility
+// handlers/visibility_handler.rs
+
+// POST /visibility - Create or update
 pub async fn update_visibility(
     State(state): State<AppState>,
     Json(payload): Json<UpdateVisibilityRequest>,
 ) -> Result<Json<VisibilityResponse>> {
-    println!(
-        "🔄 Updating visibility: {} = {}",
-        payload.key, payload.value
-    );
-
-    // Validate
-    if let Err(validation_errors) = payload.validate() {
-        return Err(AppError::invalid_data(&format!(
-            "Validation failed: {:?}",
-            validation_errors
-        )));
-    }
-
     let collection: Collection<VotesVisibility> = state.db.collection("visibility");
 
+    // Check if exists
     let filter = doc! { "key": &payload.key };
-    let update = doc! {
-        "$set": {
-            "key": &payload.key,
-            "value": payload.value,
-            "updated_at": BsonDateTime::from_chrono(Utc::now()),
+    let existing = collection.find_one(filter.clone()).await?;
+
+    let now = Utc::now();
+
+    let doc = if let Some(mut existing_doc) = existing {
+        // Update existing
+        existing_doc.value = payload.value;
+        existing_doc.updated_at = now;
+        existing_doc
+    } else {
+        // Create new
+        VotesVisibility {
+            id: None,
+            key: payload.key.clone(),
+            value: payload.value,
+            created_at: now,
+            description: "Show/hide votes button globally".to_string(),
+            updated_at: now,
         }
     };
 
-    let options = mongodb::options::UpdateOptions::builder()
-        .upsert(true)
-        .build();
-
+    // Upsert
+    let update = doc! {
+        "$set": {
+            "value": payload.value,
+            "updated_at": BsonDateTime::from_chrono(now),
+        }
+    };
     collection.update_one(filter, update).await?;
-
-    println!(
-        "✅ Successfully updated visibility: {} = {}",
-        payload.key, payload.value
-    );
 
     Ok(Json(VisibilityResponse {
         key: payload.key,
