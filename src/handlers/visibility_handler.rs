@@ -33,25 +33,28 @@ pub async fn get_visibility(
 ) -> Result<Json<VisibilityResponse>> {
     println!("🔍 GET /visibility/{}", key);
 
-    let collection: Collection<VotesVisibility> = state.db.collection("visibility");
+    // ✅ Use Document type instead of VotesVisibility
+    let collection: Collection<Document> = state.db.collection("visibility");
     let filter = doc! { "key": &key };
 
     match collection.find_one(filter).await? {
         Some(doc) => {
-            println!("✅ Found visibility for key: {}", key);
+            // ✅ Extract value directly from document
+            let value = doc.get_bool("value").unwrap_or(true);
+
             Ok(Json(VisibilityResponse {
-                key: doc.key,
-                value: doc.value,
+                key: key,
+                value: value,
             }))
         }
         None => {
             println!(
-                "ℹ️ No visibility setting found for key: {}, returning default true",
+                "ℹ️ No visibility found for key: {}, returning default true",
                 key
             );
             Ok(Json(VisibilityResponse {
                 key: key,
-                value: true, // default
+                value: true,
             }))
         }
     }
