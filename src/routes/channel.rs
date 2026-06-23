@@ -36,7 +36,7 @@ pub fn channel_routes() -> Router<AppState> {
         // ====================================================================
         // CHANNEL CRUD
         // ====================================================================
-        .route("/", post(create_channel_handler))
+        .route("/create", post(create_channel_handler))
         .route("/:channel_id", get(get_channel_handler))
         .route("/all", get(get_all_channels_handler))
         // Add this with the other routes
