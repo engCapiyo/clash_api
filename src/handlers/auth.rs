@@ -1025,3 +1025,39 @@ pub async fn update_user_phone(
         }
     }
 }
+// ============================================================================
+// UPDATE USER BALANCE (Called by M-Pesa callback)
+// ============================================================================
+
+pub async fn update_user_balance_by_phone(
+    State(state): State<AppState>,
+    phone: &str,
+    amount: f64,
+) -> Result<(), String> {
+    println!("💰 Updating user balance for phone: {}", phone);
+
+    let collection: Collection<User> = state.db.collection("users");
+
+    // Find user by phone (using normalized match)
+    let phone_filter = phone_query(phone);
+
+    // Update balance - increment by amount
+    let update = doc! {
+        "$inc": { "balance": amount },
+        "$set": { "updated_at": DateTime::from_millis(Utc::now().timestamp_millis()) }
+    };
+
+    match collection.update_one(phone_filter, update).await {
+        Ok(result) => {
+            if result.matched_count == 0 {
+                return Err(format!("User not found with phone: {}", phone));
+            }
+            println!("✅ Balance updated for phone: {}", phone);
+            Ok(())
+        }
+        Err(e) => {
+            println!("❌ Failed to update balance: {}", e);
+            Err(format!("Database error: {}", e))
+        }
+    }
+}

@@ -5,13 +5,14 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::StreamExt;
-use mongodb::bson::doc;
+use mongodb::bson::{doc, DateTime as BsonDateTime};
 use mongodb::Collection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{error, info, warn};
 
 use crate::models::transaction::{MpesaTransaction, Transaction};
+use crate::models::user::User;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +179,18 @@ pub async fn initiate_stk_push(
     })))
 }
 
+// Helper function to normalize phone numbers
+fn normalize_phone(phone: &str) -> String {
+    let mut cleaned: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+    if cleaned.starts_with('0') {
+        cleaned = cleaned[1..].to_string();
+    }
+    if cleaned.len() > 9 {
+        cleaned = cleaned[cleaned.len() - 9..].to_string();
+    }
+    cleaned
+}
+
 pub async fn mpesa_confirmation(
     State(state): State<AppState>,
     Json(payload): Json<MpesaCallback>,
@@ -199,8 +212,6 @@ pub async fn mpesa_confirmation(
     }
 
     let transactions: Collection<Transaction> = state.db.collection("transactions");
-    let mpesa_transactions: Collection<MpesaTransaction> =
-        state.db.collection("mpesa_transactions");
 
     let filter = doc! { "checkout_request_id": &checkout_id };
 
@@ -229,7 +240,6 @@ pub async fn mpesa_confirmation(
                             }
                         }
                         "TransactionDate" => {
-                            // Safaricom sends this as a number e.g. 20240101120000
                             transaction_date = Some(item.value.to_string());
                         }
                         "PhoneNumber" => {
@@ -251,7 +261,6 @@ pub async fn mpesa_confirmation(
             };
             let now = now_str();
 
-            // Build the $set doc using only String / primitive values — no DateTime
             let mut set_doc = doc! {
                 "status": status,
                 "result_code": callback.result_code,
@@ -290,8 +299,50 @@ pub async fn mpesa_confirmation(
                 }
             }
 
-            // If successful, also write a full MpesaTransaction record
+            // ✅ UPDATE USER BALANCE ON SUCCESS
             if callback.result_code == 0 {
+                let amount_to_add = paid_amount.unwrap_or(transaction.amount);
+                let phone_for_update = paying_phone
+                    .clone()
+                    .unwrap_or_else(|| transaction.phone_number.clone());
+
+                println!(
+                    "💰 Adding {} to user balance for phone: {}",
+                    amount_to_add, phone_for_update
+                );
+
+                // Update user balance
+                let users: Collection<User> = state.db.collection("users");
+
+                // Normalize phone to match how it's stored
+                let normalized = normalize_phone(&phone_for_update);
+                let filter = doc! { "phone": { "$regex": format!("{}$", normalized) } };
+
+                // ✅ Use bson::DateTime::now() for MongoDB
+                let now_bson = BsonDateTime::now();
+
+                let update_balance = doc! {
+                    "$inc": { "balance": amount_to_add },
+                    "$set": { "updated_at": now_bson }
+                };
+
+                match users.update_one(filter, update_balance).await {
+                    Ok(result) => {
+                        if result.matched_count > 0 {
+                            println!(
+                                "✅ User balance updated successfully for: {}",
+                                phone_for_update
+                            );
+                        } else {
+                            println!("⚠️ User not found for phone: {}", phone_for_update);
+                        }
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to update user balance: {}", e);
+                    }
+                }
+
+                // Save MpesaTransaction record
                 if let Some(receipt) = mpesa_receipt_number {
                     let mpesa_tx = MpesaTransaction {
                         id: None,
@@ -299,14 +350,15 @@ pub async fn mpesa_confirmation(
                             .unwrap_or_else(|| transaction.phone_number.clone()),
                         transaction_date: transaction_date.unwrap_or_else(|| now.clone()),
                         mpesa_receipt_number: receipt,
-                        paid_amount: paid_amount
-                            .map(|a| a.to_string())
-                            .unwrap_or_else(|| transaction.amount.to_string()),
+                        paid_amount: amount_to_add.to_string(),
                         merchant_request_id: callback.merchant_request_id.clone(),
                         checkout_request_id: checkout_id.clone(),
                         created_at: now.clone(),
                         updated_at: now.clone(),
                     };
+
+                    let mpesa_transactions: Collection<MpesaTransaction> =
+                        state.db.collection("mpesa_transactions");
 
                     if let Err(e) = mpesa_transactions.insert_one(&mpesa_tx).await {
                         error!("Failed to insert MpesaTransaction record: {}", e);
@@ -570,6 +622,7 @@ pub async fn simulate_payment(
         "status": "completed"
     }))
 }
+
 #[derive(Debug, Deserialize)]
 pub struct B2CPaymentRequest {
     pub phone_number: String,
