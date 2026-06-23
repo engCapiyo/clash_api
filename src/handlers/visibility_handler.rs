@@ -5,7 +5,7 @@ use axum::{
     response::Json,
 };
 use chrono::Utc;
-use mongodb::bson::{doc, DateTime as BsonDateTime};
+use mongodb::bson::{doc, DateTime as BsonDateTime, Document};
 use mongodb::Collection;
 use serde::{Deserialize, Serialize};
 use validator::Validate;
