@@ -5,9 +5,11 @@ use axum::{
 
 use crate::handlers::channel::{
     add_members_to_channel_handler, approve_join_request_handler, cast_vote_handler,
-    check_user_vote_handler, check_user_vote_in_channel_handler, create_channel_handler,
-    finalize_fixture_result_handler, get_all_channels_handler, get_channel_fixtures_handler,
-    get_channel_handler, get_channel_invite_code_handler, get_channel_leaderboard_handler,
+    check_user_vote_handler, check_user_vote_in_channel_handler,
+    compute_admin_reward_score_handler, compute_all_admin_reward_scores_handler,
+    create_channel_handler, finalize_fixture_result_handler, get_admin_reward_leaderboard_handler,
+    get_all_channels_handler, get_channel_fixtures_handler, get_channel_handler,
+    get_channel_invite_code_handler, get_channel_leaderboard_handler,
     get_fixture_comment_count_handler, get_fixture_latest_comment_handler,
     get_fixture_vote_count_handler, get_invite_channel_handler, get_messages_handler,
     get_pending_requests_handler, get_single_fixture_handler, get_user_channel_count_handler,
@@ -41,6 +43,10 @@ pub fn channel_routes() -> Router<AppState> {
         .route("/all", get(get_all_channels_handler))
         // Add this with the other routes
         .route("/invite/:code", get(get_invite_channel_handler))
+        .route(
+            "/admin-reward/compute-all",
+            post(compute_all_admin_reward_scores_handler),
+        )
         .route(
             "/:channel_id/fixtures/:fixture_id/votes/count",
             get(get_fixture_vote_count_handler),
@@ -121,6 +127,20 @@ pub fn channel_routes() -> Router<AppState> {
         )
         .route("/weekly/top", get(get_weekly_top_channel_handler))
         .route("/admin/reset-weekly", post(reset_weekly_messages_handler))
+        // ====================================================================
+        // ADMIN REWARD SCORING
+        // ====================================================================
+        // Computes and persists a score for one channel's admin over a
+        // rolling window. Call with ?days=7 (or 14/30) — defaults to 7.
+        .route(
+            "/:channel_id/admin-reward/compute",
+            post(compute_admin_reward_score_handler),
+        )
+        // Ranks all channels' admins by their latest computed score
+        .route(
+            "/admin-reward/leaderboard",
+            get(get_admin_reward_leaderboard_handler),
+        )
         // ====================================================================
         // COMMENTS & UNREAD
         // ====================================================================
@@ -284,6 +304,52 @@ Body: {
     "user_id": "user456",
     "fcm_token": "fcm_token_here"
 }
+
+============================================================================
+
+ADMIN REWARD SCORING
+============================================================================
+
+1. COMPUTE SCORE FOR A CHANNEL (run this on a schedule, e.g. nightly cron,
+   or trigger manually for testing)
+   POST /api/channels/:channel_id/admin-reward/compute?days=7
+
+   Response: {
+       "success": true,
+       "score": {
+           "channel_id": "abc123",
+           "admin_user_id": "user789",
+           "period_start": "...",
+           "period_end": "...",
+           "active_member_ratio": 0.62,
+           "vote_participation": 0.41,
+           "retention_rate": 0.80,
+           "net_member_growth": 3,
+           "score": 0.51,
+           "computed_at": "..."
+       }
+   }
+
+2. VIEW LEADERBOARD ACROSS ALL CHANNELS
+   GET /api/channels/admin-reward/leaderboard
+
+   Response: {
+       "success": true,
+       "leaderboard": [
+           {
+               "rank": 1,
+               "channel_id": "abc123",
+               "admin_user_id": "user789",
+               "score": 0.51,
+               ...
+           }
+       ]
+   }
+
+   NOTE: leaderboard only reflects channels that have had compute called
+   at least once. Wire compute_admin_reward_score_handler into a scheduled
+   job per channel (same pattern as reset_weekly_messages_handler) so the
+   leaderboard stays fresh without depending on manual/client-triggered calls.
 
 ============================================================================
 */

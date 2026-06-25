@@ -15,8 +15,8 @@ use bson::oid::ObjectId; // ✅ MUST HAVE THIS
 
 use crate::errors::{AppError, Result};
 use crate::models::channel::{
-    Channel, ChannelActivity, ChannelFixture, ChannelMember, Fixture, Message, PendingRequest,
-    ReplyToData, Vote, VoteCounts,
+    AdminRewardScore, Channel, ChannelActivity, ChannelFixture, ChannelMember,
+    ChannelMembershipEvent, Fixture, Message, PendingRequest, ReplyToData, Vote, VoteCounts,
 };
 use crate::AppState;
 
@@ -47,6 +47,30 @@ pub struct NewMember {
 pub struct FinalizeFixtureRequest {
     pub fixture_id: String,
     pub result: String, // "home", "away", "draw"
+}
+
+// ============================================================================
+// LOG MEMBERSHIP EVENT (helper, not a route handler)
+// ============================================================================
+// Fire-and-forget by design — a missed log entry shouldn't fail the actual
+// join/leave operation. event_type: "joined" | "left" | "removed"
+
+async fn log_membership_event(state: &AppState, channel_id: &str, user_id: &str, event_type: &str) {
+    let events_col = state
+        .db
+        .collection::<ChannelMembershipEvent>("channel_membership_events");
+
+    let event = ChannelMembershipEvent {
+        id: None,
+        channel_id: channel_id.to_string(),
+        user_id: user_id.to_string(),
+        event_type: event_type.to_string(),
+        occurred_at: DateTime::now(),
+    };
+
+    if let Err(e) = events_col.insert_one(event).await {
+        eprintln!("⚠️ Failed to log membership event: {}", e);
+    }
 }
 
 pub async fn finalize_fixture_result_handler(
@@ -193,7 +217,6 @@ pub async fn create_channel_handler(
     let channel_id = Uuid::new_v4().to_string();
     let invite_code = Uuid::new_v4().to_string().to_uppercase()[0..6].to_string();
 
-    // Start with creator as admin
     let mut members = vec![ChannelMember {
         user_id: payload.created_by.clone(),
         username: payload.created_by_username.clone(),
@@ -203,16 +226,15 @@ pub async fn create_channel_handler(
         correct_votes: 0,
         total_votes: 0,
         msg_count: 0,
+        last_active_at: None, // NEW
     }];
 
-    // Add members
     if let Some(requested_members) = payload.members {
         for new_member in requested_members {
             if new_member.user_id == payload.created_by {
                 continue;
             }
 
-            // ✅ Try to find user by ObjectId OR user_id
             let filter = if let Ok(oid) = ObjectId::parse_str(&new_member.user_id) {
                 doc! { "_id": oid }
             } else {
@@ -236,6 +258,7 @@ pub async fn create_channel_handler(
                 correct_votes,
                 total_votes,
                 msg_count: 0,
+                last_active_at: None, // NEW
             });
         }
     }
@@ -248,7 +271,7 @@ pub async fn create_channel_handler(
         name: payload.name,
         created_by: payload.created_by.clone(),
         created_at: now,
-        members,
+        members: members.clone(),
         activity: ChannelActivity {
             total_messages: 0,
             messages_this_week: 0,
@@ -263,11 +286,15 @@ pub async fn create_channel_handler(
 
     channels_col.insert_one(channel).await?;
 
-    // Update creator as admin
     if let Ok(oid) = ObjectId::parse_str(&payload.created_by) {
         users_col
             .update_one(doc! { "_id": oid }, doc! { "$set": { "is_admin": true } })
             .await?;
+    }
+
+    // NEW: log a "joined" event for every founding member, admin included
+    for m in &members {
+        log_membership_event(&state, &channel_id, &m.user_id, "joined").await;
     }
 
     Ok(Json(json!({
@@ -728,9 +755,9 @@ pub async fn cast_vote_handler(
     let games_col: Collection<Game> = state.db.collection("fixtures");
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
     let users_col = state.db.collection::<User>("users");
+    let channels_col = state.db.collection::<Channel>("channels"); // NEW
     let now = BsonDateTime::from_chrono(chrono::Utc::now());
 
-    // 1. Check if user already voted (check embedded voters array)
     let existing_voter = games_col
         .find_one(doc! {
             "match_id": &payload.fixture_id,
@@ -744,14 +771,12 @@ pub async fn cast_vote_handler(
         ));
     }
 
-    // 2. Get user info for voter display
     let user_id_obj = ObjectId::parse_str(&payload.user_id)?;
     let user = users_col
         .find_one(doc! { "_id": user_id_obj })
         .await?
         .ok_or_else(|| AppError::DocumentNotFound)?;
 
-    // Convert selection: "home" -> "home_team", "away" -> "away_team", "draw" -> "draw"
     let display_selection = match payload.selection.as_str() {
         "home" => "home_team",
         "away" => "away_team",
@@ -759,7 +784,6 @@ pub async fn cast_vote_handler(
         _ => &payload.selection,
     };
 
-    // 3. ✅ UPDATE FIXTURE - Add voter to voters array, increment vote count
     games_col
         .update_one(
             doc! { "match_id": &payload.fixture_id },
@@ -770,8 +794,8 @@ pub async fn cast_vote_handler(
                         "userId": &payload.user_id,
                         "userName": &user.username,
                         "selection": display_selection,
-                        "isCorrect": null,        // Unknown until match finalized
-                        "pointsAwarded": null,    // Unknown until match finalized
+                        "isCorrect": null,
+                        "pointsAwarded": null,
                         "votedAt": now,
                     }
                 }
@@ -779,7 +803,6 @@ pub async fn cast_vote_handler(
         )
         .await?;
 
-    // 4. Update all channel_fixtures vote_counts
     let increment_field = match payload.selection.as_str() {
         "home" => "vote_counts.home",
         "away" => "vote_counts.away",
@@ -794,13 +817,32 @@ pub async fn cast_vote_handler(
         )
         .await?;
 
-    // 5. Update user total_votes
     users_col
         .update_one(
             doc! { "_id": user_id_obj },
             doc! { "$inc": { "total_votes": 1 } },
         )
         .await?;
+
+    // NEW: 6. Stamp last_active_at on this voter's membership in every
+    // channel they belong to. Without this, channel-level engagement
+    // scoring can't tell which members are actually still voting.
+    let mut channel_cursor = channels_col
+        .find(doc! { "members.user_id": &payload.user_id })
+        .await?;
+
+    while channel_cursor.advance().await? {
+        let channel: Channel = channel_cursor.deserialize_current()?;
+        channels_col
+            .update_one(
+                doc! {
+                    "channel_id": &channel.channel_id,
+                    "members.user_id": &payload.user_id,
+                },
+                doc! { "$set": { "members.$.last_active_at": now } },
+            )
+            .await?;
+    }
 
     Ok(Json(json!({
         "success": true,
@@ -1034,13 +1076,11 @@ pub async fn approve_join_request_handler(
     let users_col = state.db.collection::<User>("users");
     let now = mongodb::bson::DateTime::now();
 
-    // 1. Get the channel
     let channel = channels_col
         .find_one(doc! { "channel_id": &payload.channel_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
-    // 2. Get user data for points
     let user_obj_id = ObjectId::parse_str(&payload.user_id)?;
     let user = users_col.find_one(doc! { "_id": user_obj_id }).await?;
 
@@ -1050,7 +1090,6 @@ pub async fn approve_join_request_handler(
         (0, 0, 0)
     };
 
-    // 3. Create member
     let new_member = ChannelMember {
         user_id: payload.user_id.clone(),
         username: payload.username.clone(),
@@ -1060,12 +1099,12 @@ pub async fn approve_join_request_handler(
         correct_votes,
         total_votes,
         msg_count: 0,
+        last_active_at: None, // NEW
     };
 
     let bson_member = bson::to_bson(&new_member)
         .map_err(|e| AppError::ValidationError(format!("Failed to serialize: {}", e)))?;
 
-    // 4. Add to channel and remove from pending
     let result = channels_col
         .update_one(
             doc! { "channel_id": &payload.channel_id },
@@ -1081,7 +1120,9 @@ pub async fn approve_join_request_handler(
         return Err(AppError::DocumentNotFound);
     }
 
-    // 5. 🔔 NOTIFY USER THAT REQUEST WAS APPROVED
+    // NEW: log the join
+    log_membership_event(&state, &payload.channel_id, &payload.user_id, "joined").await;
+
     if let Some(fcm_service) = &state.fcm_service {
         let notification_data = json!({
             "type": "join_approved",
@@ -1219,7 +1260,7 @@ pub async fn join_channel_by_code_handler(
     };
 
     let new_member = ChannelMember {
-        user_id: payload.user_id,
+        user_id: payload.user_id.clone(),
         username: payload.username,
         role: "member".to_string(),
         joined_at: now,
@@ -1227,6 +1268,7 @@ pub async fn join_channel_by_code_handler(
         correct_votes,
         total_votes,
         msg_count: 0,
+        last_active_at: None, // NEW
     };
 
     let bson_member = bson::to_bson(&new_member)
@@ -1241,6 +1283,9 @@ pub async fn join_channel_by_code_handler(
             },
         )
         .await?;
+
+    // NEW: log the join
+    log_membership_event(&state, &channel.channel_id, &payload.user_id, "joined").await;
 
     Ok(Json(json!({
         "success": true,
@@ -1269,6 +1314,7 @@ pub async fn add_members_to_channel_handler(
     let now = DateTime::now();
 
     let mut members_to_add = Vec::new();
+    let mut added_user_ids = Vec::new(); // NEW
 
     for member in &payload.members {
         let user_obj_id = match ObjectId::parse_str(&member.user_id) {
@@ -1293,7 +1339,10 @@ pub async fn add_members_to_channel_handler(
             "correct_votes": correct_votes,
             "total_votes": total_votes,
             "msg_count": 0,
+            "last_active_at": null, // NEW
         });
+
+        added_user_ids.push(member.user_id.clone()); // NEW
     }
 
     let added_count = members_to_add.len();
@@ -1310,6 +1359,11 @@ pub async fn add_members_to_channel_handler(
 
     if result.matched_count == 0 {
         return Err(AppError::DocumentNotFound);
+    }
+
+    // NEW: log a join event per added member
+    for user_id in &added_user_ids {
+        log_membership_event(&state, &payload.channel_id, user_id, "joined").await;
     }
 
     Ok(Json(json!({
@@ -1354,7 +1408,295 @@ pub async fn leave_channel_handler(
         ));
     }
 
+    // NEW: log the departure
+    log_membership_event(&state, &payload.channel_id, &payload.user_id, "left").await;
+
     Ok(Json(json!({ "success": true })))
+}
+// ============================================================================
+// COMPUTE ADMIN REWARD SCORE
+// ============================================================================
+
+// ============================================================================
+// COMPUTE ADMIN REWARD SCORE (shared logic + single-channel + bulk)
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ComputeRewardScoreQuery {
+    pub days: Option<i64>, // period length, default 7
+}
+
+// Core scoring logic, factored out so both the single-channel handler and
+// the bulk "compute for every channel" handler stay identical instead of
+// drifting apart over time.
+
+// ----------------------------------------------------------------------------
+// SINGLE CHANNEL
+// ----------------------------------------------------------------------------
+// ============================================================================
+// COMPUTE ADMIN REWARD SCORE (shared logic + single-channel + bulk)
+// ============================================================================
+
+pub async fn compute_all_admin_reward_scores_handler(
+    State(state): State<AppState>,
+    Query(params): Query<ComputeRewardScoreQuery>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+    let scores_col = state
+        .db
+        .collection::<AdminRewardScore>("admin_reward_scores");
+
+    let days = params.days.unwrap_or(7);
+
+    let mut cursor = channels_col.find(doc! {}).await?;
+
+    let mut computed = Vec::new();
+    let mut failed: Vec<serde_json::Value> = Vec::new();
+
+    while cursor.advance().await? {
+        let channel: Channel = match cursor.deserialize_current() {
+            Ok(c) => c,
+            Err(e) => {
+                failed.push(json!({ "error": format!("deserialize failed: {}", e) }));
+                continue;
+            }
+        };
+
+        match compute_score_for_channel(&state, &channel, days).await {
+            Ok(reward_score) => {
+                if let Err(e) = scores_col.insert_one(&reward_score).await {
+                    failed.push(json!({
+                        "channel_id": channel.channel_id,
+                        "error": format!("insert failed: {}", e),
+                    }));
+                } else {
+                    computed.push(json!({
+                        "channel_id": reward_score.channel_id,
+                        "admin_user_id": reward_score.admin_user_id,
+                        "score": reward_score.score,
+                    }));
+                }
+            }
+            Err(e) => {
+                failed.push(json!({
+                    "channel_id": channel.channel_id,
+                    "error": format!("{:?}", e),
+                }));
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "channels_processed": computed.len(),
+        "channels_failed": failed.len(),
+        "results": computed,
+        "failures": failed,
+    })))
+}
+
+// Core scoring logic, factored out so both the single-channel handler and
+// the bulk "compute for every channel" handler stay identical instead of
+// drifting apart over time.
+async fn compute_score_for_channel(
+    state: &AppState,
+    channel: &Channel,
+    days: i64,
+) -> Result<AdminRewardScore> {
+    let events_col = state
+        .db
+        .collection::<ChannelMembershipEvent>("channel_membership_events");
+
+    let period_end = chrono::Utc::now();
+    let period_start = period_end - chrono::Duration::days(days);
+    let period_start_bson = DateTime::from_chrono(period_start);
+    let period_end_bson = DateTime::from_chrono(period_end);
+
+    let member_count = (channel.member_count.max(1)) as f64;
+
+    let active_count = channel
+        .members
+        .iter()
+        .filter(|m| {
+            m.last_active_at
+                .map_or(false, |t| t.to_chrono() >= period_start)
+        })
+        .count() as f64;
+
+    let voting_count = channel
+        .members
+        .iter()
+        .filter(|m| {
+            m.total_votes > 0
+                && m.last_active_at
+                    .map_or(false, |t| t.to_chrono() >= period_start)
+        })
+        .count() as f64;
+
+    let eligible_for_retention = channel
+        .members
+        .iter()
+        .filter(|m| m.joined_at.to_chrono() < period_start)
+        .count() as f64;
+
+    let retained = channel
+        .members
+        .iter()
+        .filter(|m| {
+            m.joined_at.to_chrono() < period_start
+                && m.last_active_at
+                    .map_or(false, |t| t.to_chrono() >= period_start)
+        })
+        .count() as f64;
+
+    let retention_rate = if eligible_for_retention > 0.0 {
+        retained / eligible_for_retention
+    } else {
+        0.0
+    };
+
+    let joined_count = events_col
+        .count_documents(doc! {
+            "channel_id": &channel.channel_id,
+            "event_type": "joined",
+            "occurred_at": { "$gte": period_start_bson, "$lte": period_end_bson },
+        })
+        .await? as i32;
+
+    let left_count = events_col
+        .count_documents(doc! {
+            "channel_id": &channel.channel_id,
+            "event_type": { "$in": ["left", "removed"] },
+            "occurred_at": { "$gte": period_start_bson, "$lte": period_end_bson },
+        })
+        .await? as i32;
+
+    let net_member_growth = joined_count - left_count;
+
+    let active_member_ratio = active_count / member_count;
+    let vote_participation = voting_count / member_count;
+    let growth_term = (net_member_growth as f64 / member_count).clamp(-1.0, 1.0);
+
+    let score = (active_member_ratio * 0.35)
+        + (vote_participation * 0.30)
+        + (retention_rate * 0.25)
+        + (growth_term * 0.10);
+
+    let admin_user_id = channel
+        .members
+        .iter()
+        .find(|m| m.role == "admin")
+        .map(|m| m.user_id.clone())
+        .unwrap_or_else(|| channel.created_by.clone());
+
+    Ok(AdminRewardScore {
+        id: None,
+        channel_id: channel.channel_id.clone(),
+        admin_user_id,
+        period_start: period_start_bson,
+        period_end: period_end_bson,
+        active_member_ratio,
+        vote_participation,
+        retention_rate,
+        net_member_growth,
+        score,
+        computed_at: DateTime::now(),
+    })
+}
+
+// ----------------------------------------------------------------------------
+// SINGLE CHANNEL
+// ----------------------------------------------------------------------------
+
+pub async fn compute_admin_reward_score_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+    Query(params): Query<ComputeRewardScoreQuery>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+    let scores_col = state
+        .db
+        .collection::<AdminRewardScore>("admin_reward_scores");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let days = params.days.unwrap_or(7);
+    let reward_score = compute_score_for_channel(&state, &channel, days).await?;
+
+    scores_col.insert_one(&reward_score).await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "score": reward_score,
+    })))
+}
+
+// ----------------------------------------------------------------------------
+// ALL CHANNELS (bulk sweep — point your cron/scheduler at this one)
+// ----------------------------------------------------------------------------
+
+// ----------------------------------------------------------------------------
+// ALL CHANNELS (bulk sweep — point your cron/scheduler at this one)
+// ----------------------------------------------------------------------------
+
+// ADMIN REWARD LEADERBOARD
+// ============================================================================
+
+pub async fn get_admin_reward_leaderboard_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>> {
+    let scores_col = state
+        .db
+        .collection::<AdminRewardScore>("admin_reward_scores");
+
+    let mut cursor = scores_col
+        .find(doc! {})
+        .sort(doc! { "computed_at": -1 })
+        .await?;
+
+    // Keep only the latest score per channel (cursor is newest-first, so
+    // the first one seen per channel_id wins).
+    let mut latest_by_channel: std::collections::HashMap<String, AdminRewardScore> =
+        std::collections::HashMap::new();
+
+    while cursor.advance().await? {
+        let s: AdminRewardScore = cursor.deserialize_current()?;
+        latest_by_channel.entry(s.channel_id.clone()).or_insert(s);
+    }
+
+    let mut ranked: Vec<AdminRewardScore> = latest_by_channel.into_values().collect();
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let leaderboard: Vec<serde_json::Value> = ranked
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            json!({
+                "rank": i + 1,
+                "channel_id": s.channel_id,
+                "admin_user_id": s.admin_user_id,
+                "score": s.score,
+                "active_member_ratio": s.active_member_ratio,
+                "vote_participation": s.vote_participation,
+                "retention_rate": s.retention_rate,
+                "net_member_growth": s.net_member_growth,
+                "period_start": s.period_start,
+                "period_end": s.period_end,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "success": true,
+        "leaderboard": leaderboard,
+    })))
 }
 
 // ============================================================================

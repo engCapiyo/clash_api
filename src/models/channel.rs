@@ -1,6 +1,7 @@
 use mongodb::bson::{oid::ObjectId, DateTime};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
 // Add this new struct
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PendingRequest {
@@ -22,10 +23,10 @@ pub struct Channel {
     pub season: String,
     pub member_count: i32,
 
-    // NEW FIELDS
     pub invite_code: String,
     pub pending_requests: Vec<PendingRequest>,
 }
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChannelMember {
     pub user_id: String,
@@ -36,6 +37,12 @@ pub struct ChannelMember {
     pub correct_votes: i32, // Denormalized from User
     pub total_votes: i32,   // Denormalized from User
     pub msg_count: i32,
+
+    // NEW: stamped whenever this member votes or sends a message in this
+    // channel. Lets us compute "active in last N days" without a full
+    // event log per member. None = never active since joining.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active_at: Option<DateTime>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -75,9 +82,8 @@ pub struct ChannelFixture {
     pub status: String,
     pub vote_counts: VoteCounts,
 
-    // NEW FIELDS FOR COMMENT TRACKING
-    pub comment_count: i32,                  // Total comments
-    pub unread_counts: HashMap<String, i32>, // Per-user unread counts
+    pub comment_count: i32,
+    pub unread_counts: HashMap<String, i32>,
 
     pub last_message: Option<String>,
     pub last_message_at: Option<DateTime>,
@@ -148,7 +154,7 @@ pub struct Vote {
     pub id: Option<ObjectId>,
     pub fixture_id: String,
     pub user_id: String,
-    pub selection: String, // "home", "away", "draw"
+    pub selection: String,
     pub is_correct: Option<bool>,
     pub points_awarded: Option<i32>,
     pub voted_at: DateTime,
@@ -172,4 +178,52 @@ pub struct Payout {
     pub status: String,
     pub created_at: DateTime,
     pub paid_at: Option<DateTime>,
+}
+
+// ============================================================================
+// MEMBERSHIP EVENT LOG - NEW
+// ============================================================================
+// Separate collection ("channel_membership_events"). Without this, you can't
+// compute churn or net growth over a rolling window — `member_count` only
+// ever tells you the current total, not who left or when. Every join/leave
+// (and join-request approve/reject if you want that funnel too) writes one
+// row here. Cheap to query: count "left" events in last 30d per channel_id.
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChannelMembershipEvent {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub channel_id: String,
+    pub user_id: String,
+    pub event_type: String, // "joined" | "left" | "removed"
+    pub occurred_at: DateTime,
+}
+
+// ============================================================================
+// ADMIN REWARD SCORE - NEW
+// ============================================================================
+// Stores the computed score per channel per period, so you're not
+// recalculating from scratch every time someone views a leaderboard, and so
+// you have history to show admins ("your score last week vs this week").
+// admin_user_id is denormalized from Channel.created_by / role=="admin" at
+// computation time, since multi-admin channels are possible.
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AdminRewardScore {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub channel_id: String,
+    pub admin_user_id: String,
+    pub period_start: DateTime,
+    pub period_end: DateTime,
+
+    // raw inputs, kept alongside the score so the formula can change later
+    // without losing the ability to recompute history
+    pub active_member_ratio: f64, // active_in_period / member_count
+    pub vote_participation: f64,  // members who voted / member_count
+    pub retention_rate: f64,      // members from period_start still here at period_end
+    pub net_member_growth: i32,   // joins - leaves in period
+
+    pub score: f64,
+    pub computed_at: DateTime,
 }
