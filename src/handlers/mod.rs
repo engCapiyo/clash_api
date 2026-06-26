@@ -11,7 +11,7 @@ pub(crate) mod chat_handlers;
 pub(crate) mod comrade_handler;
 pub(crate) mod visibility_handler;
 
-pub(crate) mod actions;
+pub mod actions;
 pub(crate) mod channel;
 pub(crate) mod events_handler;
 pub(crate) mod mpesa_handlers;
