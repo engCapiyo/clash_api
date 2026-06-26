@@ -1,5 +1,6 @@
 pub(crate) mod archive;
 //pub(crate) mod auth;
+pub(crate) mod actions;
 pub mod auth;
 pub(crate) mod bets;
 pub(crate) mod channel;

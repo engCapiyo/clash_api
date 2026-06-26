@@ -18,6 +18,7 @@ pub(crate) mod transaction;
 pub(crate) mod user_profile;
 pub use sub_fixture::*;
 
+pub(crate) mod actions;
 pub(crate) mod channel;
 pub(crate) mod comrade;
 pub(crate) mod votes_visibility;

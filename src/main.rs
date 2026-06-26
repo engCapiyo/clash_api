@@ -132,6 +132,7 @@ async fn build_router(app_state: AppState) -> Router {
         .route("/api/simple_health_check", get(simple_health_check))
         .nest("/api/auth", routes::auth::user_routes())
         .nest("/api/games", routes::games::routes())
+        .nest("/api/actions", routes::actions::actions_routes())
         .nest("/api/comrades", routes::comrade_route::comrade_routes())
         .nest("/api/posts", routes::posts::routes())
         .nest("/api/bets", routes::bets::bets_routes())

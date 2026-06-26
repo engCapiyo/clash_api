@@ -4,8 +4,8 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use futures_util::StreamExt;
 use bson::Bson;
+use futures_util::StreamExt;
 use mongodb::bson::{doc, DateTime};
 use mongodb::Collection;
 use serde_json::{json, Value};
@@ -942,6 +942,25 @@ pub struct CreatePledgeAndVoteRequest {
     pub away_team: String,
     pub starter_id: String,
     pub fixture_id: String,
+}
+pub async fn get_fixture_pledgers_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    let games_col: Collection<Game> = state.db.collection("fixtures");
+
+    let game = games_col
+        .find_one(doc! { "match_id": &fixture_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "channel_id": channel_id,
+        "pledges": game.pledges,
+        "pledgers": game.pledgers,
+    })))
 }
 
 pub async fn create_pledge_with_vote_handler(
