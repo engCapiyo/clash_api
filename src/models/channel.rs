@@ -178,6 +178,14 @@ pub struct Payout {
     pub status: String,
     pub created_at: DateTime,
     pub paid_at: Option<DateTime>,
+
+    // NEW: snapshot of cumulative totals at the moment this payout was
+    // computed. Lets the next payout diff against these instead of
+    // re-paying the same lifetime votes/messages every period.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes_at_payout: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages_at_payout: Option<i32>,
 }
 
 // ============================================================================

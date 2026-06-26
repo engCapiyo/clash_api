@@ -16,7 +16,8 @@ use bson::oid::ObjectId; // ✅ MUST HAVE THIS
 use crate::errors::{AppError, Result};
 use crate::models::channel::{
     AdminRewardScore, Channel, ChannelActivity, ChannelFixture, ChannelMember,
-    ChannelMembershipEvent, Fixture, Message, PendingRequest, ReplyToData, Vote, VoteCounts,
+    ChannelMembershipEvent, Fixture, Message, Payout, PendingRequest, ReplyToData, Vote,
+    VoteCounts,
 };
 use crate::AppState;
 
@@ -1436,6 +1437,152 @@ pub struct ComputeRewardScoreQuery {
 // ============================================================================
 // COMPUTE ADMIN REWARD SCORE (shared logic + single-channel + bulk)
 // ============================================================================
+// ============================================================================
+// COMPUTE ADMIN PAYOUT (rate-based: votes + messages, per channel)
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ComputePayoutQuery {
+    pub days: Option<i64>, // unused by the diff-based logic, kept for API consistency
+}
+
+const KES_PER_VOTE: f64 = 10.0;
+const KES_PER_MESSAGE: f64 = 1.0; // KES 10 per 10 messages
+const SIGNUP_BONUS: f64 = 100.0;
+
+async fn compute_payout_for_channel(state: &AppState, channel: &Channel) -> Result<Payout> {
+    let payouts_col = state.db.collection::<Payout>("payouts");
+
+    let last_payout = payouts_col
+        .find_one(doc! { "channel_id": &channel.channel_id })
+        .sort(doc! { "created_at": -1 })
+        .await?;
+
+    let current_votes: i32 = channel.members.iter().map(|m| m.total_votes).sum();
+    let current_messages: i32 = channel.members.iter().map(|m| m.msg_count).sum();
+
+    let admin_user_id = channel
+        .members
+        .iter()
+        .find(|m| m.role == "admin")
+        .map(|m| m.user_id.clone())
+        .unwrap_or_else(|| channel.created_by.clone());
+
+    let (amount, payout_type) = match &last_payout {
+        None => (SIGNUP_BONUS, "signup_bonus".to_string()),
+        Some(p) => {
+            let prev_votes = p.votes_at_payout.unwrap_or(0);
+            let prev_messages = p.messages_at_payout.unwrap_or(0);
+
+            let new_votes = (current_votes - prev_votes).max(0) as f64;
+            let new_messages = (current_messages - prev_messages).max(0) as f64;
+
+            let amt = (new_votes * KES_PER_VOTE) + (new_messages * KES_PER_MESSAGE);
+            (amt, "engagement_rate".to_string())
+        }
+    };
+
+    Ok(Payout {
+        id: None,
+        user_id: admin_user_id,
+        channel_id: channel.channel_id.clone(),
+        payout_type,
+        amount,
+        currency: "KES".to_string(),
+        week: None,
+        season: channel.season.clone(),
+        status: "pending".to_string(),
+        created_at: DateTime::now(),
+        paid_at: None,
+        votes_at_payout: Some(current_votes),
+        messages_at_payout: Some(current_messages),
+    })
+}
+
+// ----------------------------------------------------------------------------
+// SINGLE CHANNEL
+// ----------------------------------------------------------------------------
+
+pub async fn compute_admin_payout_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+    Query(_params): Query<ComputePayoutQuery>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+    let payouts_col = state.db.collection::<Payout>("payouts");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let payout = compute_payout_for_channel(&state, &channel).await?;
+    payouts_col.insert_one(&payout).await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "payout": payout,
+    })))
+}
+
+// ----------------------------------------------------------------------------
+// ALL CHANNELS (bulk sweep)
+// ----------------------------------------------------------------------------
+
+pub async fn compute_all_admin_payouts_handler(
+    State(state): State<AppState>,
+    Query(_params): Query<ComputePayoutQuery>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+    let payouts_col = state.db.collection::<Payout>("payouts");
+
+    let mut cursor = channels_col.find(doc! {}).await?;
+
+    let mut computed = Vec::new();
+    let mut failed: Vec<serde_json::Value> = Vec::new();
+
+    while cursor.advance().await? {
+        let channel: Channel = match cursor.deserialize_current() {
+            Ok(c) => c,
+            Err(e) => {
+                failed.push(json!({ "error": format!("deserialize failed: {}", e) }));
+                continue;
+            }
+        };
+
+        match compute_payout_for_channel(&state, &channel).await {
+            Ok(payout) => {
+                if let Err(e) = payouts_col.insert_one(&payout).await {
+                    failed.push(json!({
+                        "channel_id": channel.channel_id,
+                        "error": format!("insert failed: {}", e),
+                    }));
+                } else {
+                    computed.push(json!({
+                        "channel_id": payout.channel_id,
+                        "admin_user_id": payout.user_id,
+                        "amount": payout.amount,
+                        "payout_type": payout.payout_type,
+                    }));
+                }
+            }
+            Err(e) => {
+                failed.push(json!({
+                    "channel_id": channel.channel_id,
+                    "error": format!("{:?}", e),
+                }));
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "channels_processed": computed.len(),
+        "channels_failed": failed.len(),
+        "results": computed,
+        "failures": failed,
+    })))
+}
 
 pub async fn compute_all_admin_reward_scores_handler(
     State(state): State<AppState>,

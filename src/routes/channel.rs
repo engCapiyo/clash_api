@@ -5,9 +5,10 @@ use axum::{
 
 use crate::handlers::channel::{
     add_members_to_channel_handler, approve_join_request_handler, cast_vote_handler,
-    check_user_vote_handler, check_user_vote_in_channel_handler,
-    compute_admin_reward_score_handler, compute_all_admin_reward_scores_handler,
-    create_channel_handler, finalize_fixture_result_handler, get_admin_reward_leaderboard_handler,
+    check_user_vote_handler, check_user_vote_in_channel_handler, compute_admin_payout_handler,
+    compute_admin_reward_score_handler, compute_all_admin_payouts_handler,
+    compute_all_admin_reward_scores_handler, create_channel_handler,
+    finalize_fixture_result_handler, get_admin_reward_leaderboard_handler,
     get_all_channels_handler, get_channel_fixtures_handler, get_channel_handler,
     get_channel_invite_code_handler, get_channel_leaderboard_handler,
     get_fixture_comment_count_handler, get_fixture_latest_comment_handler,
@@ -43,6 +44,14 @@ pub fn channel_routes() -> Router<AppState> {
         .route("/all", get(get_all_channels_handler))
         // Add this with the other routes
         .route("/invite/:code", get(get_invite_channel_handler))
+        .route(
+            "/:channel_id/admin-payout/compute",
+            post(compute_admin_payout_handler).get(compute_admin_payout_handler),
+        )
+        .route(
+            "/admin-payout/compute-all",
+            post(compute_all_admin_payouts_handler).get(compute_all_admin_payouts_handler),
+        )
         .route(
             "/admin-reward/compute-all",
             post(compute_all_admin_reward_scores_handler)
