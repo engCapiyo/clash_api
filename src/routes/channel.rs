@@ -45,7 +45,8 @@ pub fn channel_routes() -> Router<AppState> {
         .route("/invite/:code", get(get_invite_channel_handler))
         .route(
             "/admin-reward/compute-all",
-            post(compute_all_admin_reward_scores_handler),
+            post(compute_all_admin_reward_scores_handler)
+                .get(compute_all_admin_reward_scores_handler),
         )
         .route(
             "/:channel_id/fixtures/:fixture_id/votes/count",
