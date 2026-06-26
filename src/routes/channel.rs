@@ -8,9 +8,9 @@ use crate::handlers::channel::{
     check_user_vote_handler, check_user_vote_in_channel_handler, compute_admin_payout_handler,
     compute_admin_reward_score_handler, compute_all_admin_payouts_handler,
     compute_all_admin_reward_scores_handler, create_channel_handler,
-    finalize_fixture_result_handler, get_admin_reward_leaderboard_handler,
-    get_all_channels_handler, get_channel_fixtures_handler, get_channel_handler,
-    get_channel_invite_code_handler, get_channel_leaderboard_handler,
+    create_pledge_with_vote_handler, finalize_fixture_result_handler,
+    get_admin_reward_leaderboard_handler, get_all_channels_handler, get_channel_fixtures_handler,
+    get_channel_handler, get_channel_invite_code_handler, get_channel_leaderboard_handler,
     get_fixture_comment_count_handler, get_fixture_latest_comment_handler,
     get_fixture_vote_count_handler, get_invite_channel_handler, get_messages_handler,
     get_pending_requests_handler, get_single_fixture_handler, get_user_channel_count_handler,
@@ -104,6 +104,13 @@ pub fn channel_routes() -> Router<AppState> {
         .route("/reject-request", post(reject_join_request_handler))
         // Auto-join via invite code (no notification needed)
         .route("/join-by-code", post(join_channel_by_code_handler))
+        // ====================================================================
+        // PLEDGES (creates a pledge + casts the implied vote atomically)
+        // ====================================================================
+        // main.rs mounts this router at /api/channels, so this resolves to
+        // POST /api/channels/pledges. Flutter's _createPledge calls
+        // '$API_BASE_URL/channels/pledges' to match.
+        .route("/pledges", post(create_pledge_with_vote_handler))
         // ====================================================================
         // VOTES (GLOBAL - no channel_id in path)
         // ====================================================================
