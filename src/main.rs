@@ -29,8 +29,12 @@ async fn main() {
 
     create_directories().await;
 
-    let db = get_db_client().await;
-    let app_state = initialize_app_state(db).await;
+    // NOTE: get_db_client() now needs to return BOTH the Client and the
+    // Database, since AppState::new() needs the Client to start sessions
+    // for transactions. If your current get_db_client() only returns a
+    // Database, change its signature to return (mongodb::Client, mongodb::Database).
+    let (client, db) = get_db_client().await;
+    let app_state = initialize_app_state(client, db).await;
 
     let app = build_router(app_state).await;
     start_server(app).await;
@@ -45,9 +49,9 @@ async fn create_directories() {
     }
 }
 
-async fn initialize_app_state(db: mongodb::Database) -> AppState {
+async fn initialize_app_state(client: mongodb::Client, db: mongodb::Database) -> AppState {
     // Initialize AppState - no more JWT secret or SMS config needed
-    let mut app_state = match AppState::new(db) {
+    let mut app_state = match AppState::new(client, db) {
         Ok(state) => {
             tracing::info!("✅ AppState initialized successfully");
             state

@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use mongodb::Database;
+use mongodb::{Client, Database};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -14,6 +14,7 @@ pub type CommentBroadcaster = Arc<DashMap<String, broadcast::Sender<String>>>;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub client: Client,
     pub db: Database,
     pub mpesa_service: Option<Arc<MpesaService>>,
     pub fcm_service: Option<Arc<FCMService>>,
@@ -22,10 +23,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: Database) -> Result<Self, AppError> {
+    pub fn new(client: Client, db: Database) -> Result<Self, AppError> {
         let cloudinary = CloudinaryService::new()?;
 
         Ok(AppState {
+            client,
             db,
             mpesa_service: None,
             fcm_service: None,
@@ -51,7 +53,8 @@ impl AppState {
             return tx.clone();
         }
         let (tx, _) = broadcast::channel(64);
-        self.comment_broadcaster.insert(room_key.to_string(), tx.clone());
+        self.comment_broadcaster
+            .insert(room_key.to_string(), tx.clone());
         tx
     }
 }

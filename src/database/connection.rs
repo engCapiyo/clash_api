@@ -1,9 +1,9 @@
 use mongodb::{Client, Database};
 use std::env;
 
-pub async fn get_db_client() -> Database {
-    let database_url = env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set as an environment variable");
+pub async fn get_db_client() -> (Client, Database) {
+    let database_url =
+        env::var("DATABASE_URL").expect("DATABASE_URL must be set as an environment variable");
 
     let client = Client::with_uri_str(&database_url)
         .await
@@ -24,11 +24,14 @@ pub async fn get_db_client() -> Database {
             }
         }
         Err(e) => {
-            eprintln!("❌ Database '{}' may not exist or is inaccessible: {}", db_name, e);
+            eprintln!(
+                "❌ Database '{}' may not exist or is inaccessible: {}",
+                db_name, e
+            );
             // You could panic here or return an error
             // panic!("Database '{}' not found: {}", db_name, e);
         }
     }
 
-    db
+    (client, db)
 }

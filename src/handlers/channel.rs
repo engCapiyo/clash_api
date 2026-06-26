@@ -692,6 +692,10 @@ pub async fn get_channel_fixtures_handler(
 // GET MESSAGES
 // ============================================================================
 
+// ============================================================================
+// GET MESSAGES
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct MessagesQuery {
     pub channel_id: String,
@@ -718,21 +722,26 @@ pub async fn get_messages_handler(
         "channel_id": &params.channel_id,
     };
 
-    // ✅ CRITICAL FIX: Handle fixture_id properly
+    // ✅ FIX: General channel chat must match documents where fixture_id is
+    // either NULL (BSON null — current/legacy writes that include the field
+    // with a null value) OR completely ABSENT (writes made after the Message
+    // model was annotated with skip_serializing_if). A plain equality match
+    // against BSON Null covers both cases in MongoDB — `$exists: false`
+    // alone does NOT match a field that is present-but-null, which was the
+    // root cause of general chat messages going missing from this query.
     match &params.fixture_id {
         Some(fixture_id) => {
-            // Fixture-specific chat
             if fixture_id.is_empty() {
-                // Empty string = general channel chat
-                filter.insert("fixture_id", doc! { "$exists": false });
+                // Empty string from client = general channel chat
+                filter.insert("fixture_id", mongodb::bson::Bson::Null);
             } else {
                 // Specific fixture
                 filter.insert("fixture_id", fixture_id);
             }
         }
         None => {
-            // No fixture_id = general channel chat
-            filter.insert("fixture_id", doc! { "$exists": false });
+            // No fixture_id param = general channel chat
+            filter.insert("fixture_id", mongodb::bson::Bson::Null);
         }
     }
 

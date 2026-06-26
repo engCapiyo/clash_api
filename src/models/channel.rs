@@ -118,11 +118,22 @@ pub struct ReplyToData {
 // MESSAGE MODEL
 // ============================================================================
 
+// ============================================================================
+// MESSAGE MODEL
+// ============================================================================
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Message {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub channel_id: String,
+    // ✅ FIX: was missing skip_serializing_if. Without it, BSON serialized
+    // `None` as an explicit `fixture_id: null` field instead of omitting the
+    // key entirely. That mismatched the read-side `$exists: false` filter in
+    // get_messages_handler, which only matches a truly absent field — so
+    // every general-channel message became invisible to that query. New
+    // writes will now correctly omit the field when there's no fixture.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fixture_id: Option<String>,
     pub sender_id: String,
     pub sender_name: String,
