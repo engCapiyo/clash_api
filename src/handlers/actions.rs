@@ -160,11 +160,18 @@ pub async fn create_bet_handler(
         payload.channel_id.clone(),
     );
 
-    bets_col
+    let insert_result = bets_col
         .insert_one(&bet)
         .session(&mut session)
         .await
         .map_err(|e| AppError::MongoDB(e))?;
+
+    // ✅ Get the inserted ID safely
+    let bet_id = insert_result
+        .inserted_id
+        .as_object_id()
+        .map(|oid| oid.to_hex())
+        .ok_or_else(|| AppError::InternalServerError("Failed to get bet ID".to_string()))?;
 
     // 5. Create vote (ONLY if not already voted)
     if existing_vote.is_none() {
@@ -214,12 +221,15 @@ pub async fn create_bet_handler(
     Ok(Json(json!({
         "success": true,
         "message": "Bet created successfully",
-        "bet_id": bet.id.unwrap().to_hex(),
+        "bet_id": bet_id,  // ✅ Now safe
         "new_balance": new_balance,
         "status": "open",
     })))
 }
 
+// ============================================================================
+// 3. FILL BET (Atomic: Finisher accepts the bet)
+// ============================================================================
 // ============================================================================
 // 3. FILL BET (Atomic: Finisher accepts the bet)
 // ============================================================================
@@ -384,7 +394,7 @@ pub async fn fill_bet_handler(
     Ok(Json(json!({
         "success": true,
         "message": "Bet filled successfully",
-        "bet_id": payload.bet_id,
+        "bet_id": payload.bet_id,  // ✅ Use payload.bet_id directly (already a valid ObjectId hex)
         "status": "matched",
         "total_pot": bet.starter_amount + payload.amount,
     })))
