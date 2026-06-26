@@ -524,59 +524,6 @@ async fn handle_incoming_message(
 // SAVE VOTE TO DATABASE (GLOBAL - No channel_id)
 // ============================================================================
 
-async fn save_vote_to_database(
-    state: &AppState,
-    fixture_id: &str,
-    user_id: &str,
-    selection: &str,
-) -> Result<(), String> {
-    let votes_col = state.db.collection::<Vote>("votes");
-    let now = BsonDateTime::now();
-
-    // Check if user already voted on this fixture
-    let existing = votes_col
-        .find_one(doc! {
-            "fixture_id": fixture_id,
-            "user_id": user_id,
-        })
-        .await
-        .map_err(|e| format!("Failed to check existing vote: {}", e))?;
-
-    if existing.is_some() {
-        return Err("Already voted on this fixture".to_string());
-    }
-
-    let vote = Vote {
-        id: None,
-        fixture_id: fixture_id.to_string(),
-        user_id: user_id.to_string(),
-        selection: selection.to_string(),
-        is_correct: None,
-        points_awarded: None,
-        voted_at: now,
-    };
-
-    votes_col
-        .insert_one(&vote)
-        .await
-        .map_err(|e| format!("Failed to insert vote: {}", e))?;
-
-    // Also update user's total_votes count
-    let users_col = state.db.collection::<User>("users");
-    let user_object_id =
-        ObjectId::parse_str(user_id).map_err(|e| format!("Invalid user ID: {}", e))?;
-
-    users_col
-        .update_one(
-            doc! { "_id": user_object_id },
-            doc! { "$inc": { "total_votes": 1 } },
-        )
-        .await
-        .map_err(|e| format!("Failed to update user vote count: {}", e))?;
-
-    Ok(())
-}
-
 // ============================================================================
 // SAVE MESSAGE TO DATABASE
 // ============================================================================
@@ -675,14 +622,19 @@ async fn save_message_to_database(
         .await
         .map_err(|e| format!("Failed to update channel activity: {}", e))?;
 
-    // 3. Update member's message count
+    // 3. Update member's message count AND last_active_at
+    // (covers both chat types — fixture_id is None for overall channel
+    // chat, Some(..) for fixture-scoped chat — same field update either way)
     channels_col
         .update_one(
             doc! {
                 "channel_id": channel_id,
                 "members.user_id": user_id
             },
-            doc! { "$inc": { "members.$.msg_count": 1 } },
+            doc! {
+                "$inc": { "members.$.msg_count": 1 },
+                "$set": { "members.$.last_active_at": now },
+            },
         )
         .await
         .map_err(|e| format!("Failed to update member msg_count: {}", e))?;
