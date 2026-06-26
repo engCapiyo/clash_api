@@ -690,50 +690,125 @@ pub async fn get_channel_fixtures_handler(
 // GET MESSAGES
 // ============================================================================
 
-#[derive(Debug, serde::Deserialize)]
-pub struct GetMessagesQuery {
+#[derive(Debug, Deserialize)]
+pub struct MessagesQuery {
     pub channel_id: String,
     pub fixture_id: Option<String>,
-    pub limit: Option<i32>,
-    pub offset: Option<i32>,
+    pub limit: Option<i64>,
+    pub before: Option<String>,
 }
 
 pub async fn get_messages_handler(
+    Query(params): Query<MessagesQuery>,
     State(state): State<AppState>,
-    Query(params): Query<GetMessagesQuery>,
-) -> Result<Json<serde_json::Value>> {
-    let messages_col = state.db.collection::<Message>("messages");
-    let limit = params.limit.unwrap_or(50);
+) -> Json<serde_json::Value> {
+    tracing::info!(
+        "📨 Fetching messages - channel: {}, fixture: {:?}",
+        params.channel_id,
+        params.fixture_id
+    );
 
-    let filter = if let Some(fixture_id) = &params.fixture_id {
-        doc! {
-            "channel_id": &params.channel_id,
-            "fixture_id": fixture_id,
+    let messages_col = state.db.collection::<Message>("messages");
+    let limit = params.limit.unwrap_or(100);
+
+    // ✅ BUILD THE FILTER CORRECTLY
+    let mut filter = doc! {
+        "channel_id": &params.channel_id,
+    };
+
+    // ✅ CRITICAL FIX: Handle fixture_id properly
+    match &params.fixture_id {
+        Some(fixture_id) => {
+            // Fixture-specific chat
+            if fixture_id.is_empty() {
+                // Empty string = general channel chat
+                filter.insert("fixture_id", doc! { "$exists": false });
+            } else {
+                // Specific fixture
+                filter.insert("fixture_id", fixture_id);
+            }
         }
-    } else {
-        doc! {
-            "channel_id": &params.channel_id,
-            "fixture_id": mongodb::bson::Bson::Null,
+        None => {
+            // No fixture_id = general channel chat
+            filter.insert("fixture_id", doc! { "$exists": false });
+        }
+    }
+
+    // Add pagination
+    if let Some(before) = &params.before {
+        if let Ok(before_time) = DateTime::parse_rfc3339_str(before) {
+            filter.insert("sent_at", doc! { "$lt": before_time });
+        }
+    }
+
+    // Execute query - newest first
+    let mut cursor = match messages_col
+        .find(filter)
+        .sort(doc! { "sent_at": -1 })
+        .limit(limit)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("❌ Failed to query messages: {}", e);
+            return Json(serde_json::json!({
+                "success": false,
+                "error": format!("Database error: {}", e),
+                "messages": []
+            }));
         }
     };
 
-    let mut cursor = messages_col
-        .find(filter)
-        .sort(doc! { "sent_at": 1 })
-        .limit(limit as i64)
-        .skip(params.offset.unwrap_or(0) as u64)
-        .await?;
-
-    let mut messages = Vec::new();
-    while cursor.advance().await? {
-        messages.push(cursor.deserialize_current()?);
+    // Collect messages
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    while let Some(msg) = cursor.next().await {
+        match msg {
+            Ok(message) => {
+                let msg_json = serde_json::json!({
+                    "id": message.id.map(|oid| oid.to_hex()),
+                    "message_id": message.message_id,
+                    "sender_id": message.sender_id,
+                    "sender_name": message.sender_name,
+                    "text": message.text,
+                    "selection": message.selection,
+                    "sent_at": message.sent_at.to_rfc3339_string(),
+                    "image_url": message.image_url,
+                    "video_url": message.video_url,
+                    "is_image": message.is_image,
+                    "is_video": message.is_video,
+                    "reply_to": message.reply_to.map(|r| serde_json::json!({
+                        "messageId": r.message_id,
+                        "text": r.text,
+                        "username": r.username,
+                        "selection": r.selection,
+                        "isMe": r.is_me,
+                    })),
+                });
+                messages.push(msg_json);
+            }
+            Err(e) => {
+                tracing::error!("❌ Error reading message: {}", e);
+            }
+        }
     }
 
-    Ok(Json(json!({
+    // Reverse to get chronological order
+    messages.reverse();
+
+    tracing::info!(
+        "✅ Returned {} messages for channel {}, fixture: {:?}",
+        messages.len(),
+        params.channel_id,
+        params.fixture_id
+    );
+
+    Json(serde_json::json!({
         "success": true,
         "messages": messages,
         "count": messages.len(),
-    })))
+        "channel_id": params.channel_id,
+        "fixture_id": params.fixture_id,
+    }))
 }
 // ============================================================================
 // CAST VOTE (GLOBAL - No channel_id, No votes collection)
