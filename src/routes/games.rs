@@ -3,7 +3,7 @@ use axum::{
     Router,
 };
 
-use crate::handlers::{events_handler, games, lineup_handler, statistics_handler};
+use crate::handlers::{actions, channel, events_handler, games, statistics_handler};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -20,17 +20,11 @@ pub fn routes() -> Router<AppState> {
             "/test-notification",
             post(games::send_test_notification_from_poller),
         )
-        // ── Lineups ────────────────────────────────────────────────────────────
-        .route("/lineups", post(lineup_handler::receive_lineups_update))
-        // ── Statistics ─────────────────────────────────────────────────────────
-        .route(
-            "/statistics",
-            post(statistics_handler::add_statistics_snapshot),
-        )
-        .route(
-            "/statistics/bulk",
-            post(statistics_handler::bulk_update_statistics),
-        )
+        // ── Lineups (now in games) ────────────────────────────────────────────
+        .route("/lineups", post(games::store_lineups))
+        // ── Statistics (now in games) ─────────────────────────────────────────
+        .route("/statistics", post(games::add_statistics_snapshot))
+        .route("/statistics/bulk", post(games::bulk_update_statistics))
         // ── Events ─────────────────────────────────────────────────────────────
         .route("/events", post(events_handler::add_event))
         .route("/events/bulk", post(events_handler::bulk_add_events))
@@ -65,6 +59,26 @@ pub fn routes() -> Router<AppState> {
             "/fixture/:fixture_id/user/:user_id/voted",
             get(games::check_user_voted_fast),
         )
+        // ── Lineups (match-specific) ──────────────────────────────────────────
+        .route("/:match_id/lineups", get(games::get_lineups))
+        .route(
+            "/:match_id/lineups/simplified",
+            get(games::get_simplified_lineups),
+        )
+        .route(
+            "/:match_id/lineups/available",
+            get(games::check_lineups_available),
+        )
+        // ── Statistics (match-specific) ──────────────────────────────────────
+        .route("/:match_id/statistics", get(games::get_match_statistics))
+        .route(
+            "/:match_id/statistics/latest",
+            get(games::get_latest_statistics),
+        )
+        .route(
+            "/:match_id/statistics/:minute",
+            get(games::get_statistics_at_minute),
+        )
         // ── :match_id routes (must come last) ─────────────────────────────────
         .route("/:match_id/score", put(games::update_game_score))
         .route("/:match_id/status", put(games::update_game_status))
@@ -76,27 +90,6 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/:match_id/commentary/latest",
             get(games::get_latest_commentary),
-        )
-        .route("/:match_id/lineups", get(lineup_handler::get_lineups))
-        .route(
-            "/:match_id/lineups/simplified",
-            get(lineup_handler::get_simplified_lineups),
-        )
-        .route(
-            "/:match_id/lineups/available",
-            get(lineup_handler::check_lineups_available),
-        )
-        .route(
-            "/:match_id/statistics",
-            get(statistics_handler::get_match_statistics),
-        )
-        .route(
-            "/:match_id/statistics/latest",
-            get(statistics_handler::get_latest_statistics),
-        )
-        .route(
-            "/:match_id/statistics/:minute",
-            get(statistics_handler::get_statistics_at_minute),
         )
         .route("/:match_id/events", get(events_handler::get_match_events))
         .route(

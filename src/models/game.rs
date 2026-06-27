@@ -3,8 +3,9 @@ use mongodb::bson::DateTime as BsonDateTime;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// ========== VOTER STRUCT ==========
-// ========== VOTER STRUCT ==========
+// ============================================================================
+// VOTER
+// ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Voter {
     #[serde(rename = "userId")]
@@ -13,7 +14,7 @@ pub struct Voter {
     #[serde(rename = "userName")]
     pub user_name: String,
 
-    pub selection: String, // "home_team", "away_team", "draw"
+    pub selection: String, // "home", "away", "draw"
 
     #[serde(rename = "isCorrect", skip_serializing_if = "Option::is_none")]
     pub is_correct: Option<bool>,
@@ -25,7 +26,9 @@ pub struct Voter {
     pub voted_at: BsonDateTime,
 }
 
-// ========== COMMENTARY ENTRY ==========
+// ============================================================================
+// COMMENTARY ENTRY
+// ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentaryEntry {
     pub minute: i32,
@@ -38,7 +41,9 @@ pub struct CommentaryEntry {
     pub created_at: BsonDateTime,
 }
 
-// ========== STATISTICS ==========
+// ============================================================================
+// STATISTICS - MATCHES PYTHON POLLER AND FLUTTER
+// ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamStatistics {
     pub possession: Option<f64>,
@@ -60,19 +65,21 @@ pub struct TeamStatistics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchStatistics {
+    pub home: TeamStatistics,
+    pub away: TeamStatistics,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatisticsSnapshot {
     pub minute: i32,
     pub statistics: MatchStatistics,
     pub timestamp: BsonDateTime,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MatchStatistics {
-    pub home: TeamStatistics,
-    pub away: TeamStatistics,
-}
-
-// ========== LINEUPS ==========
+// ============================================================================
+// LINEUPS - MATCHES PYTHON POLLER AND FLUTTER
+// ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Player {
     pub name: String,
@@ -87,6 +94,11 @@ pub struct Player {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Coach {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamLineup {
     pub formation: String,
     pub coach: Coach,
@@ -95,29 +107,32 @@ pub struct TeamLineup {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Coach {
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineupsDocument {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+
     #[serde(rename = "matchId")]
     pub match_id: String,
+
     #[serde(rename = "homeTeam")]
     pub home_team: String,
+
     #[serde(rename = "awayTeam")]
     pub away_team: String,
+
     #[serde(rename = "homeLineup")]
     pub home_lineup: TeamLineup,
+
     #[serde(rename = "awayLineup")]
     pub away_lineup: TeamLineup,
+
     #[serde(rename = "fetchedAt")]
     pub fetched_at: BsonDateTime,
 }
 
-// ========== MAIN GAME MODEL ==========
+// ============================================================================
+// MAIN GAME MODEL - MATCHES PYTHON SCRAPER AND FLUTTER
+// ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Game {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -137,7 +152,7 @@ pub struct Game {
 
     pub league: String,
 
-    // ⚠️ FIXED: Now Option<f64> to handle null from scraper
+    // ✅ Option<f64> - handles null from Python scraper
     #[serde(rename = "homeWin")]
     pub home_win: Option<f64>,
 
@@ -174,7 +189,7 @@ pub struct Game {
 
     pub result: Option<String>, // "home", "away", "draw"
 
-    pub source: String, // "365scores", "apifootball", etc.
+    pub source: String, // "365scores"
 
     #[serde(rename = "scrapedAt")]
     pub scraped_at: BsonDateTime,
@@ -199,14 +214,14 @@ pub struct Game {
     #[serde(rename = "lastCommentaryAt")]
     pub last_commentary_at: Option<BsonDateTime>,
 
-    // ========== LINEUPS ==========
+    // ========== LINEUPS (stored as document reference) ==========
     pub lineups: Option<LineupsDocument>,
     #[serde(rename = "lineupsFetched")]
     pub lineups_fetched: bool,
     #[serde(rename = "lineupsFetchedAt")]
     pub lineups_fetched_at: Option<BsonDateTime>,
 
-    // ========== STATISTICS ==========
+    // ========== STATISTICS (array of snapshots) ==========
     pub statistics: Vec<StatisticsSnapshot>,
     #[serde(rename = "lastStatisticsMinute")]
     pub last_statistics_minute: Option<i32>,
@@ -225,7 +240,9 @@ pub struct Game {
     pub created_at: BsonDateTime,
 }
 
-// ========== REQUEST STRUCTS ==========
+// ============================================================================
+// REQUEST STRUCTS
+// ============================================================================
 #[derive(Debug, Deserialize)]
 pub struct CreateGameRequest {
     #[serde(rename = "matchId")]
@@ -275,7 +292,9 @@ pub struct GameQuery {
     pub source: Option<String>,
 }
 
-// ========== LIVE UPDATE FROM POLLER ==========
+// ============================================================================
+// LIVE UPDATE FROM POLLER
+// ============================================================================
 #[derive(Debug, Clone, Deserialize)]
 pub struct LiveGameUpdate {
     #[serde(rename = "fixtureId")]
@@ -301,22 +320,9 @@ pub struct LiveGameUpdate {
     pub timestamp: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct EventRequest {
-    #[serde(rename = "fixtureId")]
-    pub fixture_id: String,
-    #[serde(rename = "eventType")]
-    pub event_type: String,
-    pub minute: i32,
-    pub team: String,
-    pub player: String,
-    pub assist: Option<String>,
-    #[serde(rename = "homeScore")]
-    pub home_score: i32,
-    #[serde(rename = "awayScore")]
-    pub away_score: i32,
-}
-
+// ============================================================================
+// LINEUPS UPDATE FROM POLLER
+// ============================================================================
 #[derive(Debug, Deserialize)]
 pub struct LineupsUpdate {
     #[serde(rename = "fixtureId")]
@@ -359,7 +365,59 @@ pub struct PlayerPayload {
     pub player_id: Option<String>,
 }
 
-// ========== RESPONSE WRAPPERS ==========
+// ============================================================================
+// STATISTICS UPDATE FROM POLLER
+// ============================================================================
+#[derive(Debug, Deserialize)]
+pub struct StatisticsSnapshotPayload {
+    pub fixture_id: String,
+    pub minute: i32,
+    pub statistics: MatchStatisticsPayload,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MatchStatisticsPayload {
+    pub home: TeamStatisticsPayload,
+    pub away: TeamStatisticsPayload,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TeamStatisticsPayload {
+    pub possession: Option<f64>,
+    pub shots: Option<i32>,
+    pub shots_on_target: Option<i32>,
+    pub shots_off_target: Option<i32>,
+    pub corners: Option<i32>,
+    pub fouls: Option<i32>,
+    pub yellow_cards: Option<i32>,
+    pub red_cards: Option<i32>,
+    pub offsides: Option<i32>,
+    pub passes: Option<i32>,
+    pub pass_accuracy: Option<f64>,
+}
+
+// ============================================================================
+// EVENTS FROM POLLER
+// ============================================================================
+#[derive(Debug, Deserialize)]
+pub struct EventRequest {
+    #[serde(rename = "fixtureId")]
+    pub fixture_id: String,
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+    pub minute: i32,
+    pub team: String,
+    pub player: String,
+    pub assist: Option<String>,
+    #[serde(rename = "homeScore")]
+    pub home_score: i32,
+    #[serde(rename = "awayScore")]
+    pub away_score: i32,
+}
+
+// ============================================================================
+// RESPONSE WRAPPERS
+// ============================================================================
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T> {
     pub success: bool,
@@ -375,7 +433,9 @@ pub struct PaginatedGames {
     pub limit: i64,
 }
 
-// ========== DEFAULT IMPLEMENTATIONS ==========
+// ============================================================================
+// DEFAULT IMPLEMENTATIONS
+// ============================================================================
 impl Default for TeamStatistics {
     fn default() -> Self {
         Self {
@@ -416,7 +476,9 @@ impl Default for CommentaryEntry {
     }
 }
 
-// ========== CONSTRUCTORS ==========
+// ============================================================================
+// CONSTRUCTORS
+// ============================================================================
 impl LineupsDocument {
     pub fn new(
         match_id: String,
