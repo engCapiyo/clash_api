@@ -9,19 +9,21 @@ use mongodb::Collection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use tracing; // Add if missing
+use tracing;
 
 use crate::handlers::ws_handler::broadcast_live_match_update;
+// ✅ Only import what actually exists in models::game
+use crate::errors::{AppError, Result};
 use crate::models::game::{
-    CommentaryEntry, Game, GameQuery, GameStatusUpdate, HistoryGame, LiveGameUpdate,
-    UpdateGameScore, Voter,
+    Coach, CommentaryEntry, Game, GameQuery, LineupsDocument, LineupsUpdate, LiveGameUpdate,
+    MatchStatistics, Player, StatisticsSnapshot, TeamLineup, TeamStatistics,
+    UpdateGameScoreRequest, Voter,
 };
 use crate::models::notification::FCMToken;
 use crate::state::AppState;
-use crate::{
-    errors::{AppError, Result},
-    models::line_up::LineupsUpdate,
-};
+
+// ✅ GameStatusUpdate and HistoryGame are defined HERE in the handler file
+// (they're not in models/game.rs)
 
 // ============================================================================
 // TEST NOTIFICATION REQUEST
@@ -268,329 +270,8 @@ pub async fn send_lineup_available_notification(
 }
 
 // ============================================================================
-// HYPE NOTIFICATIONS
-// ============================================================================
-
-pub async fn check_and_send_hype_notifications(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>> {
-    tracing::info!("📅 Checking for hype notifications");
-
-    let state_clone = state.clone();
-
-    tokio::spawn(async move {
-        tracing::info!("📱 BACKGROUND: Checking hype notifications...");
-
-        let games_col: Collection<Game> = state_clone.db.collection("fixtures");
-        let now = Utc::now();
-
-        let cursor = match games_col.find(doc! { "status": "upcoming" }).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("❌ Failed to query games: {}", e);
-                return;
-            }
-        };
-
-        let games: Vec<Game> = match cursor.try_collect().await {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::error!("❌ Failed to collect games: {}", e);
-                return;
-            }
-        };
-
-        let fcm_tokens_col: Collection<FCMToken> = state_clone.db.collection("fcm_tokens");
-        let cursor = match fcm_tokens_col.find(doc! {}).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("❌ Failed to query tokens: {}", e);
-                return;
-            }
-        };
-
-        let tokens = match cursor.try_collect::<Vec<FCMToken>>().await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("❌ Failed to collect tokens: {}", e);
-                return;
-            }
-        };
-
-        let unique_users: std::collections::HashSet<String> =
-            tokens.iter().map(|t| t.user_id.clone()).collect();
-        let fcm_service = match state_clone.fcm_service.as_ref() {
-            Some(s) => s,
-            None => {
-                tracing::error!("❌ FCM service not initialized");
-                return;
-            }
-        };
-
-        for game in games {
-            let kickoff = parse_kickoff_utc(&game.date_iso, &game.time);
-            if let Some(kickoff) = kickoff {
-                let days_until = (kickoff - now).num_days();
-
-                let (title, body, days) = if days_until == 14 {
-                    (
-                        format!("🎉 2 weeks until {} vs {}!", game.home_team, game.away_team),
-                        format!(
-                            "Kickoff at {}",
-                            (kickoff + chrono::FixedOffset::east(3 * 3600))
-                                .format("%A, %B %d at %H:%M")
-                        ),
-                        14,
-                    )
-                } else if days_until == 7 {
-                    (
-                        format!("📅 1 week to go! {} vs {}", game.home_team, game.away_team),
-                        format!(
-                            "Kickoff at {}",
-                            (kickoff + chrono::FixedOffset::east(3 * 3600))
-                                .format("%A, %B %d at %H:%M")
-                        ),
-                        7,
-                    )
-                } else if days_until == 1 {
-                    (
-                        format!(
-                            "⏰ 24 hours until {} vs {}!",
-                            game.home_team, game.away_team
-                        ),
-                        format!(
-                            "Kickoff tomorrow at {}",
-                            (kickoff + chrono::FixedOffset::east(3 * 3600)).format("%H:%M")
-                        ),
-                        1,
-                    )
-                } else {
-                    continue;
-                };
-
-                for user_id in &unique_users {
-                    let _ = fcm_service
-                        .send_to_user(
-                            &state_clone,
-                            user_id,
-                            &title,
-                            &body,
-                            json!({
-                                "fixture_id": game.match_id,
-                                "days_until": days,
-                                "type": "hype"
-                            }),
-                            "hype",
-                        )
-                        .await;
-                }
-            }
-        }
-        tracing::info!("✅ BACKGROUND: Hype notifications complete");
-    });
-
-    Ok(Json(json!({
-        "success": true,
-        "message": "Hype notifications check started in background"
-    })))
-}
-
-// ============================================================================
-// COUNTDOWN NOTIFICATIONS
-// ============================================================================
-
-pub async fn check_and_send_countdown_notifications(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>> {
-    tracing::info!("⏰ Checking for countdown notifications");
-
-    let state_clone = state.clone();
-
-    tokio::spawn(async move {
-        tracing::info!("📱 BACKGROUND: Checking countdown notifications...");
-
-        let games_col: Collection<Game> = state_clone.db.collection("fixtures");
-        let now = Utc::now();
-
-        let cursor = match games_col.find(doc! { "status": "upcoming" }).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("❌ Failed to query games: {}", e);
-                return;
-            }
-        };
-
-        let games: Vec<Game> = match cursor.try_collect().await {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::error!("❌ Failed to collect games: {}", e);
-                return;
-            }
-        };
-
-        let fcm_tokens_col: Collection<FCMToken> = state_clone.db.collection("fcm_tokens");
-        let cursor = match fcm_tokens_col.find(doc! {}).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("❌ Failed to query tokens: {}", e);
-                return;
-            }
-        };
-
-        let tokens = match cursor.try_collect::<Vec<FCMToken>>().await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("❌ Failed to collect tokens: {}", e);
-                return;
-            }
-        };
-
-        let unique_users: std::collections::HashSet<String> =
-            tokens.iter().map(|t| t.user_id.clone()).collect();
-        let fcm_service = match state_clone.fcm_service.as_ref() {
-            Some(s) => s,
-            None => {
-                tracing::error!("❌ FCM service not initialized");
-                return;
-            }
-        };
-
-        for game in games {
-            let kickoff = parse_kickoff_utc(&game.date_iso, &game.time);
-            if let Some(kickoff) = kickoff {
-                let minutes_until = (kickoff - now).num_minutes();
-                let kickoff_eat = (kickoff + chrono::FixedOffset::east(3 * 3600)).format("%H:%M");
-                let name = format!("{} vs {}", game.home_team, game.away_team);
-
-                let (title, body) = if minutes_until == 60 {
-                    (
-                        "🔔 1 hour until kick-off!".to_string(),
-                        format!(
-                            "{} kicks off at {} EAT. Pick your side! ⚽",
-                            name, kickoff_eat
-                        ),
-                    )
-                } else if minutes_until == 45 {
-                    (
-                        "⏰ 45 minutes to kick-off!".to_string(),
-                        format!("{} at {} EAT — get your votes in! 🎯", name, kickoff_eat),
-                    )
-                } else if minutes_until == 30 {
-                    (
-                        "⚡ 30 minutes to go!".to_string(),
-                        format!("{} — rivalries heating up. Who's winning this? 🔥", name),
-                    )
-                } else if minutes_until == 10 {
-                    (
-                        "🔥 10 minutes! Last chance to vote!".to_string(),
-                        format!("{} — locks soon. Don't miss out! ⏰", name),
-                    )
-                } else {
-                    continue;
-                };
-
-                for user_id in &unique_users {
-                    let _ = fcm_service
-                        .send_to_user(
-                            &state_clone,
-                            user_id,
-                            &title,
-                            &body,
-                            json!({
-                                "fixture_id": game.match_id,
-                                "minutes_to_kickoff": minutes_until,
-                                "type": "countdown"
-                            }),
-                            "countdown",
-                        )
-                        .await;
-                }
-            }
-        }
-        tracing::info!("✅ BACKGROUND: Countdown notifications complete");
-    });
-
-    Ok(Json(json!({
-        "success": true,
-        "message": "Countdown notifications check started in background"
-    })))
-}
-
-// ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
-
-async fn send_goal_notification_to_voter(
-    state: &AppState,
-    voter: &Voter,
-    fixture: &Game,
-    update: &LiveGameUpdate,
-) -> Result<()> {
-    let fcm_service = state
-        .fcm_service
-        .as_ref()
-        .ok_or_else(|| AppError::InternalServerError("FCM service not initialized".to_string()))?;
-
-    let home_team = &fixture.home_team;
-    let away_team = &fixture.away_team;
-    let scored_team = if update.scorer == Some("home_team".to_string()) {
-        home_team
-    } else {
-        away_team
-    };
-    let score_line = format!("{}-{}", update.home_score, update.away_score);
-
-    let (title, body, ntype) = if Some(&voter.selection) == update.scorer.as_ref() {
-        (
-            format!("⚽ GOAL! Your team scored!"),
-            format!("{} scores! {} ({})", scored_team, score_line, update.minute),
-            "goal_your_team".to_string(),
-        )
-    } else if voter.selection == "draw" {
-        (
-            format!("⚽ Goal! Draw under pressure"),
-            format!(
-                "{} scores → {} ({})",
-                scored_team, score_line, update.minute
-            ),
-            "goal_draw_pressure".to_string(),
-        )
-    } else {
-        (
-            format!("⚔️ RIVAL SCORED!"),
-            format!(
-                "Your rival's team ({}) scored! {} ({})",
-                scored_team, score_line, update.minute
-            ),
-            "goal_rival_team".to_string(),
-        )
-    };
-
-    let success = fcm_service
-        .send_to_user(
-            state,
-            &voter.user_id,
-            &title,
-            &body,
-            json!({
-                "fixture_id": fixture.match_id,
-                "home_score": update.home_score,
-                "away_score": update.away_score,
-                "minute": update.minute,
-                "type": ntype
-            }),
-            &ntype,
-        )
-        .await?;
-
-    if success {
-        tracing::info!("✅ Goal notification sent to user: {}", voter.user_id);
-    } else {
-        tracing::warn!("⚠️ No tokens for user: {}", voter.user_id);
-    }
-
-    Ok(())
-}
 
 fn parse_kickoff_utc(date_iso: &str, time_str: &str) -> Option<chrono::DateTime<Utc>> {
     let date = NaiveDate::parse_from_str(date_iso, "%Y-%m-%d").ok()?;
@@ -626,12 +307,28 @@ pub async fn get_games(
         filter.insert("is_live", is_live);
     }
 
-    let cursor = collection.find(filter).await?;
-    let mut games: Vec<Game> = cursor.try_collect().await?;
+    // ⚠️ FIXED: Tolerant deserialization - skip broken documents
+    let mut cursor = collection.find(filter).await?;
+    let mut games: Vec<Game> = Vec::new();
+    let mut skipped = 0;
+
+    while cursor.advance().await? {
+        match cursor.deserialize_current() {
+            Ok(game) => games.push(game),
+            Err(e) => {
+                skipped += 1;
+                tracing::error!("⚠️ Skipping malformed fixture document: {}", e);
+            }
+        }
+    }
+
+    if skipped > 0 {
+        tracing::warn!("⚠️ Skipped {} malformed fixture document(s)", skipped);
+    }
 
     games.sort_by(|a, b| b.scraped_at.cmp(&a.scraped_at));
 
-    tracing::info!("✅ Fetched {} games", games.len());
+    tracing::info!("✅ Fetched {} games ({} skipped)", games.len(), skipped);
     Ok(Json(games))
 }
 
@@ -721,11 +418,9 @@ pub async fn get_upcoming_games(State(state): State<AppState>) -> Result<Json<Ve
 pub async fn update_game_score(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
-    Json(payload): Json<UpdateGameScore>,
+    Json(payload): Json<UpdateGameScoreRequest>,
 ) -> Result<Json<Game>> {
-    use crate::handlers::ws_handler::broadcast_live_match_update;
     use crate::models::channel::ChannelFixture;
-    use mongodb::Collection;
 
     let collection: Collection<Game> = state.db.collection("fixtures");
     let filter = doc! { "match_id": &match_id };
@@ -756,7 +451,7 @@ pub async fn update_game_score(
         return Err(AppError::DocumentNotFound);
     }
 
-    // ✅ Broadcast to ALL channels that have this fixture
+    // Broadcast to ALL channels that have this fixture
     if payload.home_score.is_some() || payload.away_score.is_some() {
         if let Some(game) = collection.find_one(filter.clone()).await? {
             let channel_fixtures_col: Collection<ChannelFixture> =
@@ -801,9 +496,15 @@ pub async fn update_game_score(
         None => Err(AppError::DocumentNotFound),
     }
 }
+
 // ============================================================================
-// UPDATE GAME STATUS - Broadcasts to ALL channels with this fixture
+// UPDATE GAME STATUS
 // ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct GameStatusUpdate {
+    pub status: String,
+}
 
 pub async fn update_game_status(
     State(state): State<AppState>,
@@ -814,7 +515,6 @@ pub async fn update_game_status(
     use crate::handlers::channel::FinalizeFixtureRequest;
     use crate::handlers::ws_handler::broadcast_live_match_update;
     use crate::models::channel::ChannelFixture;
-    use mongodb::Collection;
 
     let collection: Collection<Game> = state.db.collection("fixtures");
 
@@ -839,14 +539,13 @@ pub async fn update_game_status(
 
     collection.update_one(filter.clone(), update).await?;
 
-    // ✅ AUTO-FINALIZE WHEN MATCH BECOMES COMPLETED
+    // AUTO-FINALIZE WHEN MATCH BECOMES COMPLETED
     if payload.status == "completed" {
         tracing::info!(
             "🏁 Match {} status set to completed! Auto-finalizing points...",
             match_id
         );
 
-        // Get final scores from database
         if let Some(game) = collection.find_one(filter.clone()).await? {
             let home_score = game.home_score.unwrap_or(0);
             let away_score = game.away_score.unwrap_or(0);
@@ -867,7 +566,7 @@ pub async fn update_game_status(
             match finalize_fixture_result_handler(State(state.clone()), Json(finalize_request))
                 .await
             {
-                Ok(response) => {
+                Ok(_) => {
                     tracing::info!(
                         "✅ Match {} auto-finalized with result: {} ({}-{})",
                         match_id,
@@ -922,16 +621,15 @@ pub async fn update_game_status(
         None => Err(AppError::DocumentNotFound),
     }
 }
+
 // ============================================================================
-// RECEIVE LIVE UPDATE - From Python Poller, Broadcasts to ALL channels
+// STORE LINEUPS
 // ============================================================================
 
 pub async fn store_lineups(
     State(state): State<AppState>,
     Json(payload): Json<LineupsUpdate>,
 ) -> Result<Json<serde_json::Value>> {
-    use crate::models::line_up::{LineupsDocument, Player};
-
     tracing::info!("📋 Storing lineups for fixture: {}", payload.fixture_id);
 
     let games_col: Collection<Game> = state.db.collection("fixtures");
@@ -942,55 +640,90 @@ pub async fn store_lineups(
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
-    let map_player = |p: crate::models::line_up::RawPlayer| Player {
-        name: p.name,
-        position: p.position,
-        jersey_number: p.jersey_number,
-        captain: p.captain,
-        lineup: p.lineup,
-        player_id: p.player_id,
-        rating: None,
+    // Build home team lineup
+    let home_lineup = TeamLineup {
+        formation: payload.lineups.home.formation,
+        coach: Coach {
+            name: payload.lineups.home.coach.name,
+        },
+        players: payload
+            .lineups
+            .home
+            .players
+            .into_iter()
+            .map(|p| Player {
+                name: p.name,
+                position: p.position,
+                jersey_number: p.jersey_number,
+                captain: p.captain,
+                lineup: p.lineup,
+                player_id: p.player_id,
+                rating: None,
+            })
+            .collect(),
+        bench: payload
+            .lineups
+            .home
+            .bench
+            .into_iter()
+            .map(|p| Player {
+                name: p.name,
+                position: p.position,
+                jersey_number: p.jersey_number,
+                captain: p.captain,
+                lineup: "bench".to_string(),
+                player_id: p.player_id,
+                rating: None,
+            })
+            .collect(),
+    };
+
+    // Build away team lineup
+    let away_lineup = TeamLineup {
+        formation: payload.lineups.away.formation,
+        coach: Coach {
+            name: payload.lineups.away.coach.name,
+        },
+        players: payload
+            .lineups
+            .away
+            .players
+            .into_iter()
+            .map(|p| Player {
+                name: p.name,
+                position: p.position,
+                jersey_number: p.jersey_number,
+                captain: p.captain,
+                lineup: p.lineup,
+                player_id: p.player_id,
+                rating: None,
+            })
+            .collect(),
+        bench: payload
+            .lineups
+            .away
+            .bench
+            .into_iter()
+            .map(|p| Player {
+                name: p.name,
+                position: p.position,
+                jersey_number: p.jersey_number,
+                captain: p.captain,
+                lineup: "bench".to_string(),
+                player_id: p.player_id,
+                rating: None,
+            })
+            .collect(),
     };
 
     let doc = LineupsDocument::new(
         payload.fixture_id.clone(),
         game.home_team.clone(),
         game.away_team.clone(),
-        payload.lineups.home.formation,
-        payload.lineups.away.formation,
-        payload.lineups.home.coach.name,
-        payload.lineups.away.coach.name,
-        payload
-            .lineups
-            .home
-            .players
-            .into_iter()
-            .map(map_player)
-            .collect(),
-        payload
-            .lineups
-            .home
-            .bench
-            .into_iter()
-            .map(map_player)
-            .collect(),
-        payload
-            .lineups
-            .away
-            .players
-            .into_iter()
-            .map(map_player)
-            .collect(),
-        payload
-            .lineups
-            .away
-            .bench
-            .into_iter()
-            .map(map_player)
-            .collect(),
+        home_lineup,
+        away_lineup,
     );
 
-    // ✅ FIX: Convert bson::to_document result properly
     let bson_doc = bson::to_document(&doc).map_err(|e| {
         AppError::InternalServerError(format!("Failed to serialize lineups: {}", e))
     })?;
@@ -1006,7 +739,7 @@ pub async fn store_lineups(
     games_col
         .update_one(
             doc! { "match_id": &payload.fixture_id },
-            doc! { "$set": { "lineups_fetched": true } },
+            doc! { "$set": { "lineups_fetched": true, "lineups_fetched_at": BsonDateTime::from_chrono(Utc::now()) } },
         )
         .await?;
 
@@ -1015,8 +748,8 @@ pub async fn store_lineups(
     Ok(Json(json!({
         "success": true,
         "fixture_id": payload.fixture_id,
-        "home_players": doc.home_starting_xi.len(),
-        "away_players": doc.away_starting_xi.len(),
+        "home_players": doc.home_lineup.players.len(),
+        "away_players": doc.away_lineup.players.len(),
     })))
 }
 
@@ -1024,8 +757,6 @@ pub async fn get_lineups(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    use crate::models::line_up::LineupsDocument;
-
     let lineups_col: Collection<LineupsDocument> = state.db.collection("lineups");
 
     match lineups_col.find_one(doc! { "match_id": &match_id }).await? {
@@ -1034,16 +765,16 @@ pub async fn get_lineups(
             "fixture_id": match_id,
             "lineups": {
                 "home": {
-                    "formation": doc.home_formation,
-                    "coach": doc.home_coach,
-                    "players": doc.home_starting_xi,
-                    "bench": doc.home_bench,
+                    "formation": doc.home_lineup.formation,
+                    "coach": doc.home_lineup.coach,
+                    "players": doc.home_lineup.players,
+                    "bench": doc.home_lineup.bench,
                 },
                 "away": {
-                    "formation": doc.away_formation,
-                    "coach": doc.away_coach,
-                    "players": doc.away_starting_xi,
-                    "bench": doc.away_bench,
+                    "formation": doc.away_lineup.formation,
+                    "coach": doc.away_lineup.coach,
+                    "players": doc.away_lineup.players,
+                    "bench": doc.away_lineup.bench,
                 },
             },
             "fetched_at": doc.fetched_at.to_chrono().to_rfc3339(),
@@ -1052,12 +783,16 @@ pub async fn get_lineups(
             "success": false,
             "fixture_id": match_id,
             "lineups": {
-                "home": { "players": [] },
-                "away": { "players": [] },
+                "home": { "formation": "", "coach": { "name": "" }, "players": [], "bench": [] },
+                "away": { "formation": "", "coach": { "name": "" }, "players": [], "bench": [] },
             },
         }))),
     }
 }
+
+// ============================================================================
+// RECEIVE LIVE UPDATE - From Python Poller
+// ============================================================================
 
 pub async fn receive_live_update(
     State(state): State<AppState>,
@@ -1067,7 +802,6 @@ pub async fn receive_live_update(
     use crate::handlers::channel::FinalizeFixtureRequest;
     use crate::handlers::ws_handler::broadcast_live_match_update;
     use crate::models::channel::ChannelFixture;
-    use mongodb::Collection;
 
     tracing::info!("🔴 Live update received: {:?}", update);
 
@@ -1082,7 +816,7 @@ pub async fn receive_live_update(
         _ => ("live", true, false),
     };
 
-    let set_doc = doc! {
+    let mut set_doc = doc! {
         "home_score": update.home_score,
         "away_score": update.away_score,
         "time_elapsed": update.minute,
@@ -1091,6 +825,11 @@ pub async fn receive_live_update(
         "available_for_voting": available_for_voting,
         "scraped_at": BsonDateTime::from_chrono(Utc::now()),
     };
+
+    // Add optional fields if present
+    if let Some(minute_display) = &update.minute_display {
+        set_doc.insert("minute_display", minute_display);
+    }
 
     games_col
         .update_one(filter.clone(), doc! { "$set": set_doc })
@@ -1105,14 +844,13 @@ pub async fn receive_live_update(
         update.minute
     );
 
-    // ✅ AUTO-FINALIZE WHEN MATCH ENDS
+    // AUTO-FINALIZE WHEN MATCH ENDS
     if update.event_type == "match_end" {
         tracing::info!(
             "🏁 Match {} ended! Auto-finalizing points...",
             update.fixture_id
         );
 
-        // Determine result based on final score
         let result = if update.home_score > update.away_score {
             "home"
         } else if update.away_score > update.home_score {
@@ -1121,14 +859,13 @@ pub async fn receive_live_update(
             "draw"
         };
 
-        // Call the finalize handler
         let finalize_request = FinalizeFixtureRequest {
             fixture_id: update.fixture_id.clone(),
             result: result.to_string(),
         };
 
         match finalize_fixture_result_handler(State(state.clone()), Json(finalize_request)).await {
-            Ok(response) => {
+            Ok(_) => {
                 tracing::info!(
                     "✅ Match {} auto-finalized with result: {}",
                     update.fixture_id,
@@ -1194,6 +931,7 @@ pub async fn receive_live_update(
         "channels_notified": channel_count,
     })))
 }
+
 // ============================================================================
 // FAST COUNT HANDLERS
 // ============================================================================
@@ -1416,8 +1154,12 @@ pub async fn add_commentary(
     let mut entry = payload.entry;
     entry.created_at = now;
 
+    let bson_entry = bson::to_bson(&entry).map_err(|e| {
+        AppError::InternalServerError(format!("Failed to serialize commentary: {}", e))
+    })?;
+
     let update = doc! {
-        "$push": { "commentary": bson::to_bson(&entry).unwrap() },
+        "$push": { "commentary": bson_entry },
         "$inc": { "commentary_count": 1 },
         "$set": { "last_commentary_at": now }
     };
@@ -1512,6 +1254,14 @@ pub struct HistoryQuery {
     pub to_date: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryGame {
+    #[serde(flatten)]
+    pub game: Game,
+    pub completed_at: BsonDateTime,
+    pub moved_to_history: bool,
+}
+
 pub async fn move_completed_to_history(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
@@ -1525,10 +1275,10 @@ pub async fn move_completed_to_history(
     let game = games_col.find_one(filter.clone()).await?;
 
     if let Some(game) = game {
-        let match_id_clone = game.match_id.clone(); // ✅ Clone before moving
+        let match_id_clone = game.match_id.clone();
 
         let history_entry = HistoryGame {
-            game, // game moved here
+            game,
             completed_at: BsonDateTime::from_chrono(Utc::now()),
             moved_to_history: true,
         };
@@ -1536,7 +1286,7 @@ pub async fn move_completed_to_history(
         history_col.insert_one(history_entry).await?;
         games_col
             .delete_one(doc! { "match_id": &match_id_clone })
-            .await?; // ✅ Use cloned value
+            .await?;
 
         tracing::info!("✅ Game {} moved to history", match_id);
 
@@ -1569,7 +1319,6 @@ pub async fn get_history_games(
         filter.insert("away_team", away_team);
     }
 
-    // ✅ Fixed date filtering
     if let Some(from_date) = &query.from_date {
         if let Ok(date) = chrono::NaiveDate::parse_from_str(from_date, "%Y-%m-%d") {
             let datetime = date.and_hms_opt(0, 0, 0).unwrap();
@@ -1646,16 +1395,16 @@ pub async fn cleanup_stale_completed_games(
     let mut moved_count = 0;
 
     for game in stale_games {
-        let match_id = game.match_id.clone(); // ✅ Clone first before moving
+        let match_id = game.match_id.clone();
 
         let history_entry = HistoryGame {
-            game, // game moved here
+            game,
             completed_at: BsonDateTime::from_chrono(Utc::now()),
             moved_to_history: true,
         };
 
         history_col.insert_one(history_entry).await?;
-        games_col.delete_one(doc! { "match_id": &match_id }).await?; // ✅ Use cloned value
+        games_col.delete_one(doc! { "match_id": &match_id }).await?;
         moved_count += 1;
     }
 
@@ -1667,6 +1416,3 @@ pub async fn cleanup_stale_completed_games(
         "moved_count": moved_count,
     })))
 }
-// ============================================================================
-// LIVE UPDATE HANDLER (Called by Python Poller)
-// ============================================================================

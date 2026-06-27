@@ -3,7 +3,6 @@ pub mod game;
 pub mod user;
 
 pub(crate) mod archive;
-pub(crate) mod bets;
 pub(crate) mod chat; // Now just a simple declaration
 pub(crate) mod comments; // Now just a simple declaration
 pub(crate) mod events;

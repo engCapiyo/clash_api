@@ -6,7 +6,6 @@ pub(crate) mod upload;
 
 pub(crate) mod archive;
 pub(crate) mod b2c_handlers;
-pub(crate) mod bets;
 pub(crate) mod chat_handlers;
 pub(crate) mod comrade_handler;
 pub(crate) mod visibility_handler;

@@ -1,6 +1,9 @@
-use bson::DateTime as BsonDateTime;
+use chrono::{DateTime, Utc};
+use mongodb::bson::DateTime as BsonDateTime;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
+// ========== VOTER STRUCT ==========
 // ========== VOTER STRUCT ==========
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Voter {
@@ -10,8 +13,7 @@ pub struct Voter {
     #[serde(rename = "userName")]
     pub user_name: String,
 
-    #[serde(rename = "selection")]
-    pub selection: String,
+    pub selection: String, // "home_team", "away_team", "draw"
 
     #[serde(rename = "isCorrect", skip_serializing_if = "Option::is_none")]
     pub is_correct: Option<bool>,
@@ -23,263 +25,338 @@ pub struct Voter {
     pub voted_at: BsonDateTime,
 }
 
-// ========== PLEDGER STRUCT ==========
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Pledger {
-    #[serde(rename = "userId")]
-    pub user_id: String,
-
-    #[serde(rename = "userName")]
-    pub user_name: String,
-
-    #[serde(rename = "selection")]
-    pub selection: String, // "home_team", "away_team", "draw"
-
-    #[serde(rename = "amount")]
-    pub amount: f64,
-
-    #[serde(rename = "pledgedAt")]
-    pub pledged_at: BsonDateTime,
-}
-
-// ========== BETTOR STRUCT ==========
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Bettor {
-    #[serde(rename = "userId")]
-    pub user_id: String,
-
-    #[serde(rename = "userName")]
-    pub user_name: String,
-
-    #[serde(rename = "selection")]
-    pub selection: String, // "home_team", "away_team", "draw"
-
-    #[serde(rename = "amount")]
-    pub amount: f64,
-
-    #[serde(rename = "opponentId")]
-    pub opponent_id: String,
-
-    #[serde(rename = "opponentName")]
-    pub opponent_name: String,
-
-    #[serde(rename = "opponentSelection")]
-    pub opponent_selection: String,
-
-    #[serde(rename = "opponentAmount")]
-    pub opponent_amount: f64,
-
-    #[serde(rename = "totalPot")]
-    pub total_pot: f64,
-
-    #[serde(rename = "betId")]
-    pub bet_id: String,
-
-    #[serde(rename = "status", skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>, // "active", "won", "lost"
-
-    #[serde(rename = "winner", skip_serializing_if = "Option::is_none")]
-    pub winner: Option<bool>,
-
-    #[serde(rename = "payout", skip_serializing_if = "Option::is_none")]
-    pub payout: Option<f64>,
-
-    #[serde(rename = "matchedAt")]
-    pub matched_at: BsonDateTime,
-
-    #[serde(rename = "resolvedAt", skip_serializing_if = "Option::is_none")]
-    pub resolved_at: Option<BsonDateTime>,
-}
-
-// ========== COMMENTARY ENTRY STRUCT ==========
+// ========== COMMENTARY ENTRY ==========
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommentaryEntry {
     pub minute: i32,
-    pub minute_display: String,
     pub text: String,
+    #[serde(rename = "type")]
     pub event_type: String,
-    pub home_score: i32,
-    pub away_score: i32,
-    pub team: Option<String>,   // Team that committed the action
-    pub player: Option<String>, // Player involved
+    pub team: Option<String>,
+    pub player: Option<String>,
+    #[serde(rename = "createdAt")]
     pub created_at: BsonDateTime,
 }
 
-// ========== MAIN GAME MODEL - MATCHES DATABASE EXACTLY ==========
+// ========== STATISTICS ==========
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamStatistics {
+    pub possession: Option<f64>,
+    pub shots: Option<i32>,
+    #[serde(rename = "shotsOnTarget")]
+    pub shots_on_target: Option<i32>,
+    #[serde(rename = "shotsOffTarget")]
+    pub shots_off_target: Option<i32>,
+    pub corners: Option<i32>,
+    pub fouls: Option<i32>,
+    #[serde(rename = "yellowCards")]
+    pub yellow_cards: Option<i32>,
+    #[serde(rename = "redCards")]
+    pub red_cards: Option<i32>,
+    pub offsides: Option<i32>,
+    pub passes: Option<i32>,
+    #[serde(rename = "passAccuracy")]
+    pub pass_accuracy: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatisticsSnapshot {
+    pub minute: i32,
+    pub statistics: MatchStatistics,
+    pub timestamp: BsonDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchStatistics {
+    pub home: TeamStatistics,
+    pub away: TeamStatistics,
+}
+
+// ========== LINEUPS ==========
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Player {
+    pub name: String,
+    pub position: String,
+    #[serde(rename = "jerseyNumber")]
+    pub jersey_number: i32,
+    pub captain: bool,
+    pub lineup: String, // "starting" or "bench"
+    #[serde(rename = "playerId")]
+    pub player_id: Option<String>,
+    pub rating: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamLineup {
+    pub formation: String,
+    pub coach: Coach,
+    pub players: Vec<Player>,
+    pub bench: Vec<Player>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Coach {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineupsDocument {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "matchId")]
+    pub match_id: String,
+    #[serde(rename = "homeTeam")]
+    pub home_team: String,
+    #[serde(rename = "awayTeam")]
+    pub away_team: String,
+    #[serde(rename = "homeLineup")]
+    pub home_lineup: TeamLineup,
+    #[serde(rename = "awayLineup")]
+    pub away_lineup: TeamLineup,
+    #[serde(rename = "fetchedAt")]
+    pub fetched_at: BsonDateTime,
+}
+
+// ========== MAIN GAME MODEL ==========
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Game {
-    #[serde(rename = "_id")]
-    pub id: String,
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 
-    #[serde(rename = "match_id")]
+    #[serde(rename = "matchId")]
     pub match_id: String,
 
-    #[serde(rename = "sofascore_id", skip_serializing_if = "Option::is_none")]
-    pub sofascore_id: Option<i64>,
+    #[serde(rename = "threesixtyfiveGameId")]
+    pub threesixtyfive_game_id: Option<String>,
 
-    #[serde(rename = "home_team")]
+    #[serde(rename = "homeTeam")]
     pub home_team: String,
 
-    #[serde(rename = "away_team")]
+    #[serde(rename = "awayTeam")]
     pub away_team: String,
 
-    #[serde(rename = "league")]
     pub league: String,
 
-    #[serde(rename = "home_win")]
-    pub home_win: f64,
+    // ⚠️ FIXED: Now Option<f64> to handle null from scraper
+    #[serde(rename = "homeWin")]
+    pub home_win: Option<f64>,
 
-    #[serde(rename = "away_win")]
-    pub away_win: f64,
+    #[serde(rename = "awayWin")]
+    pub away_win: Option<f64>,
 
-    #[serde(rename = "draw")]
-    pub draw: f64,
+    pub draw: Option<f64>,
 
-    #[serde(rename = "date")]
     pub date: String,
-
-    #[serde(rename = "time")]
     pub time: String,
 
-    #[serde(rename = "date_iso")]
+    #[serde(rename = "dateIso")]
     pub date_iso: String,
 
-    #[serde(rename = "home_score", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "kickoffUtc")]
+    pub kickoff_utc: DateTime<Utc>,
+
+    #[serde(rename = "homeScore")]
     pub home_score: Option<i32>,
 
-    #[serde(rename = "away_score", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "awayScore")]
     pub away_score: Option<i32>,
 
-    #[serde(rename = "status")]
-    pub status: String,
+    pub status: String, // "upcoming", "soon", "live", "completed"
 
-    #[serde(rename = "is_live")]
+    #[serde(rename = "isLive")]
     pub is_live: bool,
 
-    #[serde(rename = "available_for_voting")]
+    #[serde(rename = "availableForVoting")]
     pub available_for_voting: bool,
 
-    #[serde(rename = "time_elapsed", default)]
-    pub time_elapsed: i32,
+    #[serde(rename = "timeElapsed")]
+    pub time_elapsed: Option<i32>,
 
-    #[serde(rename = "result", skip_serializing_if = "Option::is_none")]
     pub result: Option<String>, // "home", "away", "draw"
 
-    #[serde(rename = "source")]
-    pub source: String,
+    pub source: String, // "365scores", "apifootball", etc.
 
-    #[serde(rename = "scraped_at")]
+    #[serde(rename = "scrapedAt")]
     pub scraped_at: BsonDateTime,
 
-    // ========== VOTES (Free) ==========
-    #[serde(rename = "votes", default)]
-    pub votes: i64,
+    #[serde(rename = "lastScrapedAt")]
+    pub last_scraped_at: Option<BsonDateTime>,
 
-    #[serde(rename = "voters", default)]
+    #[serde(rename = "lastPolledAt")]
+    pub last_polled_at: Option<BsonDateTime>,
+
+    // ========== VOTES ==========
+    pub votes: i64,
     pub voters: Vec<Voter>,
 
-    // ========== PLEDGES (Pending - waiting for opponent) ==========
-    #[serde(rename = "pledges", default)]
-    pub pledges: i64,
-
-    #[serde(rename = "pledgers", default)]
-    pub pledgers: Vec<Pledger>,
-
-    // ========== BETS (Active - matched with opponent) ==========
-    #[serde(rename = "bets", default)]
-    pub bets: i64,
-
-    #[serde(rename = "bettors", default)]
-    pub bettors: Vec<Bettor>,
-
     // ========== COMMENTS ==========
-    #[serde(rename = "comments", default)]
     pub comments: i64,
 
-    // ========== COMMENTARY FIELDS ==========
-    #[serde(default)]
+    // ========== COMMENTARY ==========
     pub commentary: Vec<CommentaryEntry>,
-
-    #[serde(default)]
+    #[serde(rename = "commentaryCount")]
     pub commentary_count: i64,
-
+    #[serde(rename = "lastCommentaryAt")]
     pub last_commentary_at: Option<BsonDateTime>,
+
+    // ========== LINEUPS ==========
+    pub lineups: Option<LineupsDocument>,
+    #[serde(rename = "lineupsFetched")]
+    pub lineups_fetched: bool,
+    #[serde(rename = "lineupsFetchedAt")]
+    pub lineups_fetched_at: Option<BsonDateTime>,
+
+    // ========== STATISTICS ==========
+    pub statistics: Vec<StatisticsSnapshot>,
+    #[serde(rename = "lastStatisticsMinute")]
+    pub last_statistics_minute: Option<i32>,
+
+    // ========== EVENTS ==========
+    #[serde(rename = "forwardedEventSignatures")]
+    pub forwarded_event_signatures: Vec<String>,
+
+    // ========== COMPLETION ==========
+    #[serde(rename = "completedAt")]
+    pub completed_at: Option<BsonDateTime>,
+    #[serde(rename = "movedToHistory")]
+    pub moved_to_history: bool,
+
+    #[serde(rename = "createdAt")]
+    pub created_at: BsonDateTime,
 }
 
 // ========== REQUEST STRUCTS ==========
 #[derive(Debug, Deserialize)]
-pub struct CreateGame {
+pub struct CreateGameRequest {
+    #[serde(rename = "matchId")]
     pub match_id: String,
+    #[serde(rename = "homeTeam")]
     pub home_team: String,
+    #[serde(rename = "awayTeam")]
     pub away_team: String,
     pub league: String,
-    pub home_win: f64,
-    pub away_win: f64,
-    pub draw: f64,
+    #[serde(rename = "homeWin")]
+    pub home_win: Option<f64>,
+    #[serde(rename = "awayWin")]
+    pub away_win: Option<f64>,
+    pub draw: Option<f64>,
     pub date: String,
     pub time: String,
+    #[serde(rename = "dateIso")]
     pub date_iso: String,
+    #[serde(rename = "kickoffUtc")]
+    pub kickoff_utc: DateTime<Utc>,
     pub source: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct UpdateGameScore {
+pub struct UpdateGameScoreRequest {
+    #[serde(rename = "matchId")]
     pub match_id: String,
+    #[serde(rename = "homeScore")]
     pub home_score: Option<i32>,
+    #[serde(rename = "awayScore")]
     pub away_score: Option<i32>,
     pub status: Option<String>,
+    #[serde(rename = "isLive")]
     pub is_live: Option<bool>,
+    #[serde(rename = "timeElapsed")]
     pub time_elapsed: Option<i32>,
-}
-
-// ========== LIVE GAME UPDATE FROM PYTHON POLLER ==========
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LiveGameUpdate {
-    pub fixture_id: String,
-    pub event_type: String,
-    pub home_score: i32,
-    pub away_score: i32,
-    pub minute: i32,
-    pub minute_display: String,
-    pub scorer: Option<String>,
-    pub player: Option<String>,
-    pub assist: Option<String>,
-    pub team: Option<String>,
-    pub player_out: Option<String>,
-    pub player_in: Option<String>,
-    pub on_target: Option<bool>,
-    pub blocked: Option<bool>,
-    #[serde(skip_deserializing)]
-    pub timestamp: Option<BsonDateTime>,
-}
-
-// ========== COMMENTARY UPDATE FROM PYTHON POLLER ==========
-#[derive(Debug, Deserialize)]
-pub struct CommentaryUpdate {
-    pub match_id: String,
-    pub entry: CommentaryEntry,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LatestCommentaryQuery {
-    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct GameQuery {
     pub status: Option<String>,
     pub league: Option<String>,
+    #[serde(rename = "isLive")]
     pub is_live: Option<bool>,
     pub limit: Option<i64>,
     pub skip: Option<u64>,
     pub source: Option<String>,
 }
 
+// ========== LIVE UPDATE FROM POLLER ==========
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveGameUpdate {
+    #[serde(rename = "fixtureId")]
+    pub fixture_id: String,
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+    #[serde(rename = "homeScore")]
+    pub home_score: i32,
+    #[serde(rename = "awayScore")]
+    pub away_score: i32,
+    pub minute: i32,
+    #[serde(rename = "minuteDisplay")]
+    pub minute_display: Option<String>,
+    pub status: Option<String>,
+    #[serde(rename = "isLive")]
+    pub is_live: Option<bool>,
+    #[serde(rename = "availableForVoting")]
+    pub available_for_voting: Option<bool>,
+    pub scorer: Option<String>,
+    pub player: Option<String>,
+    pub assist: Option<String>,
+    pub team: Option<String>,
+    pub timestamp: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Deserialize)]
-pub struct GameStatusUpdate {
-    pub match_id: String,
-    pub status: String,
-    pub is_live: bool,
+pub struct EventRequest {
+    #[serde(rename = "fixtureId")]
+    pub fixture_id: String,
+    #[serde(rename = "eventType")]
+    pub event_type: String,
+    pub minute: i32,
+    pub team: String,
+    pub player: String,
+    pub assist: Option<String>,
+    #[serde(rename = "homeScore")]
+    pub home_score: i32,
+    #[serde(rename = "awayScore")]
+    pub away_score: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LineupsUpdate {
+    #[serde(rename = "fixtureId")]
+    pub fixture_id: String,
+    #[serde(rename = "homeTeam")]
+    pub home_team: String,
+    #[serde(rename = "awayTeam")]
+    pub away_team: String,
+    pub lineups: LineupsPayload,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LineupsPayload {
+    pub home: TeamLineupPayload,
+    pub away: TeamLineupPayload,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TeamLineupPayload {
+    pub formation: String,
+    pub coach: CoachPayload,
+    pub players: Vec<PlayerPayload>,
+    pub bench: Vec<PlayerPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CoachPayload {
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PlayerPayload {
+    pub name: String,
+    pub position: String,
+    #[serde(rename = "jerseyNumber")]
+    pub jersey_number: i32,
+    pub captain: bool,
+    pub lineup: String,
+    #[serde(rename = "playerId")]
+    pub player_id: Option<String>,
 }
 
 // ========== RESPONSE WRAPPERS ==========
@@ -298,78 +375,121 @@ pub struct PaginatedGames {
     pub limit: i64,
 }
 
-#[derive(Debug, Serialize)]
-pub struct LiveGamesResponse {
-    pub live_games: Vec<Game>,
-    pub count: usize,
-    pub last_updated: BsonDateTime,
+// ========== DEFAULT IMPLEMENTATIONS ==========
+impl Default for TeamStatistics {
+    fn default() -> Self {
+        Self {
+            possession: None,
+            shots: None,
+            shots_on_target: None,
+            shots_off_target: None,
+            corners: None,
+            fouls: None,
+            yellow_cards: None,
+            red_cards: None,
+            offsides: None,
+            passes: None,
+            pass_accuracy: None,
+        }
+    }
 }
 
-// ========== DEFAULT IMPLEMENTATIONS ==========
+impl Default for MatchStatistics {
+    fn default() -> Self {
+        Self {
+            home: TeamStatistics::default(),
+            away: TeamStatistics::default(),
+        }
+    }
+}
+
 impl Default for CommentaryEntry {
     fn default() -> Self {
         Self {
             minute: 0,
-            minute_display: String::new(),
             text: String::new(),
             event_type: String::new(),
-            home_score: 0,
-            away_score: 0,
             team: None,
             player: None,
-            created_at: BsonDateTime::from_chrono(chrono::Utc::now()),
+            created_at: BsonDateTime::from_chrono(Utc::now()),
         }
     }
 }
 
-impl LiveGameUpdate {
-    pub fn into_event_request(self) -> EventRequest {
-        EventRequest {
-            match_id: self.fixture_id,
-            event_type: self.event_type,
-            minute: self.minute,
-            minute_display: self.minute_display,
-            home_score: self.home_score,
-            away_score: self.away_score,
-            player: self.player.or(self.scorer),
-            team: self.team,
-            assist: self.assist,
-            player_out: self.player_out,
-            player_in: self.player_in,
-            shot_type: None,
-            on_target: self.on_target,
-            blocked: self.blocked,
+// ========== CONSTRUCTORS ==========
+impl LineupsDocument {
+    pub fn new(
+        match_id: String,
+        home_team: String,
+        away_team: String,
+        home_lineup: TeamLineup,
+        away_lineup: TeamLineup,
+    ) -> Self {
+        Self {
+            id: None,
+            match_id,
+            home_team,
+            away_team,
+            home_lineup,
+            away_lineup,
+            fetched_at: BsonDateTime::from_chrono(Utc::now()),
         }
     }
 }
 
-// ============================================================================
-// HISTORY GAME MODEL (for completed games archive)
-// ============================================================================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HistoryGame {
-    #[serde(flatten)]
-    pub game: Game,
-    pub completed_at: BsonDateTime,
-    pub moved_to_history: bool,
-}
-
-// ========== EVENT REQUEST (for compatibility with events handler) ==========
-#[derive(Debug, Deserialize)]
-pub struct EventRequest {
-    pub match_id: String,
-    pub event_type: String,
-    pub minute: i32,
-    pub minute_display: String,
-    pub home_score: i32,
-    pub away_score: i32,
-    pub player: Option<String>,
-    pub team: Option<String>,
-    pub assist: Option<String>,
-    pub player_out: Option<String>,
-    pub player_in: Option<String>,
-    pub shot_type: Option<String>,
-    pub on_target: Option<bool>,
-    pub blocked: Option<bool>,
+impl Game {
+    pub fn new(
+        match_id: String,
+        home_team: String,
+        away_team: String,
+        league: String,
+        date: String,
+        time: String,
+        date_iso: String,
+        kickoff_utc: DateTime<Utc>,
+        source: String,
+    ) -> Self {
+        let now = BsonDateTime::from_chrono(Utc::now());
+        Self {
+            id: None,
+            match_id,
+            threesixtyfive_game_id: None,
+            home_team,
+            away_team,
+            league,
+            home_win: None,
+            away_win: None,
+            draw: None,
+            date,
+            time,
+            date_iso,
+            kickoff_utc,
+            home_score: None,
+            away_score: None,
+            status: "upcoming".to_string(),
+            is_live: false,
+            available_for_voting: true,
+            time_elapsed: None,
+            result: None,
+            source,
+            scraped_at: now,
+            last_scraped_at: Some(now),
+            last_polled_at: None,
+            votes: 0,
+            voters: Vec::new(),
+            comments: 0,
+            commentary: Vec::new(),
+            commentary_count: 0,
+            last_commentary_at: None,
+            lineups: None,
+            lineups_fetched: false,
+            lineups_fetched_at: None,
+            statistics: Vec::new(),
+            last_statistics_minute: None,
+            forwarded_event_signatures: Vec::new(),
+            completed_at: None,
+            moved_to_history: false,
+            created_at: now,
+        }
+    }
 }

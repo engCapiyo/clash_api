@@ -11,6 +11,7 @@ use mongodb::Collection;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::models::channel::ChannelFixture;
 use crate::models::game::Game;
 use crate::services::fcm_service::FCMService;
 use bson::oid::ObjectId;
@@ -18,9 +19,8 @@ use serde::Deserialize;
 
 use crate::errors::{AppError, Result};
 use crate::models::channel::{
-    AdminRewardScore, Channel, ChannelActivity, ChannelFixture, ChannelMember,
-    ChannelMembershipEvent, Fixture, Message, Payout, PendingRequest, ReplyToData, Vote,
-    VoteCounts,
+    AdminRewardScore, Channel, ChannelActivity, ChannelMember, ChannelMembershipEvent, Fixture,
+    Message, Payout, PendingRequest, ReplyToData, Vote, VoteCounts,
 };
 use crate::models::pledges::{CreatePledge, Pledge};
 use crate::AppState;
@@ -947,19 +947,32 @@ pub async fn get_fixture_pledgers_handler(
     State(state): State<AppState>,
     Path((channel_id, fixture_id)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    // ✅ Use channel_fixtures collection, not games
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
-    let game = games_col
-        .find_one(doc! { "match_id": &fixture_id })
+    let channel_fixture = channel_fixtures_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "fixture_id": &fixture_id,
+        })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
+
+    // Pledges are stored in a separate "pledges" collection
+    let pledges_col = state.db.collection::<Pledge>("pledges");
+    let mut cursor = pledges_col.find(doc! { "fixture_id": &fixture_id }).await?;
+
+    let mut pledges = Vec::new();
+    while cursor.advance().await? {
+        pledges.push(cursor.deserialize_current()?);
+    }
 
     Ok(Json(json!({
         "success": true,
         "fixture_id": fixture_id,
         "channel_id": channel_id,
-        "pledges": game.pledges,
-        "pledgers": game.pledgers,
+        "pledges": pledges,
+        "pledgers": pledges, // pledgers = pledges (same thing)
     })))
 }
 
