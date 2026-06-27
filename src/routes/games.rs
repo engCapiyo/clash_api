@@ -3,15 +3,12 @@ use axum::{
     Router,
 };
 
-use crate::handlers::events_handler;
-use crate::handlers::games;
-use crate::handlers::lineup_handler;
-use crate::handlers::statistics_handler;
+use crate::handlers::{events_handler, games, lineup_handler, statistics_handler};
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        // ── Static routes first (must come before /:match_id) ────────────────
+        // ── Games / Fixtures ────────────────────────────────────────────────────
         .route("/", get(games::get_games))
         .route("/upcoming", get(games::get_upcoming_games))
         .route("/live", get(games::get_live_games))
@@ -19,7 +16,13 @@ pub fn routes() -> Router<AppState> {
         .route("/cleanup-stale", post(games::cleanup_stale_completed_games))
         .route("/live-update", post(games::receive_live_update))
         .route("/commentary", post(games::add_commentary))
+        .route(
+            "/test-notification",
+            post(games::send_test_notification_from_poller),
+        )
+        // ── Lineups ────────────────────────────────────────────────────────────
         .route("/lineups", post(lineup_handler::receive_lineups_update))
+        // ── Statistics ─────────────────────────────────────────────────────────
         .route(
             "/statistics",
             post(statistics_handler::add_statistics_snapshot),
@@ -28,17 +31,15 @@ pub fn routes() -> Router<AppState> {
             "/statistics/bulk",
             post(statistics_handler::bulk_update_statistics),
         )
+        // ── Events ─────────────────────────────────────────────────────────────
         .route("/events", post(events_handler::add_event))
         .route("/events/bulk", post(events_handler::bulk_add_events))
+        // ── Batch / Fast Counts ───────────────────────────────────────────────
         .route(
             "/fixture/counts/batch",
             post(games::get_batch_fixture_counts_fast),
         )
-        .route(
-            "/test-notification",
-            post(games::send_test_notification_from_poller),
-        )
-        // ── Prefixed param routes ─────────────────────────────────────────────
+        // ── Match-specific routes ────────────────────────────────────────────
         .route("/match/:match_id", get(games::get_game_by_match_id))
         .route(
             "/history/:match_id",
@@ -64,7 +65,7 @@ pub fn routes() -> Router<AppState> {
             "/fixture/:fixture_id/user/:user_id/voted",
             get(games::check_user_voted_fast),
         )
-        // ── /:match_id routes (must come last) ────────────────────────────────
+        // ── :match_id routes (must come last) ─────────────────────────────────
         .route("/:match_id/score", put(games::update_game_score))
         .route("/:match_id/status", put(games::update_game_status))
         .route(
