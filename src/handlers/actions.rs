@@ -181,7 +181,7 @@ pub async fn create_bet_handler(
         payload.starter_name.clone(),
         payload.starter_selection.clone(),
         payload.amount,
-        payload.channel_id.clone(),
+        payload.channel_id.unwrap_or_default(),
         payload.vote_id.clone(), // ✅ Pass vote_id
     );
 

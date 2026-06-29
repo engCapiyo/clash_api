@@ -77,7 +77,7 @@ pub struct CreateBetRequest {
     pub starter_selection: String, // "home", "away", "draw"
     pub amount: f64,
     pub fixture_id: String,
-    pub channel_id: String,
+    pub channel_id: Option<String>,
     pub vote_id: String, // ✅ Required vote reference
 }
 
