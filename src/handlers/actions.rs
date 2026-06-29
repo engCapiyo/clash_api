@@ -110,7 +110,7 @@ pub async fn create_bet_handler(
     let fixture_id = payload.fixture_id.clone();
 
     // ============================================================
-    // 1. VERIFY VOTE EXISTS ✅ FIXED - Check by user_id only
+    // 1. CHECK IF USER HAS ALREADY VOTED
     // ============================================================
     let vote_exists = games_col
         .find_one(doc! {
@@ -119,12 +119,6 @@ pub async fn create_bet_handler(
         })
         .await
         .map_err(|e| AppError::MongoDB(e))?;
-
-    if vote_exists.is_none() {
-        return Err(AppError::ValidationError(
-            "Vote not found. Please vote first before creating a pledge.".to_string(),
-        ));
-    }
 
     // ============================================================
     // 2. START TRANSACTION
@@ -161,7 +155,54 @@ pub async fn create_bet_handler(
     }
 
     // ============================================================
-    // 4. DEDUCT BALANCE
+    // 4. AUTO-CAST VOTE IF NOT ALREADY VOTED (ATOMIC)
+    // ============================================================
+    if vote_exists.is_none() {
+        tracing::info!(
+            "🗳️ Auto-casting vote for user {} on fixture {}",
+            payload.starter_id,
+            fixture_id
+        );
+
+        let voter = Voter {
+            user_id: payload.starter_id.clone(),
+            user_name: payload.starter_name.clone(),
+            selection: payload.starter_selection.clone(),
+            is_correct: None,
+            points_awarded: None,
+            voted_at: now,
+        };
+
+        let voter_bson = to_bson(&voter)
+            .map_err(|e| AppError::ValidationError(format!("BSON serialization error: {}", e)))?;
+
+        games_col
+            .update_one(
+                doc! { "match_id": &fixture_id },
+                doc! {
+                    "$inc": { "votes": 1 },
+                    "$push": { "voters": voter_bson },
+                },
+            )
+            .session(&mut session)
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+
+        tracing::info!(
+            "✅ Auto-vote cast for user {} on fixture {}",
+            payload.starter_id,
+            fixture_id
+        );
+    } else {
+        tracing::info!(
+            "ℹ️ User {} already voted on fixture {} — skipping vote",
+            payload.starter_id,
+            fixture_id
+        );
+    }
+
+    // ============================================================
+    // 5. DEDUCT BALANCE
     // ============================================================
     users_col
         .update_one(
@@ -173,7 +214,7 @@ pub async fn create_bet_handler(
         .map_err(|e| AppError::MongoDB(e))?;
 
     // ============================================================
-    // 5. CREATE BET DOCUMENT WITH vote_id
+    // 6. CREATE BET DOCUMENT
     // ============================================================
     let bet = Bet::new_open(
         fixture_id.clone(),
@@ -181,8 +222,8 @@ pub async fn create_bet_handler(
         payload.starter_name.clone(),
         payload.starter_selection.clone(),
         payload.amount,
-        payload.channel_id.unwrap_or_default(),
-        payload.vote_id.clone(), // ✅ Pass vote_id
+        payload.channel_id.clone().unwrap_or_default(),
+        payload.vote_id.clone(),
     );
 
     let insert_result = bets_col
@@ -198,7 +239,7 @@ pub async fn create_bet_handler(
         .ok_or_else(|| AppError::InternalServerError("Failed to get bet ID".to_string()))?;
 
     // ============================================================
-    // 6. INCREMENT PLEDGES COUNT IN FIXTURE
+    // 7. INCREMENT PLEDGES COUNT IN FIXTURE
     // ============================================================
     games_col
         .update_one(
@@ -210,7 +251,7 @@ pub async fn create_bet_handler(
         .map_err(|e| AppError::MongoDB(e))?;
 
     // ============================================================
-    // 7. COMMIT TRANSACTION
+    // 8. COMMIT TRANSACTION
     // ============================================================
     session
         .commit_transaction()
@@ -219,16 +260,26 @@ pub async fn create_bet_handler(
 
     let new_balance = user.balance - payload.amount;
 
+    tracing::info!(
+        "✅ Pledge created: bet_id={}, user={}, fixture={}, amount={}, voted={}",
+        bet_id,
+        payload.starter_id,
+        fixture_id,
+        payload.amount,
+        vote_exists.is_none()
+    );
+
     // ============================================================
-    // 8. RETURN SUCCESS
+    // 9. RETURN SUCCESS
     // ============================================================
     Ok(Json(json!({
         "success": true,
-        "message": "Bet created successfully",
+        "message": "Pledge created successfully",
         "bet_id": bet_id,
         "vote_id": payload.vote_id,
         "new_balance": new_balance,
         "status": "open",
+        "auto_voted": vote_exists.is_none(),
     })))
 }
 // ============================================================================
