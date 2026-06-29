@@ -2,7 +2,7 @@ use bson::DateTime as BsonDateTime;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
-// VOTER (Global - No channel_id)
+// VOTER (Embedded in fixture.voters[] - For backward compatibility)
 // ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Voter {
@@ -12,6 +12,37 @@ pub struct Voter {
     pub is_correct: Option<bool>,
     pub points_awarded: Option<i32>,
     pub voted_at: BsonDateTime,
+}
+
+// ============================================================================
+// VOTE (Standalone collection - NEW)
+// ============================================================================
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Vote {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<bson::oid::ObjectId>,
+    pub fixture_id: String,
+    pub user_id: String,
+    pub user_name: String,
+    pub selection: String, // "home", "away", "draw"
+    pub is_correct: Option<bool>,
+    pub points_awarded: Option<i32>,
+    pub voted_at: BsonDateTime,
+}
+
+impl Vote {
+    pub fn new(fixture_id: String, user_id: String, user_name: String, selection: String) -> Self {
+        Self {
+            id: None,
+            fixture_id,
+            user_id,
+            user_name,
+            selection,
+            is_correct: None,
+            points_awarded: None,
+            voted_at: BsonDateTime::now(),
+        }
+    }
 }
 
 // ============================================================================
