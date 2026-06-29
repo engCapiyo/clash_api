@@ -1,5 +1,3 @@
-// File: src/models/actions.rs
-
 use bson::DateTime as BsonDateTime;
 use serde::{Deserialize, Serialize};
 
@@ -39,7 +37,7 @@ pub struct Bet {
     pub finisher_amount: Option<f64>,
 
     // === VOTE REFERENCE ===
-    pub vote_id: Option<String>, // ✅ NEW: Reference to vote
+    pub vote_id: Option<String>, // ✅ Reference to vote
 
     // === CHANNEL (where the bet is visible) ===
     pub channel_id: String, // Channel-specific visibility
@@ -71,7 +69,7 @@ pub struct CastVoteRequest {
     pub selection: String, // "home", "away", "draw"
 }
 
-// ✅ UPDATED: Create Bet Request (with vote_id)
+// ✅ Create Bet Request (with vote_id)
 #[derive(Debug, Deserialize)]
 pub struct CreateBetRequest {
     pub starter_id: String,
@@ -80,7 +78,7 @@ pub struct CreateBetRequest {
     pub amount: f64,
     pub fixture_id: String,
     pub channel_id: String,
-    pub vote_id: String, // ✅ NEW: Required vote reference
+    pub vote_id: String, // ✅ Required vote reference
 }
 
 // Fill Bet Request (Finisher)
@@ -99,6 +97,13 @@ pub struct FillBetRequest {
 pub struct SettleBetRequest {
     pub fixture_id: String,
     pub result: String, // "home", "away", "draw"
+}
+
+// Rollback Vote Request
+#[derive(Debug, Deserialize)]
+pub struct RollbackVoteRequest {
+    pub fixture_id: String,
+    pub user_id: String,
 }
 
 // ============================================================================
@@ -131,7 +136,7 @@ pub struct BetResponse {
     pub finisher_name: Option<String>,
     pub finisher_selection: Option<String>,
     pub finisher_amount: Option<f64>,
-    pub vote_id: Option<String>, // ✅ NEW
+    pub vote_id: Option<String>, // ✅
     pub status: String,
     pub created_at: BsonDateTime,
     pub matched_at: Option<BsonDateTime>,
@@ -163,7 +168,7 @@ impl Bet {
             finisher_name: None,
             finisher_selection: None,
             finisher_amount: None,
-            vote_id: Some(vote_id), // ✅ NEW
+            vote_id: Some(vote_id), // ✅
             channel_id,
             status: "open".to_string(),
             winner_id: None,
