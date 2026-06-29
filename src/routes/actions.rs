@@ -1,3 +1,5 @@
+// File: src/routes/actions.rs
+
 use axum::{
     routing::{get, post, put},
     Router,
@@ -5,10 +7,20 @@ use axum::{
 
 use crate::{
     handlers::actions::{
-        cast_vote_handler, check_user_vote_handler, create_bet_handler, fill_bet_handler,
-        get_channel_bettors_handler, get_channel_members_handler, get_channel_pledges_handler,
-        get_channel_voters_handler, get_fixture_voters_handler, get_open_bets_handler,
-        get_user_bets_handler, get_user_votes_handler, settle_bets_handler,
+        cast_vote_handler,
+        check_user_vote_handler,
+        create_bet_handler,
+        fill_bet_handler,
+        get_channel_bettors_handler,
+        get_channel_members_handler,
+        get_channel_pledges_handler,
+        get_channel_voters_handler,
+        get_fixture_voters_handler,
+        get_open_bets_handler,
+        get_user_bets_handler,
+        get_user_votes_handler,
+        rollback_vote_handler, // ✅ NEW
+        settle_bets_handler,
     },
     AppState,
 };
@@ -28,6 +40,7 @@ pub fn actions_routes() -> Router<AppState> {
             get(get_fixture_voters_handler),
         )
         .route("/vote/user/:user_id", get(get_user_votes_handler))
+        .route("/vote/rollback", post(rollback_vote_handler)) // ✅ NEW
         // ============================================================
         // BETS (Channel-Specific)
         // ============================================================

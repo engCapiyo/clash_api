@@ -15,6 +15,7 @@ use axum::{
 use bson::{doc, to_bson, DateTime as BsonDateTime};
 use futures_util::StreamExt;
 use mongodb::Collection;
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
 
@@ -79,6 +80,11 @@ pub async fn cast_vote_handler(
 // ============================================================================
 // 2. CREATE BET (Atomic: Bet + Vote) - Starter
 // ============================================================================
+// File: src/handlers/actions.rs
+
+// ============================================================================
+// 2. CREATE BET (Atomic: Bet + Vote) - UPDATED with vote_id
+// ============================================================================
 pub async fn create_bet_handler(
     State(state): State<AppState>,
     Json(payload): Json<CreateBetRequest>,
@@ -100,6 +106,29 @@ pub async fn create_bet_handler(
         .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
     let fixture_id = payload.fixture_id.clone();
 
+    // ============================================================
+    // 1. VERIFY VOTE EXISTS (Using vote_id from frontend)
+    // ============================================================
+    // Parse vote_id
+    let vote_oid = bson::oid::ObjectId::parse_str(&payload.vote_id)
+        .map_err(|e| AppError::InvalidObjectId(format!("Invalid vote_id: {}", e)))?;
+
+    // Check if vote exists in fixtures.voters
+    let vote_exists = games_col
+        .find_one(doc! {
+            "match_id": &fixture_id,
+            "voters.user_id": &payload.starter_id,
+            "voters._id": vote_oid, // Optional: if you store vote_id in voters
+        })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    if vote_exists.is_none() {
+        return Err(AppError::ValidationError(
+            "Vote not found. Please vote first before creating a pledge.".to_string(),
+        ));
+    }
+
     // Start transaction
     let mut session = state
         .client
@@ -111,7 +140,7 @@ pub async fn create_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 1. Find user and check balance
+    // 2. Find user and check balance
     let user = users_col
         .find_one(doc! { "_id": starter_id })
         .session(&mut session)
@@ -130,16 +159,6 @@ pub async fn create_bet_handler(
         )));
     }
 
-    // 2. Check if already voted
-    let existing_vote = games_col
-        .find_one(doc! {
-            "match_id": &fixture_id,
-            "voters.user_id": &payload.starter_id,
-        })
-        .session(&mut session)
-        .await
-        .map_err(|e| AppError::MongoDB(e))?;
-
     // 3. Deduct balance
     users_col
         .update_one(
@@ -150,7 +169,7 @@ pub async fn create_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 4. Create bet document (OPEN)
+    // 4. Create bet document with vote_id
     let bet = Bet::new_open(
         fixture_id.clone(),
         payload.starter_id.clone(),
@@ -158,6 +177,7 @@ pub async fn create_bet_handler(
         payload.starter_selection.clone(),
         payload.amount,
         payload.channel_id.clone(),
+        payload.vote_id.clone(), // ✅ Pass vote_id
     );
 
     let insert_result = bets_col
@@ -166,41 +186,13 @@ pub async fn create_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // ✅ Get the inserted ID safely
     let bet_id = insert_result
         .inserted_id
         .as_object_id()
         .map(|oid| oid.to_hex())
         .ok_or_else(|| AppError::InternalServerError("Failed to get bet ID".to_string()))?;
 
-    // 5. Create vote (ONLY if not already voted)
-    if existing_vote.is_none() {
-        let voter = Voter {
-            user_id: payload.starter_id.clone(),
-            user_name: payload.starter_name.clone(),
-            selection: payload.starter_selection.clone(),
-            is_correct: None,
-            points_awarded: None,
-            voted_at: now,
-        };
-
-        let voter_bson = to_bson(&voter)
-            .map_err(|e| AppError::ValidationError(format!("BSON serialization error: {}", e)))?;
-
-        games_col
-            .update_one(
-                doc! { "match_id": &fixture_id },
-                doc! {
-                    "$inc": { "votes": 1 },
-                    "$push": { "voters": voter_bson },
-                },
-            )
-            .session(&mut session)
-            .await
-            .map_err(|e| AppError::MongoDB(e))?;
-    }
-
-    // 6. Increment pledges count
+    // 5. Increment pledges count in fixture
     games_col
         .update_one(
             doc! { "match_id": &fixture_id },
@@ -221,12 +213,95 @@ pub async fn create_bet_handler(
     Ok(Json(json!({
         "success": true,
         "message": "Bet created successfully",
-        "bet_id": bet_id,  // ✅ Now safe
+        "bet_id": bet_id,
+        "vote_id": payload.vote_id, // ✅ Return vote_id
         "new_balance": new_balance,
         "status": "open",
     })))
 }
 
+// ============================================================================
+// ✅ NEW: VOTE ROLLBACK ENDPOINT (For pledge failure)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct RollbackVoteRequest {
+    pub fixture_id: String,
+    pub user_id: String,
+}
+
+pub async fn rollback_vote_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<RollbackVoteRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use futures_util::TryStreamExt;
+    use mongodb::Collection;
+
+    tracing::info!(
+        "🔄 Rolling back vote for user {} on fixture {}",
+        payload.user_id,
+        payload.fixture_id
+    );
+
+    let games_col: Collection<Game> = state.db.collection("fixtures");
+
+    // 1. Find the fixture and get user's vote
+    let game = games_col
+        .find_one(doc! { "match_id": &payload.fixture_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    // 2. Find the user's vote to know the selection
+    let user_vote = game.voters.iter().find(|v| v.user_id == payload.user_id);
+
+    if let Some(vote) = user_vote {
+        // 3. Remove from voters array and decrement counts
+        let filter = doc! { "match_id": &payload.fixture_id };
+
+        let update = match vote.selection.as_str() {
+            "home" => doc! {
+                "$pull": { "voters": { "user_id": &payload.user_id } },
+                "$inc": { "votes": -1 }
+            },
+            "away" => doc! {
+                "$pull": { "voters": { "user_id": &payload.user_id } },
+                "$inc": { "votes": -1 }
+            },
+            "draw" => doc! {
+                "$pull": { "voters": { "user_id": &payload.user_id } },
+                "$inc": { "votes": -1 }
+            },
+            _ => doc! {
+                "$pull": { "voters": { "user_id": &payload.user_id } },
+                "$inc": { "votes": -1 }
+            },
+        };
+
+        games_col
+            .update_one(filter, update)
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+
+        tracing::info!(
+            "✅ Vote rolled back for user {} on fixture {}",
+            payload.user_id,
+            payload.fixture_id
+        );
+
+        Ok(Json(json!({
+            "success": true,
+            "message": "Vote rolled back successfully",
+            "fixture_id": payload.fixture_id,
+            "user_id": payload.user_id,
+            "selection": vote.selection,
+        })))
+    } else {
+        Err(AppError::ValidationError(
+            "User has not voted on this fixture".to_string(),
+        ))
+    }
+}
 // ============================================================================
 // 3. FILL BET (Atomic: Finisher accepts the bet)
 // ============================================================================

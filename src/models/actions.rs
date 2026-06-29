@@ -1,3 +1,5 @@
+// File: src/models/actions.rs
+
 use bson::DateTime as BsonDateTime;
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +38,9 @@ pub struct Bet {
     pub finisher_selection: Option<String>,
     pub finisher_amount: Option<f64>,
 
+    // === VOTE REFERENCE ===
+    pub vote_id: Option<String>, // ✅ NEW: Reference to vote
+
     // === CHANNEL (where the bet is visible) ===
     pub channel_id: String, // Channel-specific visibility
 
@@ -66,7 +71,7 @@ pub struct CastVoteRequest {
     pub selection: String, // "home", "away", "draw"
 }
 
-// Create Bet Request (Starter)
+// ✅ UPDATED: Create Bet Request (with vote_id)
 #[derive(Debug, Deserialize)]
 pub struct CreateBetRequest {
     pub starter_id: String,
@@ -75,6 +80,7 @@ pub struct CreateBetRequest {
     pub amount: f64,
     pub fixture_id: String,
     pub channel_id: String,
+    pub vote_id: String, // ✅ NEW: Required vote reference
 }
 
 // Fill Bet Request (Finisher)
@@ -93,19 +99,6 @@ pub struct FillBetRequest {
 pub struct SettleBetRequest {
     pub fixture_id: String,
     pub result: String, // "home", "away", "draw"
-}
-
-// Get Channel Bettors Request
-#[derive(Debug, Deserialize)]
-pub struct GetChannelBettorsQuery {
-    pub fixture_id: String,
-    pub channel_id: String,
-}
-
-// Get Fixture Votes Request
-#[derive(Debug, Deserialize)]
-pub struct GetFixtureVotesQuery {
-    pub fixture_id: String,
 }
 
 // ============================================================================
@@ -138,24 +131,10 @@ pub struct BetResponse {
     pub finisher_name: Option<String>,
     pub finisher_selection: Option<String>,
     pub finisher_amount: Option<f64>,
+    pub vote_id: Option<String>, // ✅ NEW
     pub status: String,
     pub created_at: BsonDateTime,
     pub matched_at: Option<BsonDateTime>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BettorsListResponse {
-    pub fixture_id: String,
-    pub channel_id: String,
-    pub bettors: Vec<Bet>,
-    pub count: usize,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VotersListResponse {
-    pub fixture_id: String,
-    pub voters: Vec<Voter>,
-    pub total: usize,
 }
 
 // ============================================================================
@@ -170,6 +149,7 @@ impl Bet {
         starter_selection: String,
         amount: f64,
         channel_id: String,
+        vote_id: String, // ✅ NEW
     ) -> Self {
         let now = BsonDateTime::now();
         Self {
@@ -183,6 +163,7 @@ impl Bet {
             finisher_name: None,
             finisher_selection: None,
             finisher_amount: None,
+            vote_id: Some(vote_id), // ✅ NEW
             channel_id,
             status: "open".to_string(),
             winner_id: None,
