@@ -184,8 +184,9 @@ pub struct Game {
     #[serde(rename = "availableForVoting")]
     pub available_for_voting: bool,
 
+    // ✅ FIXED: Changed from i32 to f64
     #[serde(rename = "timeElapsed")]
-    pub time_elapsed: Option<i32>,
+    pub time_elapsed: Option<f64>,
 
     pub result: Option<String>, // "home", "away", "draw"
 
@@ -223,8 +224,10 @@ pub struct Game {
 
     // ========== STATISTICS (array of snapshots) ==========
     pub statistics: Vec<StatisticsSnapshot>,
+
+    // ✅ FIXED: Changed from i32 to f64
     #[serde(rename = "lastStatisticsMinute")]
-    pub last_statistics_minute: Option<i32>,
+    pub last_statistics_minute: Option<f64>,
 
     // ========== EVENTS ==========
     #[serde(rename = "forwardedEventSignatures")]
@@ -278,7 +281,7 @@ pub struct UpdateGameScoreRequest {
     #[serde(rename = "isLive")]
     pub is_live: Option<bool>,
     #[serde(rename = "timeElapsed")]
-    pub time_elapsed: Option<i32>,
+    pub time_elapsed: Option<f64>, // ✅ FIXED
 }
 
 #[derive(Debug, Deserialize)]
