@@ -281,6 +281,9 @@ pub async fn rollback_vote_handler(
 // ============================================================================
 // 4. FILL BET - NO channel_id in query
 // ============================================================================
+// ============================================================================
+// 4. FILL BET (Atomic: Finisher accepts the bet)
+// ============================================================================
 pub async fn fill_bet_handler(
     State(state): State<AppState>,
     Json(payload): Json<FillBetRequest>,
@@ -289,8 +292,9 @@ pub async fn fill_bet_handler(
     let bets_col: Collection<Bet> = state.db.collection("bets");
     let users_col: Collection<User> = state.db.collection("users");
     let games_col: Collection<Game> = state.db.collection("fixtures");
-    let channels_col: Collection<Channel> = state.db.collection("channels");
+    let now = BsonDateTime::now();
 
+    // Validate
     if payload.amount <= 0.0 {
         return Err(AppError::ValidationError(
             "Amount must be greater than 0".to_string(),
@@ -313,7 +317,9 @@ pub async fn fill_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 1. Find the bet (must be OPEN) - NO channel_id filter
+    // ============================================================
+    // 1. Find the bet (must be OPEN) - NO channel filter
+    // ============================================================
     let bet = bets_col
         .find_one(doc! {
             "_id": bet_id,
@@ -337,36 +343,7 @@ pub async fn fill_bet_handler(
         ));
     }
 
-    // 3. Check channel membership - BOTH must be in the channel
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &payload.channel_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
-
-    if !member_ids.contains(&bet.starter_id) {
-        session
-            .abort_transaction()
-            .await
-            .map_err(|e| AppError::MongoDB(e))?;
-        return Err(AppError::ValidationError(
-            "Starter is not in this channel".to_string(),
-        ));
-    }
-
-    if !member_ids.contains(&payload.finisher_id) {
-        session
-            .abort_transaction()
-            .await
-            .map_err(|e| AppError::MongoDB(e))?;
-        return Err(AppError::ValidationError(
-            "Finisher is not in this channel".to_string(),
-        ));
-    }
-
-    // 4. Find finisher and check balance
+    // 3. Find finisher and check balance
     let finisher = users_col
         .find_one(doc! { "_id": finisher_id })
         .session(&mut session)
@@ -385,7 +362,7 @@ pub async fn fill_bet_handler(
         )));
     }
 
-    // 5. Check finisher didn't already vote
+    // 4. Check finisher didn't already vote
     let existing_vote = votes_col
         .find_one(doc! {
             "fixture_id": &bet.fixture_id,
@@ -395,7 +372,7 @@ pub async fn fill_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 6. Deduct finisher balance
+    // 5. Deduct finisher balance
     users_col
         .update_one(
             doc! { "_id": finisher_id },
@@ -405,7 +382,7 @@ pub async fn fill_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 7. Update bet to MATCHED
+    // 6. Update bet to MATCHED
     bets_col
         .update_one(
             doc! { "_id": bet_id },
@@ -416,7 +393,7 @@ pub async fn fill_bet_handler(
                     "finisher_name": &payload.finisher_name,
                     "finisher_selection": &payload.finisher_selection,
                     "finisher_amount": payload.amount,
-                    "matched_at": BsonDateTime::now(),
+                    "matched_at": now,
                 }
             },
         )
@@ -424,7 +401,7 @@ pub async fn fill_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 8. Create vote for finisher if not already voted
+    // 7. Create vote for finisher if not already voted
     if existing_vote.is_none() {
         let vote = Vote::new(
             bet.fixture_id.clone(),
@@ -439,6 +416,7 @@ pub async fn fill_bet_handler(
             .await
             .map_err(|e| AppError::MongoDB(e))?;
 
+        // Increment vote count in fixture
         games_col
             .update_one(
                 doc! { "match_id": &bet.fixture_id },
@@ -449,7 +427,7 @@ pub async fn fill_bet_handler(
             .map_err(|e| AppError::MongoDB(e))?;
     }
 
-    // 9. Increment bets count
+    // 8. Increment bets count
     games_col
         .update_one(
             doc! { "match_id": &bet.fixture_id },
@@ -459,10 +437,18 @@ pub async fn fill_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
+    // Commit transaction
     session
         .commit_transaction()
         .await
         .map_err(|e| AppError::MongoDB(e))?;
+
+    tracing::info!(
+        "✅ Bet filled: bet_id={}, finisher={}, fixture={}",
+        payload.bet_id,
+        payload.finisher_id,
+        bet.fixture_id
+    );
 
     Ok(Json(json!({
         "success": true,
