@@ -23,7 +23,7 @@ use serde_json::json;
 use std::collections::HashSet;
 
 // ============================================================================
-// 1. CAST VOTE (Global - No channel_id) - WRITES TO VOTES COLLECTION
+// 1. CAST VOTE (Global - No channel_id)
 // ============================================================================
 pub async fn cast_vote_handler(
     State(state): State<AppState>,
@@ -31,7 +31,6 @@ pub async fn cast_vote_handler(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let votes_col: Collection<Vote> = state.db.collection("votes");
     let games_col: Collection<Game> = state.db.collection("fixtures");
-    let now = BsonDateTime::now();
 
     tracing::info!(
         "🗳️ Cast vote: fixture={}, user={}, selection={}",
@@ -40,9 +39,7 @@ pub async fn cast_vote_handler(
         payload.selection
     );
 
-    // ============================================================
-    // 1. CHECK IF ALREADY VOTED (votes collection)
-    // ============================================================
+    // Check if already voted
     let existing = votes_col
         .find_one(doc! {
             "fixture_id": &payload.fixture_id,
@@ -57,9 +54,7 @@ pub async fn cast_vote_handler(
         ));
     }
 
-    // ============================================================
-    // 2. INSERT VOTE INTO VOTES COLLECTION
-    // ============================================================
+    // Insert vote
     let vote = Vote::new(
         payload.fixture_id.clone(),
         payload.user_id.clone(),
@@ -72,9 +67,7 @@ pub async fn cast_vote_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // ============================================================
-    // 3. INCREMENT VOTE COUNT IN FIXTURE (fast count cache)
-    // ============================================================
+    // Increment vote count
     games_col
         .update_one(
             doc! { "match_id": &payload.fixture_id },
@@ -82,13 +75,6 @@ pub async fn cast_vote_handler(
         )
         .await
         .map_err(|e| AppError::MongoDB(e))?;
-
-    tracing::info!(
-        "✅ Vote cast: fixture={}, user={}, selection={}",
-        payload.fixture_id,
-        payload.user_id,
-        payload.selection
-    );
 
     Ok(Json(json!({
         "success": true,
@@ -100,7 +86,7 @@ pub async fn cast_vote_handler(
 }
 
 // ============================================================================
-// 2. CREATE BET (Atomic: Bet + Vote) - UPDATED with votes collection
+// 2. CREATE BET (Atomic: Bet + Vote)
 // ============================================================================
 pub async fn create_bet_handler(
     State(state): State<AppState>,
@@ -110,9 +96,7 @@ pub async fn create_bet_handler(
     let games_col: Collection<Game> = state.db.collection("fixtures");
     let bets_col: Collection<Bet> = state.db.collection("bets");
     let users_col: Collection<User> = state.db.collection("users");
-    let now = BsonDateTime::now();
 
-    // Validate amount
     if payload.amount <= 0.0 {
         return Err(AppError::ValidationError(
             "Amount must be greater than 0".to_string(),
@@ -123,9 +107,7 @@ pub async fn create_bet_handler(
         .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
     let fixture_id = payload.fixture_id.clone();
 
-    // ============================================================
-    // 1. CHECK IF ALREADY VOTED (votes collection)
-    // ============================================================
+    // Check if already voted
     let vote_exists = votes_col
         .find_one(doc! {
             "fixture_id": &fixture_id,
@@ -134,9 +116,7 @@ pub async fn create_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // ============================================================
-    // 2. START TRANSACTION
-    // ============================================================
+    // Start transaction
     let mut session = state
         .client
         .start_session()
@@ -147,9 +127,7 @@ pub async fn create_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // ============================================================
-    // 3. FIND USER AND CHECK BALANCE
-    // ============================================================
+    // Check balance
     let user = users_col
         .find_one(doc! { "_id": starter_id })
         .session(&mut session)
@@ -168,16 +146,8 @@ pub async fn create_bet_handler(
         )));
     }
 
-    // ============================================================
-    // 4. AUTO-CAST VOTE IF NOT ALREADY VOTED (votes collection)
-    // ============================================================
+    // Auto-cast vote if not already voted
     if vote_exists.is_none() {
-        tracing::info!(
-            "🗳️ Auto-casting vote for user {} on fixture {}",
-            payload.starter_id,
-            fixture_id
-        );
-
         let vote = Vote::new(
             fixture_id.clone(),
             payload.starter_id.clone(),
@@ -191,7 +161,6 @@ pub async fn create_bet_handler(
             .await
             .map_err(|e| AppError::MongoDB(e))?;
 
-        // Increment vote count in fixture
         games_col
             .update_one(
                 doc! { "match_id": &fixture_id },
@@ -200,22 +169,9 @@ pub async fn create_bet_handler(
             .session(&mut session)
             .await
             .map_err(|e| AppError::MongoDB(e))?;
-
-        tracing::info!(
-            "✅ Auto-vote cast for user {} on fixture {}",
-            payload.starter_id,
-            fixture_id
-        );
-    } else {
-        tracing::info!(
-            "ℹ️ User {} already voted — skipping auto-vote",
-            payload.starter_id
-        );
     }
 
-    // ============================================================
-    // 5. DEDUCT BALANCE
-    // ============================================================
+    // Deduct balance
     users_col
         .update_one(
             doc! { "_id": starter_id },
@@ -225,9 +181,7 @@ pub async fn create_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // ============================================================
-    // 6. CREATE BET DOCUMENT
-    // ============================================================
+    // Create bet
     let bet = Bet::new_open(
         fixture_id.clone(),
         payload.starter_id.clone(),
@@ -250,9 +204,7 @@ pub async fn create_bet_handler(
         .map(|oid| oid.to_hex())
         .ok_or_else(|| AppError::InternalServerError("Failed to get bet ID".to_string()))?;
 
-    // ============================================================
-    // 7. INCREMENT PLEDGES COUNT IN FIXTURE
-    // ============================================================
+    // Increment pledges count
     games_col
         .update_one(
             doc! { "match_id": &fixture_id },
@@ -262,24 +214,12 @@ pub async fn create_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // ============================================================
-    // 8. COMMIT TRANSACTION
-    // ============================================================
     session
         .commit_transaction()
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
     let new_balance = user.balance - payload.amount;
-
-    tracing::info!(
-        "✅ Pledge created: bet_id={}, user={}, fixture={}, amount={}, auto_voted={}",
-        bet_id,
-        payload.starter_id,
-        fixture_id,
-        payload.amount,
-        vote_exists.is_none()
-    );
 
     Ok(Json(json!({
         "success": true,
@@ -293,7 +233,7 @@ pub async fn create_bet_handler(
 }
 
 // ============================================================================
-// 3. ROLLBACK VOTE - Deletes from votes collection
+// 3. ROLLBACK VOTE
 // ============================================================================
 pub async fn rollback_vote_handler(
     State(state): State<AppState>,
@@ -302,13 +242,6 @@ pub async fn rollback_vote_handler(
     let votes_col: Collection<Vote> = state.db.collection("votes");
     let games_col: Collection<Game> = state.db.collection("fixtures");
 
-    tracing::info!(
-        "🔄 Rolling back vote for user {} on fixture {}",
-        payload.user_id,
-        payload.fixture_id
-    );
-
-    // 1. Find the vote
     let vote = votes_col
         .find_one(doc! {
             "fixture_id": &payload.fixture_id,
@@ -320,7 +253,6 @@ pub async fn rollback_vote_handler(
             "User has not voted on this fixture".to_string(),
         ))?;
 
-    // 2. Delete the vote
     votes_col
         .delete_one(doc! {
             "fixture_id": &payload.fixture_id,
@@ -329,7 +261,6 @@ pub async fn rollback_vote_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 3. Decrement vote count in fixture
     games_col
         .update_one(
             doc! { "match_id": &payload.fixture_id },
@@ -337,12 +268,6 @@ pub async fn rollback_vote_handler(
         )
         .await
         .map_err(|e| AppError::MongoDB(e))?;
-
-    tracing::info!(
-        "✅ Vote rolled back for user {} on fixture {}",
-        payload.user_id,
-        payload.fixture_id
-    );
 
     Ok(Json(json!({
         "success": true,
@@ -354,7 +279,7 @@ pub async fn rollback_vote_handler(
 }
 
 // ============================================================================
-// 4. FILL BET (Atomic: Finisher accepts the bet) - UPDATED with votes collection
+// 4. FILL BET - NO channel_id in query
 // ============================================================================
 pub async fn fill_bet_handler(
     State(state): State<AppState>,
@@ -364,9 +289,8 @@ pub async fn fill_bet_handler(
     let bets_col: Collection<Bet> = state.db.collection("bets");
     let users_col: Collection<User> = state.db.collection("users");
     let games_col: Collection<Game> = state.db.collection("fixtures");
-    let now = BsonDateTime::now();
+    let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    // Validate
     if payload.amount <= 0.0 {
         return Err(AppError::ValidationError(
             "Amount must be greater than 0".to_string(),
@@ -389,12 +313,11 @@ pub async fn fill_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 1. Find the bet (must be OPEN)
+    // 1. Find the bet (must be OPEN) - NO channel_id filter
     let bet = bets_col
         .find_one(doc! {
             "_id": bet_id,
             "status": "open",
-            "channel_id": &payload.channel_id,
         })
         .session(&mut session)
         .await
@@ -414,7 +337,36 @@ pub async fn fill_bet_handler(
         ));
     }
 
-    // 3. Find finisher and check balance
+    // 3. Check channel membership - BOTH must be in the channel
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &payload.channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
+
+    if !member_ids.contains(&bet.starter_id) {
+        session
+            .abort_transaction()
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+        return Err(AppError::ValidationError(
+            "Starter is not in this channel".to_string(),
+        ));
+    }
+
+    if !member_ids.contains(&payload.finisher_id) {
+        session
+            .abort_transaction()
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+        return Err(AppError::ValidationError(
+            "Finisher is not in this channel".to_string(),
+        ));
+    }
+
+    // 4. Find finisher and check balance
     let finisher = users_col
         .find_one(doc! { "_id": finisher_id })
         .session(&mut session)
@@ -433,7 +385,7 @@ pub async fn fill_bet_handler(
         )));
     }
 
-    // 4. Check finisher didn't already vote (votes collection)
+    // 5. Check finisher didn't already vote
     let existing_vote = votes_col
         .find_one(doc! {
             "fixture_id": &bet.fixture_id,
@@ -443,7 +395,7 @@ pub async fn fill_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 5. Deduct finisher balance
+    // 6. Deduct finisher balance
     users_col
         .update_one(
             doc! { "_id": finisher_id },
@@ -453,7 +405,7 @@ pub async fn fill_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 6. Update bet to MATCHED
+    // 7. Update bet to MATCHED
     bets_col
         .update_one(
             doc! { "_id": bet_id },
@@ -464,7 +416,7 @@ pub async fn fill_bet_handler(
                     "finisher_name": &payload.finisher_name,
                     "finisher_selection": &payload.finisher_selection,
                     "finisher_amount": payload.amount,
-                    "matched_at": now,
+                    "matched_at": BsonDateTime::now(),
                 }
             },
         )
@@ -472,7 +424,7 @@ pub async fn fill_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 7. Create vote for finisher (ONLY if not already voted)
+    // 8. Create vote for finisher if not already voted
     if existing_vote.is_none() {
         let vote = Vote::new(
             bet.fixture_id.clone(),
@@ -487,7 +439,6 @@ pub async fn fill_bet_handler(
             .await
             .map_err(|e| AppError::MongoDB(e))?;
 
-        // Increment vote count in fixture
         games_col
             .update_one(
                 doc! { "match_id": &bet.fixture_id },
@@ -498,7 +449,7 @@ pub async fn fill_bet_handler(
             .map_err(|e| AppError::MongoDB(e))?;
     }
 
-    // 8. Increment bets count
+    // 9. Increment bets count
     games_col
         .update_one(
             doc! { "match_id": &bet.fixture_id },
@@ -508,7 +459,6 @@ pub async fn fill_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // Commit transaction
     session
         .commit_transaction()
         .await
@@ -524,7 +474,7 @@ pub async fn fill_bet_handler(
 }
 
 // ============================================================================
-// 5. SETTLE BETS (Called by Live Poller when match ends)
+// 5. SETTLE BETS
 // ============================================================================
 pub async fn settle_bets_handler(
     State(state): State<AppState>,
@@ -536,7 +486,6 @@ pub async fn settle_bets_handler(
     let votes_col: Collection<Vote> = state.db.collection("votes");
     let now = BsonDateTime::now();
 
-    // Find all MATCHED bets for this fixture
     let mut cursor = bets_col
         .find(doc! {
             "fixture_id": &payload.fixture_id,
@@ -546,12 +495,10 @@ pub async fn settle_bets_handler(
         .map_err(|e| AppError::MongoDB(e))?;
 
     let mut settled_count = 0;
-    let mut failed_count = 0;
 
     while let Some(bet) = cursor.next().await {
         let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
 
-        // Determine winner
         let (starter_won, finisher_won) = match payload.result.as_str() {
             "home" => (
                 bet.starter_selection == "home",
@@ -568,7 +515,6 @@ pub async fn settle_bets_handler(
             _ => (false, false),
         };
 
-        // Determine winner_id and results
         let (winner_id, starter_result, finisher_result) = if starter_won && !finisher_won {
             (
                 Some(bet.starter_id.clone()),
@@ -585,10 +531,8 @@ pub async fn settle_bets_handler(
             (None, Some("draw".to_string()), Some("draw".to_string()))
         };
 
-        // Calculate payout (winner gets total pot)
         let total_pot = bet.starter_amount + bet.finisher_amount.unwrap_or(0.0);
 
-        // Start transaction for each bet
         let mut session = state
             .client
             .start_session()
@@ -599,7 +543,6 @@ pub async fn settle_bets_handler(
             .await
             .map_err(|e| AppError::MongoDB(e))?;
 
-        // 1. Update bet status
         let bet_id = bet.id.ok_or(AppError::DocumentNotFound)?;
         bets_col
             .update_one(
@@ -618,7 +561,6 @@ pub async fn settle_bets_handler(
             .await
             .map_err(|e| AppError::MongoDB(e))?;
 
-        // 2. Credit winner
         if let Some(winner_id) = &winner_id {
             let winner_oid = bson::oid::ObjectId::parse_str(winner_id)
                 .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
@@ -657,7 +599,6 @@ pub async fn settle_bets_handler(
             }
         }
 
-        // Commit transaction
         session
             .commit_transaction()
             .await
@@ -665,7 +606,7 @@ pub async fn settle_bets_handler(
         settled_count += 1;
     }
 
-    // 3. Update fixture status
+    // Update fixture status
     games_col
         .update_one(
             doc! { "match_id": &payload.fixture_id },
@@ -680,38 +621,30 @@ pub async fn settle_bets_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 4. Update all votes for this fixture with correctness
+    // Update votes with correctness
     let update_result = votes_col
         .update_many(
             doc! { "fixture_id": &payload.fixture_id },
             doc! {
                 "$set": {
                     "is_correct": true,
-                    "points_awarded": 1, // or whatever points system you use
+                    "points_awarded": 1,
                 }
             },
         )
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    tracing::info!(
-        "✅ Settled {} bets, updated {} votes for fixture {}",
-        settled_count,
-        update_result.modified_count,
-        payload.fixture_id
-    );
-
     Ok(Json(json!({
         "success": true,
         "message": format!("Settled {} bets", settled_count),
         "settled": settled_count,
-        "failed": failed_count,
         "votes_updated": update_result.modified_count,
     })))
 }
 
 // ============================================================================
-// 6. GET FIXTURE VOTERS (Global - No channel filter) - FROM VOTES COLLECTION
+// 6. GET FIXTURE VOTERS (Global - No filter)
 // ============================================================================
 pub async fn get_fixture_voters_handler(
     State(state): State<AppState>,
@@ -737,18 +670,16 @@ pub async fn get_fixture_voters_handler(
         }));
     }
 
-    let total = voters.len();
-
     Ok(Json(json!({
         "success": true,
         "fixture_id": fixture_id,
         "voters": voters,
-        "total_votes": total,
+        "total_votes": voters.len(),
     })))
 }
 
 // ============================================================================
-// 7. GET USER VOTES (Global) - FROM VOTES COLLECTION
+// 7. GET USER VOTES (Global)
 // ============================================================================
 pub async fn get_user_votes_handler(
     State(state): State<AppState>,
@@ -782,7 +713,7 @@ pub async fn get_user_votes_handler(
 }
 
 // ============================================================================
-// 8. CHECK USER VOTE (Global) - FROM VOTES COLLECTION
+// 8. CHECK USER VOTE (Global)
 // ============================================================================
 pub async fn check_user_vote_handler(
     State(state): State<AppState>,
@@ -798,61 +729,87 @@ pub async fn check_user_vote_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // Clone the vote if you need to consume it multiple times
     Ok(Json(json!({
         "success": true,
         "has_voted": vote.is_some(),
-        "selection": vote.clone().map(|v| v.selection),
-        "is_correct": vote.clone().and_then(|v| v.is_correct),
-        "points_awarded": vote.and_then(|v| v.points_awarded),
+        "selection": vote.as_ref().map(|v| v.selection.clone()),
+        "is_correct": vote.as_ref().and_then(|v| v.is_correct),
+        "points_awarded": vote.as_ref().and_then(|v| v.points_awarded),
     })))
 }
 
 // ============================================================================
-// 9. GET CHANNEL BETTORS (Channel-Specific)
+// 9. GET CHANNEL VOTERS (Filtered by channel membership)
 // ============================================================================
-pub async fn get_channel_bettors_handler(
+pub async fn get_channel_voters_handler(
     State(state): State<AppState>,
     Path((channel_id, fixture_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let bets_col: Collection<Bet> = state.db.collection("bets");
+    let votes_col: Collection<Vote> = state.db.collection("votes");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    let mut cursor = bets_col
-        .find(doc! {
-            "channel_id": &channel_id,
-            "fixture_id": &fixture_id,
-            "status": { "$ne": "open" }, // Only show matched + settled bets
-        })
+    // Get channel members
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
+
+    // Get ALL votes for fixture (global)
+    let mut cursor = votes_col
+        .find(doc! { "fixture_id": &fixture_id })
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    let mut bettors = Vec::new();
-    while let Some(bet) = cursor.next().await {
-        let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
-        bettors.push(bet);
+    let mut voters = Vec::new();
+    while let Some(vote) = cursor.next().await {
+        let vote: Vote = vote.map_err(|e| AppError::MongoDB(e))?;
+        // Filter: only show voters who are in the channel
+        if member_ids.contains(&vote.user_id) {
+            voters.push(json!({
+                "user_id": vote.user_id,
+                "user_name": vote.user_name,
+                "selection": vote.selection,
+                "voted_at": vote.voted_at,
+                "is_correct": vote.is_correct,
+                "points_awarded": vote.points_awarded,
+            }));
+        }
     }
 
     Ok(Json(json!({
         "success": true,
         "fixture_id": fixture_id,
         "channel_id": channel_id,
-        "bettors": bettors,
-        "count": bettors.len(),
+        "voters": voters,
+        "total": voters.len(),
     })))
 }
 
 // ============================================================================
-// 10. GET OPEN BETS (Channel-Specific)
+// 10. GET CHANNEL PLEDGES (Filtered by channel membership)
 // ============================================================================
-pub async fn get_open_bets_handler(
+pub async fn get_channel_pledges_handler(
     State(state): State<AppState>,
     Path((channel_id, fixture_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let bets_col: Collection<Bet> = state.db.collection("bets");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
 
+    // Get channel members
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
+
+    // Get ALL open bets for fixture (global)
     let mut cursor = bets_col
         .find(doc! {
-            "channel_id": &channel_id,
             "fixture_id": &fixture_id,
             "status": "open",
         })
@@ -862,20 +819,96 @@ pub async fn get_open_bets_handler(
     let mut open_bets = Vec::new();
     while let Some(bet) = cursor.next().await {
         let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
-        open_bets.push(bet);
+        // Filter: only show bets where starter is in the channel
+        if member_ids.contains(&bet.starter_id) {
+            open_bets.push(bet);
+        }
     }
 
     Ok(Json(json!({
         "success": true,
         "fixture_id": fixture_id,
         "channel_id": channel_id,
-        "open_bets": open_bets,
+        "pledges": open_bets,
         "count": open_bets.len(),
     })))
 }
 
 // ============================================================================
-// 11. GET USER'S BETS (Global - Across all channels)
+// 11. GET CHANNEL BETTORS (Filtered by channel membership - BOTH parties)
+// ============================================================================
+pub async fn get_channel_bettors_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let bets_col: Collection<Bet> = state.db.collection("bets");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    // Get channel members
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
+
+    // Get ALL non-open bets for fixture (global)
+    let mut cursor = bets_col
+        .find(doc! {
+            "fixture_id": &fixture_id,
+            "status": { "$ne": "open" },
+        })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut matched_bets = Vec::new();
+    while let Some(bet) = cursor.next().await {
+        let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
+        // Filter: BOTH starter AND finisher must be in the channel
+        if let Some(finisher_id) = &bet.finisher_id {
+            if member_ids.contains(&bet.starter_id) && member_ids.contains(finisher_id) {
+                matched_bets.push(bet);
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "channel_id": channel_id,
+        "bettors": matched_bets,
+        "count": matched_bets.len(),
+    })))
+}
+
+// ============================================================================
+// 12. GET CHANNEL MEMBERS (Helper)
+// ============================================================================
+pub async fn get_channel_members_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_ids: Vec<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel_id,
+        "member_ids": member_ids,
+        "count": member_ids.len(),
+    })))
+}
+
+// ============================================================================
+// 13. GET USER'S BETS (Global - Across all channels)
 // ============================================================================
 pub async fn get_user_bets_handler(
     State(state): State<AppState>,
@@ -909,134 +942,7 @@ pub async fn get_user_bets_handler(
 }
 
 // ============================================================================
-// 12. GET CHANNEL MEMBERS (Helper for filtering voters)
-// ============================================================================
-pub async fn get_channel_members_handler(
-    State(state): State<AppState>,
-    Path(channel_id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let channels_col: Collection<Channel> = state.db.collection("channels");
-
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &channel_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    let member_ids: Vec<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
-
-    Ok(Json(json!({
-        "success": true,
-        "channel_id": channel_id,
-        "member_ids": member_ids,
-        "count": member_ids.len(),
-    })))
-}
-
-// ============================================================================
-// 13. GET CHANNEL VOTERS (Filtered by channel membership) - FROM VOTES COLLECTION
-// ============================================================================
-pub async fn get_channel_voters_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let votes_col: Collection<Vote> = state.db.collection("votes");
-    let channels_col: Collection<Channel> = state.db.collection("channels");
-
-    // 1. Get all votes for this fixture
-    let mut cursor = votes_col
-        .find(doc! { "fixture_id": &fixture_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?;
-
-    let mut all_votes = Vec::new();
-    while let Some(vote) = cursor.next().await {
-        let vote: Vote = vote.map_err(|e| AppError::MongoDB(e))?;
-        all_votes.push(vote);
-    }
-
-    // 2. Get channel members
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &channel_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
-
-    // 3. Filter voters by channel membership
-    let channel_voters: Vec<serde_json::Value> = all_votes
-        .into_iter()
-        .filter(|v| member_ids.contains(&v.user_id))
-        .map(|v| {
-            json!({
-                "user_id": v.user_id,
-                "user_name": v.user_name,
-                "selection": v.selection,
-                "voted_at": v.voted_at,
-                "is_correct": v.is_correct,
-                "points_awarded": v.points_awarded,
-            })
-        })
-        .collect();
-
-    Ok(Json(json!({
-        "success": true,
-        "fixture_id": fixture_id,
-        "channel_id": channel_id,
-        "voters": channel_voters,
-        "total": channel_voters.len(),
-    })))
-}
-
-// ============================================================================
-// 14. GET CHANNEL PLEDGES (Filtered by channel membership)
-// ============================================================================
-pub async fn get_channel_pledges_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let channels_col: Collection<Channel> = state.db.collection("channels");
-    let bets_col: Collection<Bet> = state.db.collection("bets");
-
-    // 1. Get channel members
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &channel_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
-
-    // 2. Get open bets for this fixture
-    let mut cursor = bets_col
-        .find(doc! {
-            "fixture_id": &fixture_id,
-            "status": "open",
-        })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?;
-
-    let mut open_bets = Vec::new();
-    while let Some(bet) = cursor.next().await {
-        let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
-        // Check if starter is in channel
-        if member_ids.contains(&bet.starter_id) {
-            open_bets.push(bet);
-        }
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "fixture_id": fixture_id,
-        "channel_id": channel_id,
-        "pledges": open_bets,
-        "count": open_bets.len(),
-    })))
-}
-
-// ============================================================================
-// 15. GET VOTE COUNT FOR FIXTURE (Fast count from fixture cache)
+// 14. GET VOTE COUNT (Fast count from fixture cache)
 // ============================================================================
 pub async fn get_vote_count_handler(
     State(state): State<AppState>,
@@ -1058,7 +964,7 @@ pub async fn get_vote_count_handler(
 }
 
 // ============================================================================
-// 16. GET FIXTURE VOTE SELECTION BREAKDOWN
+// 15. GET VOTE BREAKDOWN
 // ============================================================================
 pub async fn get_vote_breakdown_handler(
     State(state): State<AppState>,
@@ -1090,7 +996,6 @@ pub async fn get_vote_breakdown_handler(
         }
     }
 
-    // Ensure all selections are present
     let home = breakdown.get("home").and_then(|v| v.as_i64()).unwrap_or(0);
     let away = breakdown.get("away").and_then(|v| v.as_i64()).unwrap_or(0);
     let draw = breakdown.get("draw").and_then(|v| v.as_i64()).unwrap_or(0);
