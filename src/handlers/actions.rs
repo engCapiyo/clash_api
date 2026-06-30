@@ -734,7 +734,7 @@ pub async fn get_channel_voters_handler(
     let votes_col: Collection<Vote> = state.db.collection("votes");
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    // Get channel members
+    // 1. Get channel members
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await
@@ -743,7 +743,7 @@ pub async fn get_channel_voters_handler(
 
     let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
 
-    // Get ALL votes for fixture (global)
+    // 2. Get ALL votes for fixture (NO channel_id filter)
     let mut cursor = votes_col
         .find(doc! { "fixture_id": &fixture_id })
         .await
@@ -752,7 +752,7 @@ pub async fn get_channel_voters_handler(
     let mut voters = Vec::new();
     while let Some(vote) = cursor.next().await {
         let vote: Vote = vote.map_err(|e| AppError::MongoDB(e))?;
-        // Filter: only show voters who are in the channel
+        // ✅ Voter must be in the channel
         if member_ids.contains(&vote.user_id) {
             voters.push(json!({
                 "user_id": vote.user_id,
@@ -784,7 +784,7 @@ pub async fn get_channel_pledges_handler(
     let bets_col: Collection<Bet> = state.db.collection("bets");
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    // Get channel members
+    // 1. Get channel members
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await
@@ -793,7 +793,7 @@ pub async fn get_channel_pledges_handler(
 
     let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
 
-    // Get ALL open bets for fixture (global)
+    // 2. Get ALL open bets for fixture (NO channel_id filter)
     let mut cursor = bets_col
         .find(doc! {
             "fixture_id": &fixture_id,
@@ -805,7 +805,7 @@ pub async fn get_channel_pledges_handler(
     let mut open_bets = Vec::new();
     while let Some(bet) = cursor.next().await {
         let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
-        // Filter: only show bets where starter is in the channel
+        // ✅ Only starter must be in the channel (open bets)
         if member_ids.contains(&bet.starter_id) {
             open_bets.push(bet);
         }
@@ -820,9 +820,6 @@ pub async fn get_channel_pledges_handler(
     })))
 }
 
-// ============================================================================
-// 11. GET CHANNEL BETTORS (Filtered by channel membership - BOTH parties)
-// ============================================================================
 pub async fn get_channel_bettors_handler(
     State(state): State<AppState>,
     Path((channel_id, fixture_id)): Path<(String, String)>,
@@ -830,7 +827,7 @@ pub async fn get_channel_bettors_handler(
     let bets_col: Collection<Bet> = state.db.collection("bets");
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    // Get channel members
+    // 1. Get channel members
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await
@@ -839,7 +836,7 @@ pub async fn get_channel_bettors_handler(
 
     let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
 
-    // Get ALL non-open bets for fixture (global)
+    // 2. Get ALL non-open bets for fixture (NO channel_id filter)
     let mut cursor = bets_col
         .find(doc! {
             "fixture_id": &fixture_id,
@@ -851,7 +848,7 @@ pub async fn get_channel_bettors_handler(
     let mut matched_bets = Vec::new();
     while let Some(bet) = cursor.next().await {
         let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
-        // Filter: BOTH starter AND finisher must be in the channel
+        // ✅ BOTH starter AND finisher must be in the channel
         if let Some(finisher_id) = &bet.finisher_id {
             if member_ids.contains(&bet.starter_id) && member_ids.contains(finisher_id) {
                 matched_bets.push(bet);
@@ -868,7 +865,12 @@ pub async fn get_channel_bettors_handler(
     })))
 }
 
+
+
 // ============================================================================
+// 11. GET CHANNEL BETTORS (Filtered by channel membership - BOTH parties)
+// ============================================================================
+=====================================================
 // 12. GET CHANNEL MEMBERS (Helper)
 // ============================================================================
 pub async fn get_channel_members_handler(
