@@ -865,12 +865,9 @@ pub async fn get_channel_bettors_handler(
     })))
 }
 
-
-
 // ============================================================================
 // 11. GET CHANNEL BETTORS (Filtered by channel membership - BOTH parties)
 // ============================================================================
-=====================================================
 // 12. GET CHANNEL MEMBERS (Helper)
 // ============================================================================
 pub async fn get_channel_members_handler(
