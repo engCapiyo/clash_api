@@ -583,7 +583,7 @@ pub async fn receive_live_update(
 // LINEUPS HANDLERS
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LineupsUpdate {
     #[serde(rename = "fixtureId")]
     pub fixture_id: String,
@@ -594,13 +594,13 @@ pub struct LineupsUpdate {
     pub lineups: LineupsPayload,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LineupsPayload {
     pub home: TeamLineupPayload,
     pub away: TeamLineupPayload,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TeamLineupPayload {
     pub formation: String,
     pub coach: CoachPayload,
@@ -608,12 +608,12 @@ pub struct TeamLineupPayload {
     pub bench: Vec<PlayerPayload>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CoachPayload {
     pub name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PlayerPayload {
     pub name: String,
     pub position: String,
@@ -625,6 +625,7 @@ pub struct PlayerPayload {
     pub player_id: Option<String>,
 }
 
+// Helper function to map players
 fn map_players(players: Vec<PlayerPayload>, default_lineup: &str) -> Vec<Player> {
     players
         .into_iter()
@@ -651,65 +652,63 @@ pub async fn store_lineups(
     tracing::info!("📋 Storing lineups for fixture: {}", payload.fixture_id);
 
     let games_col: Collection<Game> = state.db.collection("fixtures");
-    let lineups_col: Collection<LineupsDocument> = state.db.collection("lineups");
 
-    let game = games_col
-        .find_one(doc! { "matchId": &payload.fixture_id })
-        .await?
-        .ok_or(AppError::DocumentNotFound)?;
-
+    // Build home_lineup from payload
     let home_lineup = TeamLineup {
-        formation: payload.lineups.home.formation,
+        formation: payload.lineups.home.formation.clone(),
         coach: Coach {
-            name: payload.lineups.home.coach.name,
+            name: payload.lineups.home.coach.name.clone(),
         },
-        players: map_players(payload.lineups.home.players, "starting"),
-        bench: map_players(payload.lineups.home.bench, "bench"),
+        players: map_players(payload.lineups.home.players.clone(), "starting"),
+        bench: map_players(payload.lineups.home.bench.clone(), "bench"),
     };
 
+    // Build away_lineup from payload
     let away_lineup = TeamLineup {
-        formation: payload.lineups.away.formation,
+        formation: payload.lineups.away.formation.clone(),
         coach: Coach {
-            name: payload.lineups.away.coach.name,
+            name: payload.lineups.away.coach.name.clone(),
         },
-        players: map_players(payload.lineups.away.players, "starting"),
-        bench: map_players(payload.lineups.away.bench, "bench"),
+        players: map_players(payload.lineups.away.players.clone(), "starting"),
+        bench: map_players(payload.lineups.away.bench.clone(), "bench"),
     };
 
+    // Save counts before moving
     let home_player_count = home_lineup.players.len();
     let away_player_count = away_lineup.players.len();
 
+    // Create LineupsDocument
     let doc = LineupsDocument::new(
         payload.fixture_id.clone(),
-        game.home_team.clone(),
-        game.away_team.clone(),
+        payload.home_team.clone(),
+        payload.away_team.clone(),
         home_lineup,
         away_lineup,
     );
 
-    let bson_doc = bson::to_document(&doc).map_err(|e| {
+    // Convert to BSON for embedding
+    let bson_doc = bson::to_bson(&doc).map_err(|e| {
         AppError::InternalServerError(format!("Failed to serialize lineups: {}", e))
     })?;
 
-    lineups_col
-        .update_one(
-            doc! { "matchId": &payload.fixture_id },
-            doc! { "$set": bson_doc },
-        )
-        .upsert(true)
-        .await?;
-
+    // ✅ Store in fixtures collection - embedded in Game
     games_col
         .update_one(
             doc! { "matchId": &payload.fixture_id },
             doc! { "$set": {
+                "lineups": bson_doc,
                 "lineupsFetched": true,
                 "lineupsFetchedAt": BsonDateTime::from_chrono(Utc::now()),
             }},
         )
         .await?;
 
-    tracing::info!("✅ Lineups stored for {}", payload.fixture_id);
+    tracing::info!(
+        "✅ Lineups embedded in fixture document for {} (home: {}, away: {})",
+        payload.fixture_id,
+        home_player_count,
+        away_player_count
+    );
 
     Ok(Json(json!({
         "success": true,
@@ -719,6 +718,66 @@ pub async fn store_lineups(
     })))
 }
 
+// Get lineups from fixtures collection (embedded)
+pub async fn get_lineups(
+    State(state): State<AppState>,
+    Path(match_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let games_col: Collection<Game> = state.db.collection("fixtures");
+
+    let game = games_col
+        .find_one(doc! { "matchId": &match_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    match game.lineups {
+        Some(doc) => {
+            let data = lineup_doc_to_json(&doc);
+            Ok(Json(json!({ "success": true, "data": data })))
+        }
+        None => Ok(Json(json!({ "success": false, "data": null }))),
+    }
+}
+
+pub async fn get_simplified_lineups(
+    State(state): State<AppState>,
+    Path(match_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let games_col: Collection<Game> = state.db.collection("fixtures");
+
+    let game = games_col
+        .find_one(doc! { "matchId": &match_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    match game.lineups {
+        Some(doc) => Ok(Json(json!({
+            "success": true,
+            "data": lineup_doc_to_json(&doc),
+        }))),
+        None => Ok(Json(json!({ "success": false, "data": null }))),
+    }
+}
+
+pub async fn check_lineups_available(
+    State(state): State<AppState>,
+    Path(match_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let games_col: Collection<Game> = state.db.collection("fixtures");
+
+    let game = games_col
+        .find_one(doc! { "matchId": &match_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "available": game.lineups.is_some(),
+        "fixture_id": match_id,
+    })))
+}
+
+// Helper function to convert LineupsDocument to JSON
 fn lineup_doc_to_json(doc: &LineupsDocument) -> serde_json::Value {
     json!({
         "home_formation": doc.home_lineup.formation,
@@ -749,55 +808,8 @@ fn lineup_doc_to_json(doc: &LineupsDocument) -> serde_json::Value {
             "position": p.position,
             "captain": p.captain,
         })).collect::<Vec<_>>(),
+        "fetched_at": doc.fetched_at.to_chrono().to_rfc3339(),
     })
-}
-
-pub async fn get_lineups(
-    State(state): State<AppState>,
-    Path(match_id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    let lineups_col: Collection<LineupsDocument> = state.db.collection("lineups");
-
-    match lineups_col.find_one(doc! { "matchId": &match_id }).await? {
-        Some(doc) => {
-            let mut data = lineup_doc_to_json(&doc);
-            data["fetched_at"] = json!(doc.fetched_at.to_chrono().to_rfc3339());
-            Ok(Json(json!({ "success": true, "data": data })))
-        }
-        None => Ok(Json(json!({ "success": false, "data": null }))),
-    }
-}
-
-pub async fn get_simplified_lineups(
-    State(state): State<AppState>,
-    Path(match_id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    let lineups_col: Collection<LineupsDocument> = state.db.collection("lineups");
-
-    match lineups_col.find_one(doc! { "matchId": &match_id }).await? {
-        Some(doc) => Ok(Json(json!({
-            "success": true,
-            "data": lineup_doc_to_json(&doc),
-        }))),
-        None => Ok(Json(json!({ "success": false, "data": null }))),
-    }
-}
-
-pub async fn check_lineups_available(
-    State(state): State<AppState>,
-    Path(match_id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    let lineups_col: Collection<LineupsDocument> = state.db.collection("lineups");
-    let exists = lineups_col
-        .find_one(doc! { "matchId": &match_id })
-        .await?
-        .is_some();
-
-    Ok(Json(json!({
-        "success": true,
-        "available": exists,
-        "fixture_id": match_id,
-    })))
 }
 
 // ============================================================================

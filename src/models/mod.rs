@@ -19,8 +19,6 @@ pub use sub_fixture::*;
 pub mod actions;
 pub(crate) mod channel;
 pub(crate) mod comrade;
-pub(crate) mod votes_visibility;
-
-pub(crate) mod line_up;
 pub(crate) mod statistics;
-pub(crate) mod vote; // Now just a simple declaration // Now just a simple declaration // Now just a simple declaration // Now just a simple declaration
+pub(crate) mod vote;
+pub(crate) mod votes_visibility; // Now just a simple declaration // Now just a simple declaration // Now just a simple declaration // Now just a simple declaration

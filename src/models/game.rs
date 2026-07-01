@@ -356,7 +356,7 @@ pub struct CoachPayload {
     pub name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PlayerPayload {
     pub name: String,
     pub position: String,
