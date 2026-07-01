@@ -285,7 +285,10 @@ pub struct UpdateGameScoreRequest {
     #[serde(rename = "isLive")]
     pub is_live: Option<bool>,
     #[serde(rename = "timeElapsed")]
-    pub time_elapsed: Option<i32>,
+    pub time_elapsed: Option<f64>,
+    // ✅ ADD THIS FIELD
+    #[serde(rename = "minutesPlayed")]
+    pub minutes_played: Option<i32>,
 }
 
 pub async fn update_game_score(
@@ -314,6 +317,9 @@ pub async fn update_game_score(
     if let Some(time_elapsed) = payload.time_elapsed {
         update_doc.insert("timeElapsed", time_elapsed);
     }
+    if let Some(minutes_played) = payload.minutes_played {
+        update_doc.insert("minutesPlayed", minutes_played);
+    }
     update_doc.insert("scrapedAt", BsonDateTime::from_chrono(Utc::now()));
 
     let update_result = collection
@@ -332,11 +338,13 @@ pub async fn update_game_score(
                 .find(doc! { "fixture_id": &match_id })
                 .await?;
 
+            // ✅ ADD MINUTES PLAYED TO PAYLOAD
             let score_payload = json!({
                 "fixture_id": match_id,
                 "home_score": game.home_score.unwrap_or(0),
                 "away_score": game.away_score.unwrap_or(0),
                 "minute": game.time_elapsed,
+                "minutes_played": game.minutes_played, // ✅ ADDED
             });
 
             let mut channel_count = 0;
@@ -503,6 +511,11 @@ pub async fn receive_live_update(
         "scrapedAt": BsonDateTime::from_chrono(Utc::now()),
     };
 
+    // ✅ ADD MINUTES PLAYED IF PROVIDED
+    if let Some(minutes_played) = update.minutes_played {
+        set_doc.insert("minutesPlayed", minutes_played);
+    }
+
     if let Some(minute_display) = &update.minute_display {
         set_doc.insert("minuteDisplay", minute_display);
     }
@@ -542,6 +555,7 @@ pub async fn receive_live_update(
         .find(doc! { "fixture_id": &update.fixture_id })
         .await?;
 
+    // ✅ UPDATE PAYLOAD TO INCLUDE MINUTES PLAYED
     let update_payload = json!({
         "fixture_id": update.fixture_id,
         "event_type": update.event_type,
@@ -553,6 +567,9 @@ pub async fn receive_live_update(
         "player": update.player,
         "assist": update.assist,
         "team": update.team,
+        "minutes_played": update.minutes_played, // ✅ ADDED
+        "status": status,
+        "is_live": is_live,
     });
 
     let mut channel_count = 0;

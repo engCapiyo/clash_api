@@ -152,7 +152,10 @@ pub struct Game {
 
     pub league: String,
 
-    // ✅ Option<f64> - handles null from Python scraper
+    // ✅ FIXED: minutes_played moved to correct position
+    #[serde(rename = "minutesPlayed")]
+    pub minutes_played: Option<i32>,
+
     #[serde(rename = "homeWin")]
     pub home_win: Option<f64>,
 
@@ -184,7 +187,6 @@ pub struct Game {
     #[serde(rename = "availableForVoting")]
     pub available_for_voting: bool,
 
-    // ✅ FIXED: Changed from i32 to f64
     #[serde(rename = "timeElapsed")]
     pub time_elapsed: Option<f64>,
 
@@ -225,7 +227,6 @@ pub struct Game {
     // ========== STATISTICS (array of snapshots) ==========
     pub statistics: Vec<StatisticsSnapshot>,
 
-    // ✅ FIXED: Changed from i32 to f64
     #[serde(rename = "lastStatisticsMinute")]
     pub last_statistics_minute: Option<f64>,
 
@@ -281,7 +282,10 @@ pub struct UpdateGameScoreRequest {
     #[serde(rename = "isLive")]
     pub is_live: Option<bool>,
     #[serde(rename = "timeElapsed")]
-    pub time_elapsed: Option<f64>, // ✅ FIXED
+    pub time_elapsed: Option<f64>,
+    // ✅ ADDED: minutes_played to update request
+    #[serde(rename = "minutesPlayed")]
+    pub minutes_played: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,6 +325,9 @@ pub struct LiveGameUpdate {
     pub assist: Option<String>,
     pub team: Option<String>,
     pub timestamp: Option<DateTime<Utc>>,
+    // ✅ ADDED: minutes_played to live update
+    #[serde(rename = "minutesPlayed")]
+    pub minutes_played: Option<i32>,
 }
 
 // ============================================================================
@@ -522,6 +529,7 @@ impl Game {
             home_team,
             away_team,
             league,
+            minutes_played: None, // ✅ ADDED
             home_win: None,
             away_win: None,
             draw: None,
