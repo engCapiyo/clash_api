@@ -89,6 +89,10 @@ fn generate_salt() -> String {
 // REGISTER NEW USER
 // ============================================================================
 
+// ============================================================================
+// REGISTER NEW USER
+// ============================================================================
+
 pub async fn register(
     State(state): State<AppState>,
     Json(payload): Json<CreateUserRequest>,
@@ -152,6 +156,28 @@ pub async fn register(
         _ => {}
     }
 
+    // Validate + hash PIN if one was provided (fallback-flow registration,
+    // e.g. from an emulator/old phone where Firebase phone auth failed).
+    // If no pin field was sent, this is a normal Firebase-verified signup.
+    let (pin_hash, pin_salt, is_pin_enabled) = match &payload.pin {
+        Some(pin) if pin.len() == 4 && pin.chars().all(|c| c.is_ascii_digit()) => {
+            let salt = generate_salt();
+            let hash = hash_pin(pin, &salt);
+            (Some(hash), Some(salt), true)
+        }
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "message": "PIN must be exactly 4 digits"
+                })),
+            )
+                .into_response();
+        }
+        None => (None, None, false),
+    };
+
     let now = DateTime::from_millis(Utc::now().timestamp_millis());
 
     let user = User {
@@ -165,11 +191,15 @@ pub async fn register(
         season_points: 0,
         correct_votes: 0,
         total_votes: 0,
-        pin_hash: None,
-        pin_salt: None,
-        is_pin_enabled: false,
+        pin_hash,
+        pin_salt,
+        is_pin_enabled,
         firebase_uid: None,
-        auth_methods: vec![],
+        auth_methods: if is_pin_enabled {
+            vec!["pin".into()]
+        } else {
+            vec![]
+        },
         last_login: None,
     };
 
@@ -190,7 +220,7 @@ pub async fn register(
                 season_points: 0,
                 correct_votes: 0,
                 total_votes: 0,
-                has_pin: false,
+                has_pin: is_pin_enabled,
             };
 
             let token = generate_token(
@@ -362,6 +392,10 @@ pub async fn check_user_exists(
 // SET PIN FOR USER (after Firebase registration or fallback)
 // ============================================================================
 
+// ============================================================================
+// SET PIN FOR USER (after Firebase registration or fallback)
+// ============================================================================
+
 pub async fn set_pin(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
@@ -429,7 +463,8 @@ pub async fn set_pin(
 
             println!("✅ PIN set for user: {}", user_id);
 
-            // Get updated user
+            // Get updated user and return a token so the client can log
+            // the user in immediately after setting the PIN.
             match collection.find_one(doc! { "_id": object_id }).await {
                 Ok(Some(user)) => {
                     let user_response = UserResponse {
@@ -444,24 +479,42 @@ pub async fn set_pin(
                         has_pin: true,
                     };
 
+                    let token = generate_token(
+                        &user_response.id,
+                        &user_response.username,
+                        &user_response.phone,
+                    );
+
                     (
                         StatusCode::OK,
                         Json(json!({
                             "success": true,
                             "message": "PIN set successfully",
                             "user": user_response,
+                            "token": token,
                         })),
                     )
                         .into_response()
                 }
-                _ => (
-                    StatusCode::OK,
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
                     Json(json!({
-                        "success": true,
-                        "message": "PIN set successfully",
+                        "success": false,
+                        "message": "User not found after update"
                     })),
                 )
                     .into_response(),
+                Err(e) => {
+                    println!("❌ Database error fetching updated user: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "success": false,
+                            "message": "PIN set, but failed to fetch user"
+                        })),
+                    )
+                        .into_response()
+                }
             }
         }
         Err(e) => {
@@ -477,7 +530,6 @@ pub async fn set_pin(
         }
     }
 }
-
 // ============================================================================
 // PIN LOGIN (fallback for Firebase failures)
 // ============================================================================

@@ -1312,37 +1312,33 @@ pub async fn add_commentary(
         "timestamp": Utc::now().to_rfc3339(),
     });
 
-    let tx = state.get_or_create_broadcaster(&payload.match_id);
-    let _ = tx.send(serde_json::to_string(&broadcast_msg).unwrap());
+    // ✅ FIX: Broadcast to channel_id_fixture_id rooms
+    use crate::models::channel::ChannelFixture;
+    let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
+    let mut cursor = channel_fixtures_col
+        .find(doc! { "fixture_id": &payload.match_id })
+        .await?;
 
-    tracing::info!("✅ Commentary stored and broadcasted");
+    let broadcast_json = serde_json::to_string(&broadcast_msg).unwrap();
+    let mut channel_count = 0;
 
-    Ok(Json(json!({
-        "success": true,
-        "message": "Commentary added"
-    })))
-}
+    while cursor.advance().await? {
+        let cf = cursor.deserialize_current()?;
+        let room_key = format!("{}_{}", cf.channel_id, payload.match_id);
+        let tx = state.get_or_create_broadcaster(&room_key);
+        let _ = tx.send(broadcast_json.clone());
+        channel_count += 1;
+    }
 
-pub async fn get_match_commentary(
-    State(state): State<AppState>,
-    Path(match_id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    let collection: Collection<Game> = state.db.collection("fixtures");
-
-    let game = collection
-        .find_one(doc! { "matchId": &match_id })
-        .await?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    let mut commentary = game.commentary;
-    commentary.sort_by(|a, b| a.minute.cmp(&b.minute));
+    tracing::info!(
+        "✅ Commentary stored and broadcasted to {} channels",
+        channel_count
+    );
 
     Ok(Json(json!({
         "success": true,
-        "match_id": match_id,
-        "commentary": commentary,
-        "commentary_count": game.commentary_count,
-        "last_commentary_at": game.last_commentary_at,
+        "message": "Commentary added",
+        "channels_notified": channel_count,
     })))
 }
 

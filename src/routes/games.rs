@@ -86,7 +86,7 @@ pub fn routes() -> Router<AppState> {
             "/:match_id/move-to-history",
             post(games::move_completed_to_history),
         )
-        .route("/:match_id/commentary", get(games::get_match_commentary))
+        .route("/:match_id/commentary", get(games::get_latest_commentary))
         .route(
             "/:match_id/commentary/latest",
             get(games::get_latest_commentary),

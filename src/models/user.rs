@@ -36,11 +36,12 @@ pub struct User {
     #[serde(default)]
     pub last_login: Option<DateTime>,
 }
-
 #[derive(Debug, Deserialize)]
 pub struct CreateUserRequest {
     pub username: String,
     pub phone: String,
+    #[serde(default)]
+    pub pin: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
