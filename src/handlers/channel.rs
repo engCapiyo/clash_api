@@ -689,6 +689,10 @@ pub async fn get_channel_fixtures_handler(
 // GET MESSAGES
 // ============================================================================
 
+// ============================================================================
+// GET MESSAGES - FIXED for general chat
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct MessagesQuery {
     pub channel_id: String,
@@ -714,16 +718,21 @@ pub async fn get_messages_handler(
         "channel_id": &params.channel_id,
     };
 
+    // ✅ FIX: Use $exists:false for general chat (no fixture_id field)
+    // instead of Bson::Null which only matches explicit null values
     match &params.fixture_id {
         Some(fixture_id) => {
             if fixture_id.is_empty() {
-                filter.insert("fixture_id", mongodb::bson::Bson::Null);
+                // General chat: messages with NO fixture_id field
+                filter.insert("fixture_id", doc! { "$exists": false });
             } else {
+                // Fixture chat: messages with this specific fixture_id
                 filter.insert("fixture_id", fixture_id);
             }
         }
         None => {
-            filter.insert("fixture_id", mongodb::bson::Bson::Null);
+            // General chat: messages with NO fixture_id field
+            filter.insert("fixture_id", doc! { "$exists": false });
         }
     }
 
@@ -799,7 +808,6 @@ pub async fn get_messages_handler(
         "fixture_id": params.fixture_id,
     }))
 }
-
 // ============================================================================
 // CAST VOTE (GLOBAL - No channel_id)
 // ============================================================================
