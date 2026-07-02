@@ -9,7 +9,7 @@ use crate::{
     handlers::actions::{
         cast_vote_handler, check_user_vote_handler, create_bet_handler, fill_bet_handler,
         get_channel_bettors_handler, get_channel_members_handler, get_channel_pledges_handler,
-        get_channel_voters_handler, get_fixture_voters_handler, get_user_bets_handler,
+        get_channel_vote_count_handler, get_fixture_voters_handler, get_user_bets_handler,
         get_user_votes_handler, get_vote_breakdown_handler, get_vote_count_handler,
         rollback_vote_handler, settle_bets_handler,
     },
@@ -50,7 +50,7 @@ pub fn actions_routes() -> Router<AppState> {
         // Votes - only show voters in this channel
         .route(
             "/channel/:channel_id/:fixture_id/voters",
-            get(get_channel_voters_handler),
+            get(get_channel_vote_count_handler),
         )
         // Pledges - only show starters in this channel
         .route(

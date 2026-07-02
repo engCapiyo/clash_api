@@ -2,13 +2,20 @@ use mongodb::bson::{oid::ObjectId, DateTime};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// Add this new struct
+// ============================================================================
+// PENDING REQUEST
+// ============================================================================
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PendingRequest {
     pub user_id: String,
     pub username: String,
     pub requested_at: DateTime,
 }
+
+// ============================================================================
+// CHANNEL
+// ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Channel {
@@ -22,28 +29,32 @@ pub struct Channel {
     pub activity: ChannelActivity,
     pub season: String,
     pub member_count: i32,
-
     pub invite_code: String,
     pub pending_requests: Vec<PendingRequest>,
 }
+
+// ============================================================================
+// CHANNEL MEMBER
+// ============================================================================
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChannelMember {
     pub user_id: String,
     pub username: String,
-    pub role: String,
+    pub role: String, // "admin" | "member"
     pub joined_at: DateTime,
-    pub season_points: i32, // Denormalized from User
-    pub correct_votes: i32, // Denormalized from User
-    pub total_votes: i32,   // Denormalized from User
+    pub season_points: i32,
+    pub correct_votes: i32,
+    pub total_votes: i32,
     pub msg_count: i32,
-
-    // NEW: stamped whenever this member votes or sends a message in this
-    // channel. Lets us compute "active in last N days" without a full
-    // event log per member. None = never active since joining.
+    pub likes_count: i32, // ✅ NEW: Total likes given by this member in this channel
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_active_at: Option<DateTime>,
 }
+
+// ============================================================================
+// CHANNEL ACTIVITY
+// ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChannelActivity {
@@ -52,6 +63,10 @@ pub struct ChannelActivity {
     pub week_reset_at: DateTime,
     pub last_message_at: Option<DateTime>,
 }
+
+// ============================================================================
+// FIXTURE (Global)
+// ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Fixture {
@@ -71,6 +86,10 @@ pub struct Fixture {
     pub away_score: Option<i32>,
 }
 
+// ============================================================================
+// CHANNEL FIXTURE (Per-channel fixture data)
+// ============================================================================
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChannelFixture {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -81,15 +100,18 @@ pub struct ChannelFixture {
     pub kickoff_time: String,
     pub status: String,
     pub vote_counts: VoteCounts,
-
     pub comment_count: i32,
+    pub likes_count: i32, // ✅ NEW: Total likes for this fixture in this channel
     pub unread_counts: HashMap<String, i32>,
-
     pub last_message: Option<String>,
     pub last_message_at: Option<DateTime>,
     pub last_sender: Option<String>,
     pub added_at: DateTime,
 }
+
+// ============================================================================
+// VOTE COUNTS
+// ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VoteCounts {
@@ -99,15 +121,7 @@ pub struct VoteCounts {
 }
 
 // ============================================================================
-// REPLY DATA
-// ============================================================================
-
-// ============================================================================
-// MESSAGE MODEL
-// ============================================================================
-
-// ============================================================================
-// MESSAGE MODEL
+// MESSAGE
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,7 +129,6 @@ pub struct Message {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub channel_id: String,
-    // ✅ FIX: Use skip_serializing_if to omit field when None
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixture_id: Option<String>,
     pub sender_id: String,
@@ -138,6 +151,10 @@ pub struct Message {
     pub reply_to: Option<ReplyToData>,
 }
 
+// ============================================================================
+// REPLY TO DATA
+// ============================================================================
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ReplyToData {
     #[serde(rename = "messageId")]
@@ -149,8 +166,9 @@ pub struct ReplyToData {
     #[serde(rename = "isMe")]
     pub is_me: bool,
 }
+
 // ============================================================================
-// VOTE MODEL - NO channel_id (Global Vote)
+// VOTE (Global - No channel_id)
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -159,14 +177,14 @@ pub struct Vote {
     pub id: Option<ObjectId>,
     pub fixture_id: String,
     pub user_id: String,
-    pub selection: String,
+    pub selection: String, // "home" | "away" | "draw"
     pub is_correct: Option<bool>,
     pub points_awarded: Option<i32>,
     pub voted_at: DateTime,
 }
 
 // ============================================================================
-// PAYOUT MODEL
+// PAYOUT
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -180,13 +198,9 @@ pub struct Payout {
     pub currency: String,
     pub week: Option<i32>,
     pub season: String,
-    pub status: String,
+    pub status: String, // "pending" | "paid"
     pub created_at: DateTime,
     pub paid_at: Option<DateTime>,
-
-    // NEW: snapshot of cumulative totals at the moment this payout was
-    // computed. Lets the next payout diff against these instead of
-    // re-paying the same lifetime votes/messages every period.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub votes_at_payout: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,13 +208,8 @@ pub struct Payout {
 }
 
 // ============================================================================
-// MEMBERSHIP EVENT LOG - NEW
+// MEMBERSHIP EVENT LOG
 // ============================================================================
-// Separate collection ("channel_membership_events"). Without this, you can't
-// compute churn or net growth over a rolling window — `member_count` only
-// ever tells you the current total, not who left or when. Every join/leave
-// (and join-request approve/reject if you want that funnel too) writes one
-// row here. Cheap to query: count "left" events in last 30d per channel_id.
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChannelMembershipEvent {
@@ -213,13 +222,8 @@ pub struct ChannelMembershipEvent {
 }
 
 // ============================================================================
-// ADMIN REWARD SCORE - NEW
+// ADMIN REWARD SCORE
 // ============================================================================
-// Stores the computed score per channel per period, so you're not
-// recalculating from scratch every time someone views a leaderboard, and so
-// you have history to show admins ("your score last week vs this week").
-// admin_user_id is denormalized from Channel.created_by / role=="admin" at
-// computation time, since multi-admin channels are possible.
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AdminRewardScore {
@@ -229,14 +233,114 @@ pub struct AdminRewardScore {
     pub admin_user_id: String,
     pub period_start: DateTime,
     pub period_end: DateTime,
-
-    // raw inputs, kept alongside the score so the formula can change later
-    // without losing the ability to recompute history
-    pub active_member_ratio: f64, // active_in_period / member_count
-    pub vote_participation: f64,  // members who voted / member_count
-    pub retention_rate: f64,      // members from period_start still here at period_end
-    pub net_member_growth: i32,   // joins - leaves in period
-
+    pub active_member_ratio: f64,
+    pub vote_participation: f64,
+    pub retention_rate: f64,
+    pub net_member_growth: i32,
     pub score: f64,
     pub computed_at: DateTime,
+}
+
+// ============================================================================
+// LIKE - NEW
+// ============================================================================
+
+/// A like on a fixture within a channel.
+/// Stored in a separate "likes" collection.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Like {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub fixture_id: String,
+    pub channel_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub created_at: DateTime,
+}
+
+// ============================================================================
+// LIKE HELPER METHODS
+// ============================================================================
+
+impl Like {
+    pub fn new(fixture_id: String, channel_id: String, user_id: String, username: String) -> Self {
+        Self {
+            id: None,
+            fixture_id,
+            channel_id,
+            user_id,
+            username,
+            created_at: DateTime::now(),
+        }
+    }
+}
+
+// ============================================================================
+// HELPER: Create ChannelMember with default likes_count
+// ============================================================================
+
+impl ChannelMember {
+    pub fn new(
+        user_id: String,
+        username: String,
+        role: String,
+        joined_at: DateTime,
+        season_points: i32,
+        correct_votes: i32,
+        total_votes: i32,
+    ) -> Self {
+        Self {
+            user_id,
+            username,
+            role,
+            joined_at,
+            season_points,
+            correct_votes,
+            total_votes,
+            msg_count: 0,
+            likes_count: 0,
+            last_active_at: None,
+        }
+    }
+}
+
+// ============================================================================
+// HELPER: Create ChannelFixture with default likes_count
+// ============================================================================
+
+impl ChannelFixture {
+    pub fn new(
+        channel_id: String,
+        fixture_id: String,
+        match_name: String,
+        kickoff_time: String,
+        status: String,
+        members: &[ChannelMember],
+    ) -> Self {
+        let mut unread_counts = HashMap::new();
+        for member in members {
+            unread_counts.insert(member.user_id.clone(), 0);
+        }
+
+        Self {
+            id: None,
+            channel_id,
+            fixture_id,
+            match_name,
+            kickoff_time,
+            status,
+            vote_counts: VoteCounts {
+                home: 0,
+                away: 0,
+                draw: 0,
+            },
+            comment_count: 0,
+            likes_count: 0,
+            unread_counts,
+            last_message: None,
+            last_message_at: None,
+            last_sender: None,
+            added_at: DateTime::now(),
+        }
+    }
 }

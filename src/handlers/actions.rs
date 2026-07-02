@@ -802,14 +802,13 @@ pub async fn check_user_vote_handler(
 // ============================================================================
 // 9. GET CHANNEL VOTERS (Filtered by channel membership)
 // ============================================================================
-pub async fn get_channel_voters_handler(
+pub async fn get_channel_vote_count_handler(
     State(state): State<AppState>,
     Path((channel_id, fixture_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let votes_col: Collection<Vote> = state.db.collection("votes");
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    // 1. Get channel members
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await
@@ -818,25 +817,16 @@ pub async fn get_channel_voters_handler(
 
     let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
 
-    // 2. Get ALL votes for fixture (NO channel_id filter)
     let mut cursor = votes_col
         .find(doc! { "fixture_id": &fixture_id })
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    let mut voters = Vec::new();
+    let mut count = 0;
     while let Some(vote) = cursor.next().await {
         let vote: Vote = vote.map_err(|e| AppError::MongoDB(e))?;
-        // ✅ Voter must be in the channel
         if member_ids.contains(&vote.user_id) {
-            voters.push(json!({
-                "user_id": vote.user_id,
-                "user_name": vote.user_name,
-                "selection": vote.selection,
-                "voted_at": vote.voted_at,
-                "is_correct": vote.is_correct,
-                "points_awarded": vote.points_awarded,
-            }));
+            count += 1;
         }
     }
 
@@ -844,11 +834,9 @@ pub async fn get_channel_voters_handler(
         "success": true,
         "fixture_id": fixture_id,
         "channel_id": channel_id,
-        "voters": voters,
-        "total": voters.len(),
+        "vote_count": count,
     })))
 }
-
 // ============================================================================
 // 10. GET CHANNEL PLEDGES (Filtered by channel membership)
 // ============================================================================
