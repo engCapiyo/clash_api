@@ -4,9 +4,8 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use bson::Bson;
+use bson::{doc, oid::ObjectId, Bson, DateTime};
 use futures_util::StreamExt;
-use mongodb::bson::{doc, DateTime};
 use mongodb::Collection;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -14,7 +13,6 @@ use uuid::Uuid;
 use crate::models::channel::ChannelFixture;
 use crate::models::game::Game;
 use crate::services::fcm_service::FCMService;
-use bson::oid::ObjectId;
 use serde::Deserialize;
 
 use crate::errors::{AppError, Result};
@@ -686,10 +684,6 @@ pub async fn get_channel_fixtures_handler(
 }
 
 // ============================================================================
-// GET MESSAGES
-// ============================================================================
-
-// ============================================================================
 // GET MESSAGES - FIXED for general chat
 // ============================================================================
 
@@ -700,6 +694,10 @@ pub struct MessagesQuery {
     pub limit: Option<i64>,
     pub before: Option<String>,
 }
+
+// ============================================================================
+// GET MESSAGES HANDLER - FIXED
+// ============================================================================
 
 pub async fn get_messages_handler(
     Query(params): Query<MessagesQuery>,
@@ -718,25 +716,37 @@ pub async fn get_messages_handler(
         "channel_id": &params.channel_id,
     };
 
-    // ✅ FIX: Use $exists:false for general chat (no fixture_id field)
-    // instead of Bson::Null which only matches explicit null values
+    // ✅ FIX: Use $or to handle both missing fixture_id AND fixture_id: null
     match &params.fixture_id {
         Some(fixture_id) => {
             if fixture_id.is_empty() {
-                // General chat: messages with NO fixture_id field
-                filter.insert("fixture_id", doc! { "$exists": false });
+                // General chat: messages with NO fixture_id field OR fixture_id: null
+                filter.insert(
+                    "$or",
+                    vec![
+                        doc! { "fixture_id": doc! { "$exists": false } },
+                        doc! { "fixture_id": Bson::Null },
+                    ],
+                );
             } else {
                 // Fixture chat: messages with this specific fixture_id
                 filter.insert("fixture_id", fixture_id);
             }
         }
         None => {
-            // General chat: messages with NO fixture_id field
-            filter.insert("fixture_id", doc! { "$exists": false });
+            // General chat: messages with NO fixture_id field OR fixture_id: null
+            filter.insert(
+                "$or",
+                vec![
+                    doc! { "fixture_id": doc! { "$exists": false } },
+                    doc! { "fixture_id": Bson::Null },
+                ],
+            );
         }
     }
 
     if let Some(before) = &params.before {
+        // ✅ FIX: Use DateTime::parse_rfc3339_str instead of BsonDateTime
         if let Ok(before_time) = DateTime::parse_rfc3339_str(before) {
             filter.insert("sent_at", doc! { "$lt": before_time });
         }
@@ -782,6 +792,7 @@ pub async fn get_messages_handler(
                         "selection": r.selection,
                         "isMe": r.is_me,
                     })),
+                    "fixture_id": message.fixture_id,
                 });
                 messages.push(msg_json);
             }
@@ -808,6 +819,7 @@ pub async fn get_messages_handler(
         "fixture_id": params.fixture_id,
     }))
 }
+
 // ============================================================================
 // CAST VOTE (GLOBAL - No channel_id)
 // ============================================================================
@@ -823,13 +835,11 @@ pub async fn cast_vote_handler(
     State(state): State<AppState>,
     Json(payload): Json<CastVoteRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    use bson::DateTime as BsonDateTime;
-
     let games_col: Collection<Game> = state.db.collection("fixtures");
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
     let users_col = state.db.collection::<User>("users");
     let channels_col = state.db.collection::<Channel>("channels");
-    let now = BsonDateTime::from_chrono(chrono::Utc::now());
+    let now = DateTime::now();
 
     // Check if already voted
     let existing_voter = games_col
@@ -860,9 +870,6 @@ pub async fn cast_vote_handler(
         _ => &payload.selection,
     };
 
-    // isCorrect / pointsAwarded start out unset — bind typed Nones first,
-    // never cast inline inside doc! (the macro's token muncher chokes on
-    // `as Option<T>` because of the generic angle brackets).
     let is_correct_placeholder: Option<bool> = None;
     let points_awarded_placeholder: Option<i32> = None;
 
@@ -951,11 +958,11 @@ pub struct CreatePledgeAndVoteRequest {
     pub starter_id: String,
     pub fixture_id: String,
 }
+
 pub async fn get_fixture_pledgers_handler(
     State(state): State<AppState>,
     Path((channel_id, fixture_id)): Path<(String, String)>,
 ) -> Result<Json<Value>> {
-    // ✅ Use channel_fixtures collection, not games
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
     let channel_fixture = channel_fixtures_col
@@ -966,7 +973,6 @@ pub async fn get_fixture_pledgers_handler(
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
-    // Pledges are stored in a separate "pledges" collection
     let pledges_col = state.db.collection::<Pledge>("pledges");
     let mut cursor = pledges_col.find(doc! { "fixture_id": &fixture_id }).await?;
 
@@ -980,7 +986,7 @@ pub async fn get_fixture_pledgers_handler(
         "fixture_id": fixture_id,
         "channel_id": channel_id,
         "pledges": pledges,
-        "pledgers": pledges, // pledgers = pledges (same thing)
+        "pledgers": pledges,
     })))
 }
 
@@ -993,9 +999,6 @@ pub async fn create_pledge_with_vote_handler(
         payload.username, payload.amount
     );
 
-    // ============================================================
-    // 1️⃣ VALIDATE INPUT
-    // ============================================================
     if payload.username.is_empty() {
         return Err(AppError::MissingRequiredField("username".to_string()));
     }
@@ -1023,9 +1026,6 @@ pub async fn create_pledge_with_vote_handler(
     let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    // ============================================================
-    // 2️⃣ PARSE IDs
-    // ============================================================
     let starter_id = match ObjectId::parse_str(&payload.starter_id) {
         Ok(id) => id,
         Err(_) => {
@@ -1037,15 +1037,9 @@ pub async fn create_pledge_with_vote_handler(
 
     let fixture_id = payload.fixture_id.clone();
 
-    // ============================================================
-    // 3️⃣ START SESSION & TRANSACTION
-    // ============================================================
     let mut session: mongodb::ClientSession = state.client.start_session().await?;
     session.start_transaction().await?;
 
-    // ============================================================
-    // 4️⃣ FIND USER BY _id (✅ FIXED - was "user_id")
-    // ============================================================
     let user = users_col
         .find_one(doc! { "_id": starter_id })
         .session(&mut session)
@@ -1060,9 +1054,6 @@ pub async fn create_pledge_with_vote_handler(
         user.username, user.balance
     );
 
-    // ============================================================
-    // 5️⃣ CHECK SUFFICIENT BALANCE
-    // ============================================================
     if user.balance < payload.amount {
         session.abort_transaction().await?;
         return Err(AppError::ValidationError(format!(
@@ -1071,9 +1062,6 @@ pub async fn create_pledge_with_vote_handler(
         )));
     }
 
-    // ============================================================
-    // 6️⃣ CHECK FIXTURE EXISTS AND NOT ALREADY VOTED
-    // ============================================================
     let existing_voter = games_col
         .find_one(doc! {
             "match_id": &fixture_id,
@@ -1100,29 +1088,20 @@ pub async fn create_pledge_with_vote_handler(
         return Err(AppError::DocumentNotFound);
     }
 
-    // ============================================================
-    // 7️⃣ CREATE TIME VALUES - ✅ FIXED
-    // ============================================================
-    let now = chrono::Utc::now(); // For Pledge struct (chrono)
-    let now_bson = bson::DateTime::from_chrono(now); // For MongoDB storage
+    let now = chrono::Utc::now();
+    let now_bson = DateTime::from_chrono(now);
 
-    // ============================================================
-    // 8️⃣ DEDUCT BALANCE
-    // ============================================================
     users_col
         .update_one(
             doc! { "_id": starter_id },
             doc! {
                 "$inc": { "balance": -payload.amount },
-                "$set": { "updated_at": now_bson }  // ✅ bson::DateTime
+                "$set": { "updated_at": now_bson }
             },
         )
         .session(&mut session)
         .await?;
 
-    // ============================================================
-    // 9️⃣ CREATE PLEDGE RECORD - Uses chrono::DateTime<Utc>
-    // ============================================================
     let display_selection = match payload.selection.as_str() {
         "home" => "home_team",
         "away" => "away_team",
@@ -1136,14 +1115,14 @@ pub async fn create_pledge_with_vote_handler(
         phone: payload.phone.clone(),
         selection: display_selection.to_string(),
         amount: payload.amount,
-        time: now, // ✅ chrono::DateTime<Utc>
+        time: now,
         fan: payload.fan.clone(),
         home_team: payload.home_team.clone(),
         away_team: payload.away_team.clone(),
         starter_id: payload.starter_id.clone(),
         fixture_id: Some(fixture_id.clone()),
-        created_at: now, // ✅ chrono::DateTime<Utc>
-        updated_at: now, // ✅ chrono::DateTime<Utc>
+        created_at: now,
+        updated_at: now,
     };
 
     pledges_col
@@ -1151,20 +1130,14 @@ pub async fn create_pledge_with_vote_handler(
         .session(&mut session)
         .await?;
 
-    // ============================================================
-    // 🔟 UPDATE FIXTURE - ADD PLEDGE + VOTE
-    // ============================================================
     let pledger_entry = doc! {
         "userId": &payload.starter_id,
         "userName": &payload.username,
         "selection": display_selection,
         "amount": payload.amount,
-        "pledgedAt": now_bson,  // ✅ bson::DateTime
+        "pledgedAt": now_bson,
     };
 
-    // Bind typed Nones outside the macro — passing `null as Option<bool>` /
-    // `null as Option<i32>` directly inside doc! is what produced the
-    // "expected token" / "no rules expected keyword `as`" compiler errors.
     let is_correct_placeholder: Option<bool> = None;
     let points_awarded_placeholder: Option<i32> = None;
 
@@ -1174,7 +1147,7 @@ pub async fn create_pledge_with_vote_handler(
         "selection": display_selection,
         "isCorrect": is_correct_placeholder,
         "pointsAwarded": points_awarded_placeholder,
-        "votedAt": now_bson,  // ✅ bson::DateTime
+        "votedAt": now_bson,
     };
 
     let increment_field = match payload.selection.as_str() {
@@ -1199,15 +1172,12 @@ pub async fn create_pledge_with_vote_handler(
                     "pledgers": pledger_entry,
                     "voters": voter_entry,
                 },
-                "$set": { "updated_at": now_bson }  // ✅ bson::DateTime
+                "$set": { "updated_at": now_bson }
             },
         )
         .session(&mut session)
         .await?;
 
-    // ============================================================
-    // 1️⃣1️⃣ UPDATE CHANNEL FIXTURE VOTE COUNTS
-    // ============================================================
     channel_fixtures_col
         .update_many(
             doc! { "fixture_id": &fixture_id },
@@ -1216,9 +1186,6 @@ pub async fn create_pledge_with_vote_handler(
         .session(&mut session)
         .await?;
 
-    // ============================================================
-    // 1️⃣2️⃣ INCREMENT USER TOTAL VOTES
-    // ============================================================
     users_col
         .update_one(
             doc! { "_id": starter_id },
@@ -1227,9 +1194,6 @@ pub async fn create_pledge_with_vote_handler(
         .session(&mut session)
         .await?;
 
-    // ============================================================
-    // 1️⃣3️⃣ UPDATE USER LAST_ACTIVE_AT IN ALL CHANNELS
-    // ============================================================
     let mut channel_cursor = channels_col
         .find(doc! { "members.user_id": &payload.starter_id })
         .session(&mut session)
@@ -1243,15 +1207,12 @@ pub async fn create_pledge_with_vote_handler(
                     "channel_id": &channel.channel_id,
                     "members.user_id": &payload.starter_id,
                 },
-                doc! { "$set": { "members.$.last_active_at": now_bson } }, // ✅ bson::DateTime
+                doc! { "$set": { "members.$.last_active_at": now_bson } },
             )
             .session(&mut session)
             .await?;
     }
 
-    // ============================================================
-    // 1️⃣4️⃣ COMMIT TRANSACTION
-    // ============================================================
     session.commit_transaction().await?;
 
     let new_balance = user.balance - payload.amount;
@@ -1274,6 +1235,7 @@ pub async fn create_pledge_with_vote_handler(
         "new_balance": new_balance,
     })))
 }
+
 // ============================================================================
 // USER REQUESTS TO JOIN CHANNEL
 // ============================================================================
@@ -1296,7 +1258,7 @@ pub async fn request_join_channel_handler(
     );
 
     let channels_col = state.db.collection::<Channel>("channels");
-    let now = mongodb::bson::DateTime::now();
+    let now = DateTime::now();
 
     let channel = channels_col
         .find_one(doc! { "channel_id": &payload.channel_id })
@@ -1497,7 +1459,7 @@ pub async fn approve_join_request_handler(
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
     let users_col = state.db.collection::<User>("users");
-    let now = mongodb::bson::DateTime::now();
+    let now = DateTime::now();
 
     let channel = channels_col
         .find_one(doc! { "channel_id": &payload.channel_id })
@@ -1732,9 +1694,6 @@ pub async fn add_members_to_channel_handler(
     let users_col = state.db.collection::<User>("users");
     let now = DateTime::now();
 
-    // Typed None bound once and reused for every member doc below.
-    // Do NOT write `null as Option<DateTime>` inline inside doc! — the
-    // generic's `<`/`>` breaks the macro's parser (this was the original bug).
     let no_last_active: Option<DateTime> = None;
 
     let mut members_to_add = Vec::new();

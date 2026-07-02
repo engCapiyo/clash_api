@@ -102,18 +102,6 @@ pub struct VoteCounts {
 // REPLY DATA
 // ============================================================================
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ReplyToData {
-    #[serde(rename = "messageId")]
-    pub message_id: String,
-    pub text: String,
-    pub username: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selection: Option<String>,
-    #[serde(rename = "isMe")]
-    pub is_me: bool,
-}
-
 // ============================================================================
 // MESSAGE MODEL
 // ============================================================================
@@ -127,12 +115,7 @@ pub struct Message {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub channel_id: String,
-    // ✅ FIX: was missing skip_serializing_if. Without it, BSON serialized
-    // `None` as an explicit `fixture_id: null` field instead of omitting the
-    // key entirely. That mismatched the read-side `$exists: false` filter in
-    // get_messages_handler, which only matches a truly absent field — so
-    // every general-channel message became invisible to that query. New
-    // writes will now correctly omit the field when there's no fixture.
+    // ✅ FIX: Use skip_serializing_if to omit field when None
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixture_id: Option<String>,
     pub sender_id: String,
@@ -155,6 +138,17 @@ pub struct Message {
     pub reply_to: Option<ReplyToData>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ReplyToData {
+    #[serde(rename = "messageId")]
+    pub message_id: String,
+    pub text: String,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
+    #[serde(rename = "isMe")]
+    pub is_me: bool,
+}
 // ============================================================================
 // VOTE MODEL - NO channel_id (Global Vote)
 // ============================================================================

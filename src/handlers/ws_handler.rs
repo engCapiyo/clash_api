@@ -101,7 +101,6 @@ async fn handle_socket(
     username: String,
     state: AppState,
 ) {
-    // Build room key
     let room_key = match &fixture_id {
         Some(f) => format!("{}_{}", channel_id, f),
         None => format!("{}_overall", channel_id),
@@ -113,7 +112,6 @@ async fn handle_socket(
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(Mutex::new(sender));
 
-    // Welcome message
     let welcome = serde_json::json!({
         "type": "connected",
         "channel_id": channel_id,
@@ -138,7 +136,6 @@ async fn handle_socket(
     let state_clone = state.clone();
     let tx_clone = tx.clone();
 
-    // Task 1: forward broadcasts to client
     let mut send_task = tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -156,7 +153,6 @@ async fn handle_socket(
         }
     });
 
-    // Task 2: handle incoming
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
@@ -195,10 +191,6 @@ async fn handle_socket(
 // HANDLE INCOMING MESSAGE
 // ============================================================================
 
-// ============================================================================
-// HANDLE INCOMING MESSAGE - CLEANED (NO VOTE)
-// ============================================================================
-
 async fn handle_incoming_message(
     text: String,
     state: &AppState,
@@ -228,15 +220,16 @@ async fn handle_incoming_message(
                 }
             };
 
-            // Extract from payload
             let channel_id = payload
                 .get("channelId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
+            // ✅ FIX: Handle null and empty fixtureId properly
             let fixture_id = payload
                 .get("fixtureId")
-                .and_then(|v| v.as_str())
+                .and_then(|v| if v.is_null() { None } else { v.as_str() })
+                .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
 
             let user_id = payload.get("userId").and_then(|v| v.as_str()).unwrap_or("");
@@ -280,7 +273,6 @@ async fn handle_incoming_message(
                 }
             }
 
-            // Create the room key based on channel_id and fixture_id
             let room_key = match &fixture_id {
                 Some(f) => format!("{}_{}", channel_id, f),
                 None => format!("{}_overall", channel_id),
@@ -288,8 +280,6 @@ async fn handle_incoming_message(
 
             let room_broadcaster = state.get_or_create_broadcaster(&room_key);
 
-            // Also broadcast comment count update to all clients in the room
-            // Get updated comment count
             if let Some(fixture_id) = &fixture_id {
                 let channel_fixtures_col =
                     state.db.collection::<ChannelFixture>("channel_fixtures");
@@ -336,9 +326,11 @@ async fn handle_incoming_message(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
+                // ✅ FIX: Handle null and empty fixtureId properly
                 let fixture_id = payload
                     .get("fixtureId")
-                    .and_then(|v| v.as_str())
+                    .and_then(|v| if v.is_null() { None } else { v.as_str() })
+                    .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
                 if !channel_id.is_empty() {
@@ -372,9 +364,6 @@ async fn handle_incoming_message(
             }
         }
 
-        // ================================================================
-        // ✅ NEW: JOIN REQUEST HANDLER
-        // ================================================================
         Some("join.request") => {
             tracing::info!("📨 Join request via WebSocket");
 
@@ -411,7 +400,6 @@ async fn handle_incoming_message(
                     channel_id
                 );
 
-                // Get channel admins and notify them in real-time
                 let channels_col = state.db.collection::<Channel>("channels");
 
                 match channels_col
@@ -435,7 +423,6 @@ async fn handle_incoming_message(
                             );
                         }
 
-                        // Broadcast to all admins in real-time
                         for admin_id in &admin_user_ids {
                             let admin_room = format!("user_{}", admin_id);
                             let admin_tx = state.get_or_create_broadcaster(&admin_room);
@@ -465,7 +452,6 @@ async fn handle_incoming_message(
                             }
                         }
 
-                        // Also broadcast to the channel's room so other admins see it
                         let channel_room_key = format!("channel_{}", channel_id);
                         let channel_tx = state.get_or_create_broadcaster(&channel_room_key);
 
@@ -484,7 +470,6 @@ async fn handle_incoming_message(
                             let _ = channel_tx.send(json);
                         }
 
-                        // Send confirmation back to the requester
                         let confirmation = serde_json::json!({
                             "type": "join.response",
                             "payload": {
@@ -520,12 +505,9 @@ async fn handle_incoming_message(
         }
     }
 }
-// ============================================================================
-// SAVE VOTE TO DATABASE (GLOBAL - No channel_id)
-// ============================================================================
 
 // ============================================================================
-// SAVE MESSAGE TO DATABASE
+// SAVE MESSAGE TO DATABASE - FIXED
 // ============================================================================
 
 async fn save_message_to_database(
@@ -584,10 +566,17 @@ async fn save_message_to_database(
         .and_then(|v| if v.is_null() { None } else { Some(v) })
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+    // ✅ FIX: final_fixture_id is already None for general chat
+    // This ensures the field is omitted from the document
+    let final_fixture_id = fixture_id
+        .as_ref()
+        .filter(|f| !f.is_empty())
+        .map(|f| f.to_string());
+
     let message = Message {
         id: None,
         channel_id: channel_id.to_string(),
-        fixture_id: fixture_id.clone(),
+        fixture_id: final_fixture_id, // ✅ None for general chat - field is omitted
         sender_id: user_id.to_string(),
         sender_name: username.to_string(),
         text: message_text.clone(),
@@ -623,8 +612,6 @@ async fn save_message_to_database(
         .map_err(|e| format!("Failed to update channel activity: {}", e))?;
 
     // 3. Update member's message count AND last_active_at
-    // (covers both chat types — fixture_id is None for overall channel
-    // chat, Some(..) for fixture-scoped chat — same field update either way)
     channels_col
         .update_one(
             doc! {
@@ -641,39 +628,41 @@ async fn save_message_to_database(
 
     // 4. UPDATE CHANNEL FIXTURE with comment_count and unread_counts
     if let Some(fixture_id) = fixture_id {
-        let channel = channels_col
-            .find_one(doc! { "channel_id": channel_id })
-            .await
-            .map_err(|e| format!("Failed to get channel: {}", e))?;
-
-        if let Some(channel) = channel {
-            let mut inc_doc = doc! {
-                "comment_count": 1,
-            };
-
-            for member in &channel.members {
-                if member.user_id != user_id {
-                    inc_doc.insert(format!("unread_counts.{}", member.user_id), 1);
-                }
-            }
-
-            channel_fixtures_col
-                .update_one(
-                    doc! {
-                        "channel_id": channel_id,
-                        "fixture_id": fixture_id,
-                    },
-                    doc! {
-                        "$inc": inc_doc,
-                        "$set": {
-                            "last_message": &message_text,
-                            "last_message_at": now,
-                            "last_sender": username,
-                        }
-                    },
-                )
+        if !fixture_id.is_empty() {
+            let channel = channels_col
+                .find_one(doc! { "channel_id": channel_id })
                 .await
-                .map_err(|e| format!("Failed to update channel fixture: {}", e))?;
+                .map_err(|e| format!("Failed to get channel: {}", e))?;
+
+            if let Some(channel) = channel {
+                let mut inc_doc = doc! {
+                    "comment_count": 1,
+                };
+
+                for member in &channel.members {
+                    if member.user_id != user_id {
+                        inc_doc.insert(format!("unread_counts.{}", member.user_id), 1);
+                    }
+                }
+
+                channel_fixtures_col
+                    .update_one(
+                        doc! {
+                            "channel_id": channel_id,
+                            "fixture_id": fixture_id,
+                        },
+                        doc! {
+                            "$inc": inc_doc,
+                            "$set": {
+                                "last_message": &message_text,
+                                "last_message_at": now,
+                                "last_sender": username,
+                            }
+                        },
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to update channel fixture: {}", e))?;
+            }
         }
     }
 
