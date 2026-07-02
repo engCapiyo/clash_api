@@ -17,6 +17,7 @@ use axum::{
 };
 use bson::{doc, to_bson, DateTime as BsonDateTime};
 use futures_util::StreamExt;
+use mongodb::options::UpdateOptions; // add to imports at top
 use mongodb::Collection;
 use serde::Deserialize;
 use serde_json::json;
@@ -462,6 +463,9 @@ pub async fn fill_bet_handler(
 // ============================================================================
 // 5. SETTLE BETS
 // ============================================================================
+// ============================================================================
+// 5. SETTLE BETS
+// ============================================================================
 pub async fn settle_bets_handler(
     State(state): State<AppState>,
     Json(payload): Json<SettleBetRequest>,
@@ -470,6 +474,7 @@ pub async fn settle_bets_handler(
     let users_col: Collection<User> = state.db.collection("users");
     let games_col: Collection<Game> = state.db.collection("fixtures");
     let votes_col: Collection<Vote> = state.db.collection("votes");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
     let now = BsonDateTime::now();
 
     let mut cursor = bets_col
@@ -607,25 +612,95 @@ pub async fn settle_bets_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // Update votes with correctness
-    let update_result = votes_col
+    // ============================================================
+    // STAGE 1: Mark vote correctness globally, once.
+    // Guarded on is_correct still being null so a duplicate call
+    // (retry, zombie poller process) is a safe no-op.
+    // ============================================================
+    votes_col
         .update_many(
-            doc! { "fixture_id": &payload.fixture_id },
             doc! {
-                "$set": {
-                    "is_correct": true,
-                    "points_awarded": 1,
-                }
+                "fixture_id": &payload.fixture_id,
+                "selection": &payload.result,
+                "is_correct": null,
             },
+            doc! { "$set": { "is_correct": true, "points_awarded": 1 } },
         )
         .await
         .map_err(|e| AppError::MongoDB(e))?;
+
+    votes_col
+        .update_many(
+            doc! {
+                "fixture_id": &payload.fixture_id,
+                "selection": { "$ne": &payload.result },
+                "is_correct": null,
+            },
+            doc! { "$set": { "is_correct": false, "points_awarded": 0 } },
+        )
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    // ============================================================
+    // STAGE 2: Fan out into every channel each voter belongs to.
+    // Read the lists fresh from votes (post Stage 1 commit) — if
+    // Stage 1 found nothing left to update (already settled), these
+    // come back empty and Stage 2 is a no-op too.
+    // ============================================================
+    let mut correct_cursor = votes_col
+        .find(doc! { "fixture_id": &payload.fixture_id, "is_correct": true })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+    let mut correct_ids: Vec<String> = Vec::new();
+    while let Some(v) = correct_cursor.next().await {
+        if let Ok(v) = v {
+            correct_ids.push(v.user_id);
+        }
+    }
+
+    let mut incorrect_cursor = votes_col
+        .find(doc! { "fixture_id": &payload.fixture_id, "is_correct": false })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+    let mut incorrect_ids: Vec<String> = Vec::new();
+    while let Some(v) = incorrect_cursor.next().await {
+        if let Ok(v) = v {
+            incorrect_ids.push(v.user_id);
+        }
+    }
+
+    if !correct_ids.is_empty() {
+        channels_col
+            .update_many(
+                doc! { "members.user_id": { "$in": &correct_ids } },
+                doc! { "$inc": {
+                    "members.$[m].season_points": 1,
+                    "members.$[m].correct_votes": 1,
+                    "members.$[m].total_votes": 1,
+                }},
+            )
+            .array_filters(vec![doc! { "m.user_id": { "$in": &correct_ids } }])
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+    }
+
+    if !incorrect_ids.is_empty() {
+        channels_col
+            .update_many(
+                doc! { "members.user_id": { "$in": &incorrect_ids } },
+                doc! { "$inc": { "members.$[m].total_votes": 1 } },
+            )
+            .array_filters(vec![doc! { "m.user_id": { "$in": &incorrect_ids } }])
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+    }
 
     Ok(Json(json!({
         "success": true,
         "message": format!("Settled {} bets", settled_count),
         "settled": settled_count,
-        "votes_updated": update_result.modified_count,
+        "votes_correct": correct_ids.len(),
+        "votes_incorrect": incorrect_ids.len(),
     })))
 }
 
