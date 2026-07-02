@@ -1437,24 +1437,64 @@ pub async fn move_completed_to_history(
     let games_col: Collection<Game> = state.db.collection("fixtures");
     let history_col: Collection<HistoryGame> = state.db.collection("games_history");
 
-    let game = games_col
+    let game_opt = games_col
         .find_one(doc! { "matchId": &match_id, "status": "completed" })
-        .await?
-        .ok_or(AppError::DocumentNotFound)?;
+        .await?;
+
+    let game = match game_opt {
+        Some(g) => g,
+        None => {
+            // Not in fixtures -- either it was already moved (insert
+            // succeeded, delete failed last time) or it never existed.
+            // Idempotent no-op instead of erroring, so a retry after a
+            // partial failure can't loop forever.
+            if history_col
+                .find_one(doc! { "matchId": &match_id })
+                .await?
+                .is_some()
+            {
+                tracing::info!("✅ Game {} already in history (idempotent no-op)", match_id);
+                return Ok(Json(json!({
+                    "success": true,
+                    "message": format!("Game {} already moved to history", match_id),
+                    "match_id": match_id,
+                })));
+            }
+            return Err(AppError::DocumentNotFound);
+        }
+    };
 
     let match_id_clone = game.match_id.clone();
 
+    // upsert instead of insert_one -- a retry that finds the history doc
+    // already there just overwrites it instead of hitting E11000.
     history_col
-        .insert_one(HistoryGame {
-            game,
-            completed_at: BsonDateTime::from_chrono(Utc::now()),
-            moved_to_history: true,
-        })
-        .await?;
+        .replace_one(
+            doc! { "matchId": &match_id_clone },
+            HistoryGame {
+                game,
+                completed_at: BsonDateTime::from_chrono(Utc::now()),
+                moved_to_history: true,
+            },
+        )
+        .upsert(true)
+        .await
+        .map_err(|e| {
+            tracing::error!("❌ Failed to upsert history for {}: {}", match_id_clone, e);
+            e
+        })?;
 
     games_col
         .delete_one(doc! { "matchId": &match_id_clone })
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "❌ Failed to delete fixture {} after archiving: {}",
+                match_id_clone,
+                e
+            );
+            e
+        })?;
 
     tracing::info!("✅ Game {} moved to history", match_id);
 
