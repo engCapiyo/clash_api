@@ -142,6 +142,7 @@ pub struct Game {
     pub match_id: String,
 
     #[serde(rename = "threesixtyfiveGameId")]
+    #[serde(default)]
     pub threesixtyfive_game_id: Option<String>,
 
     #[serde(rename = "homeTeam")]
@@ -152,16 +153,19 @@ pub struct Game {
 
     pub league: String,
 
-    // ✅ FIXED: minutes_played moved to correct position
     #[serde(rename = "minutesPlayed")]
+    #[serde(default)]
     pub minutes_played: Option<i32>,
 
     #[serde(rename = "homeWin")]
+    #[serde(default)]
     pub home_win: Option<f64>,
 
     #[serde(rename = "awayWin")]
+    #[serde(default)]
     pub away_win: Option<f64>,
 
+    #[serde(default)]
     pub draw: Option<f64>,
 
     pub date: String,
@@ -174,12 +178,14 @@ pub struct Game {
     pub kickoff_utc: DateTime<Utc>,
 
     #[serde(rename = "homeScore")]
+    #[serde(default)]
     pub home_score: Option<i32>,
 
     #[serde(rename = "awayScore")]
+    #[serde(default)]
     pub away_score: Option<i32>,
 
-    pub status: String, // "upcoming", "soon", "live", "completed"
+    pub status: String,
 
     #[serde(rename = "isLive")]
     pub is_live: bool,
@@ -188,55 +194,61 @@ pub struct Game {
     pub available_for_voting: bool,
 
     #[serde(rename = "timeElapsed")]
+    #[serde(default)]
     pub time_elapsed: Option<f64>,
 
-    pub result: Option<String>, // "home", "away", "draw"
+    #[serde(default)]
+    pub result: Option<String>,
 
-    pub source: String, // "365scores"
+    pub source: String,
 
     #[serde(rename = "scrapedAt")]
     pub scraped_at: BsonDateTime,
 
     #[serde(rename = "lastScrapedAt")]
+    #[serde(default)]
     pub last_scraped_at: Option<BsonDateTime>,
 
     #[serde(rename = "lastPolledAt")]
+    #[serde(default)]
     pub last_polled_at: Option<BsonDateTime>,
 
-    // ========== VOTES ==========
     pub votes: i64,
     pub voters: Vec<Voter>,
 
-    // ========== COMMENTS ==========
     pub comments: i64,
-
-    // ========== COMMENTARY ==========
     pub commentary: Vec<CommentaryEntry>,
+
     #[serde(rename = "commentaryCount")]
     pub commentary_count: i64,
+
     #[serde(rename = "lastCommentaryAt")]
+    #[serde(default)]
     pub last_commentary_at: Option<BsonDateTime>,
 
-    // ========== LINEUPS (stored as document reference) ==========
+    #[serde(default)]
     pub lineups: Option<LineupsDocument>,
+
     #[serde(rename = "lineupsFetched")]
     pub lineups_fetched: bool,
+
     #[serde(rename = "lineupsFetchedAt")]
+    #[serde(default)]
     pub lineups_fetched_at: Option<BsonDateTime>,
 
-    // ========== STATISTICS (array of snapshots) ==========
     pub statistics: Vec<StatisticsSnapshot>,
 
     #[serde(rename = "lastStatisticsMinute")]
+    #[serde(default)]
     pub last_statistics_minute: Option<f64>,
 
-    // ========== EVENTS ==========
     #[serde(rename = "forwardedEventSignatures")]
     pub forwarded_event_signatures: Vec<String>,
 
-    // ========== COMPLETION ==========
     #[serde(rename = "completedAt")]
+    #[serde(default)]
     pub completed_at: Option<BsonDateTime>,
+
     #[serde(rename = "movedToHistory")]
     pub moved_to_history: bool,
 
@@ -283,7 +295,6 @@ pub struct UpdateGameScoreRequest {
     pub is_live: Option<bool>,
     #[serde(rename = "timeElapsed")]
     pub time_elapsed: Option<f64>,
-    // ✅ ADDED: minutes_played to update request
     #[serde(rename = "minutesPlayed")]
     pub minutes_played: Option<i32>,
 }
@@ -325,7 +336,6 @@ pub struct LiveGameUpdate {
     pub assist: Option<String>,
     pub team: Option<String>,
     pub timestamp: Option<DateTime<Utc>>,
-    // ✅ ADDED: minutes_played to live update
     #[serde(rename = "minutesPlayed")]
     pub minutes_played: Option<i32>,
 }
@@ -529,7 +539,7 @@ impl Game {
             home_team,
             away_team,
             league,
-            minutes_played: None, // ✅ ADDED
+            minutes_played: None,
             home_win: None,
             away_win: None,
             draw: None,

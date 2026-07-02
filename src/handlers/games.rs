@@ -147,10 +147,15 @@ pub async fn get_games(
     State(state): State<AppState>,
     Query(query): Query<GameQuery>,
 ) -> Result<Json<Vec<Game>>> {
-    tracing::info!("🔍 GET /api/games called with query: {:?}", query);
+    tracing::info!("🔍 GET /api/games called");
 
     let collection: Collection<Game> = state.db.collection("fixtures");
     let mut filter = doc! {};
+
+    // ✅ Include all non-completed games by default
+    if query.status.is_none() && query.is_live.is_none() {
+        filter.insert("status", doc! { "$ne": "completed" });
+    }
 
     if let Some(status) = &query.status {
         filter.insert("status", status);
@@ -159,9 +164,10 @@ pub async fn get_games(
         filter.insert("league", league);
     }
     if let Some(is_live) = query.is_live {
-        filter.insert("is_live", is_live);
+        filter.insert("isLive", is_live);
     }
 
+    // ✅ SKIP MALFORMED DOCUMENTS
     let mut cursor = collection.find(filter).await?;
     let mut games: Vec<Game> = Vec::new();
     let mut skipped = 0;
@@ -171,18 +177,19 @@ pub async fn get_games(
             Ok(game) => games.push(game),
             Err(e) => {
                 skipped += 1;
-                tracing::error!("⚠️ Skipping malformed fixture document: {}", e);
+                tracing::warn!("⚠️ Skipping malformed document: {}", e);
+                continue;
             }
         }
     }
 
     if skipped > 0 {
-        tracing::warn!("⚠️ Skipped {} malformed fixture document(s)", skipped);
+        tracing::warn!("⚠️ Skipped {} malformed documents", skipped);
     }
 
     games.sort_by(|a, b| b.scraped_at.cmp(&a.scraped_at));
 
-    tracing::info!("✅ Fetched {} games ({} skipped)", games.len(), skipped);
+    tracing::info!("✅ Returning {} games", games.len());
     Ok(Json(games))
 }
 
