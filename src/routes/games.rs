@@ -91,6 +91,7 @@ pub fn routes() -> Router<AppState> {
             "/:match_id/commentary/latest",
             get(games::get_latest_commentary),
         )
+        .route("/commentary/bulk", post(games::add_commentary_bulk))
         .route("/:match_id/events", get(events_handler::get_match_events))
         .route(
             "/:match_id/events/:event_type",

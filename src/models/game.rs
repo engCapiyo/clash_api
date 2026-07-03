@@ -157,6 +157,11 @@ pub struct Game {
     #[serde(default)]
     pub minutes_played: Option<i32>,
 
+    // ✅ ADDED: minuteDisplay field for Flutter
+    #[serde(rename = "minuteDisplay")]
+    #[serde(default)]
+    pub minute_display: Option<String>,
+
     #[serde(rename = "homeWin")]
     #[serde(default)]
     pub home_win: Option<f64>,
@@ -297,6 +302,9 @@ pub struct UpdateGameScoreRequest {
     pub time_elapsed: Option<f64>,
     #[serde(rename = "minutesPlayed")]
     pub minutes_played: Option<i32>,
+    // ✅ ADDED: minuteDisplay for score updates
+    #[serde(rename = "minuteDisplay")]
+    pub minute_display: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -540,6 +548,7 @@ impl Game {
             away_team,
             league,
             minutes_played: None,
+            minute_display: None, // ✅ ADDED: initialize to None
             home_win: None,
             away_win: None,
             draw: None,
