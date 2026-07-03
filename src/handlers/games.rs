@@ -4,7 +4,7 @@ use axum::{
 };
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use futures_util::TryStreamExt;
-use mongodb::bson::{doc, DateTime as BsonDateTime};
+use mongodb::bson::{doc, DateTime as BsonDateTime, Document};
 use mongodb::Collection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -19,6 +19,129 @@ use crate::models::game::{
 };
 use crate::models::notification::FCMToken;
 use crate::state::AppState;
+
+// ============================================================================
+// TOLERANT GAME FETCHING
+// ============================================================================
+//
+// `Collection<Game>::find_one` / `.find()` deserialize the ENTIRE document
+// into the typed `Game` struct. If any embedded sub-document doesn't match
+// its typed shape -- most commonly `lineups`, since that field has been
+// written directly by non-Rust code in the past (see wc26_4749268 incident,
+// 2026-07-03: a raw 365Scores payload got persisted into `lineups` instead
+// of the proper `LineupsDocument` shape) -- deserialization fails for the
+// WHOLE Game, and every handler that reads that fixture 500s, including
+// ones with nothing to do with lineups (vote counts, statistics, score
+// updates, etc).
+//
+// These helpers fetch the raw BSON document first. If typed deserialization
+// fails, they retry with the known-troublesome `lineups` field stripped, so
+// callers still get score/status/votes/etc with `lineups: None` instead of
+// a hard failure. This is a workaround for legacy/corrupted documents, not
+// a substitute for fixing the writer (see forwarder.py's clean_team()) or
+// for cleaning up the affected documents in Mongo.
+
+async fn find_game_tolerant(
+    collection: &Collection<Game>,
+    filter: Document,
+) -> Result<Option<Game>> {
+    let raw_collection: Collection<Document> = collection.clone_with_type();
+
+    let raw_doc = match raw_collection.find_one(filter).await? {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+
+    match mongodb::bson::from_document::<Game>(raw_doc.clone()) {
+        Ok(game) => Ok(Some(game)),
+        Err(e) => {
+            let match_id = raw_doc
+                .get_str("matchId")
+                .unwrap_or("<unknown>")
+                .to_string();
+            tracing::warn!(
+                "⚠️ Game document {} failed to deserialize ({}); retrying with lineups stripped",
+                match_id,
+                e
+            );
+
+            let mut stripped = raw_doc;
+            stripped.remove("lineups");
+
+            match mongodb::bson::from_document::<Game>(stripped) {
+                Ok(game) => {
+                    tracing::warn!(
+                        "⚠️ Recovered fixture {} by dropping malformed 'lineups' field -- \
+                         this document needs data cleanup in MongoDB",
+                        match_id
+                    );
+                    Ok(Some(game))
+                }
+                Err(e2) => {
+                    tracing::error!(
+                        "❌ Fixture {} still fails to deserialize after stripping lineups: {}",
+                        match_id,
+                        e2
+                    );
+                    Err(AppError::InternalServerError(format!(
+                        "Malformed fixture document {}: {}",
+                        match_id, e2
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// Same idea as `find_game_tolerant` but for multi-document queries: skips
+/// (rather than fails on) any document that still won't deserialize even
+/// after stripping `lineups`, matching the pattern `get_games` already used.
+async fn find_games_tolerant(collection: &Collection<Game>, filter: Document) -> Result<Vec<Game>> {
+    let raw_collection: Collection<Document> = collection.clone_with_type();
+    let mut cursor = raw_collection.find(filter).await?;
+
+    let mut games: Vec<Game> = Vec::new();
+    let mut skipped = 0;
+
+    while cursor.advance().await? {
+        let raw_doc = cursor.deserialize_current()?;
+        match mongodb::bson::from_document::<Game>(raw_doc.clone()) {
+            Ok(game) => games.push(game),
+            Err(e) => {
+                let match_id = raw_doc
+                    .get_str("matchId")
+                    .unwrap_or("<unknown>")
+                    .to_string();
+                let mut stripped = raw_doc;
+                stripped.remove("lineups");
+                match mongodb::bson::from_document::<Game>(stripped) {
+                    Ok(game) => {
+                        tracing::warn!(
+                            "⚠️ Recovered fixture {} by dropping malformed 'lineups' field",
+                            match_id
+                        );
+                        games.push(game);
+                    }
+                    Err(e2) => {
+                        skipped += 1;
+                        tracing::warn!(
+                            "⚠️ Skipping malformed document {}: {} (original: {})",
+                            match_id,
+                            e2,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if skipped > 0 {
+        tracing::warn!("⚠️ Skipped {} malformed documents", skipped);
+    }
+
+    Ok(games)
+}
 
 // ============================================================================
 // TEST NOTIFICATION
@@ -167,25 +290,8 @@ pub async fn get_games(
         filter.insert("isLive", is_live);
     }
 
-    // ✅ SKIP MALFORMED DOCUMENTS
-    let mut cursor = collection.find(filter).await?;
-    let mut games: Vec<Game> = Vec::new();
-    let mut skipped = 0;
-
-    while cursor.advance().await? {
-        match cursor.deserialize_current() {
-            Ok(game) => games.push(game),
-            Err(e) => {
-                skipped += 1;
-                tracing::warn!("⚠️ Skipping malformed document: {}", e);
-                continue;
-            }
-        }
-    }
-
-    if skipped > 0 {
-        tracing::warn!("⚠️ Skipped {} malformed documents", skipped);
-    }
+    // ✅ SKIP MALFORMED DOCUMENTS (tolerates a bad `lineups` field too)
+    let mut games = find_games_tolerant(&collection, filter).await?;
 
     games.sort_by(|a, b| b.scraped_at.cmp(&a.scraped_at));
 
@@ -200,7 +306,7 @@ pub async fn get_game_by_id(
     let collection: Collection<Game> = state.db.collection("fixtures");
     let filter = doc! { "_id": &id };
 
-    match collection.find_one(filter).await? {
+    match find_game_tolerant(&collection, filter).await? {
         Some(game) => Ok(Json(game)),
         None => Err(AppError::DocumentNotFound),
     }
@@ -213,7 +319,7 @@ pub async fn get_game_by_match_id(
     let collection: Collection<Game> = state.db.collection("fixtures");
     let filter = doc! { "matchId": &match_id };
 
-    match collection.find_one(filter).await? {
+    match find_game_tolerant(&collection, filter).await? {
         Some(game) => Ok(Json(game)),
         None => Err(AppError::DocumentNotFound),
     }
@@ -223,8 +329,7 @@ pub async fn get_live_games(State(state): State<AppState>) -> Result<Json<Vec<Ga
     let collection: Collection<Game> = state.db.collection("fixtures");
     let filter = doc! { "status": "live", "isLive": true };
 
-    let cursor = collection.find(filter).await?;
-    let live_games: Vec<Game> = cursor.try_collect().await?;
+    let live_games = find_games_tolerant(&collection, filter).await?;
 
     tracing::info!("✅ Fetched {} live games", live_games.len());
     Ok(Json(live_games))
@@ -234,8 +339,7 @@ pub async fn get_upcoming_games(State(state): State<AppState>) -> Result<Json<Ve
     let collection: Collection<Game> = state.db.collection("fixtures");
     let filter = doc! { "status": "upcoming" };
 
-    let cursor = collection.find(filter).await?;
-    let games: Vec<Game> = cursor.try_collect().await?;
+    let games = find_games_tolerant(&collection, filter).await?;
 
     let now = Utc::now();
     const MATCH_DURATION_MINS: i64 = 120;
@@ -338,7 +442,7 @@ pub async fn update_game_score(
     }
 
     if payload.home_score.is_some() || payload.away_score.is_some() {
-        if let Some(game) = collection.find_one(filter.clone()).await? {
+        if let Some(game) = find_game_tolerant(&collection, filter.clone()).await? {
             let channel_fixtures_col: Collection<ChannelFixture> =
                 state.db.collection("channel_fixtures");
             let mut cursor = channel_fixtures_col
@@ -378,7 +482,7 @@ pub async fn update_game_score(
         }
     }
 
-    match collection.find_one(filter).await? {
+    match find_game_tolerant(&collection, filter).await? {
         Some(game) => Ok(Json(game)),
         None => Err(AppError::DocumentNotFound),
     }
@@ -429,7 +533,7 @@ pub async fn update_game_status(
     if payload.status == "completed" {
         tracing::info!("🏁 Match {} auto-finalizing...", match_id);
 
-        if let Some(game) = collection.find_one(filter.clone()).await? {
+        if let Some(game) = find_game_tolerant(&collection, filter.clone()).await? {
             let home_score = game.home_score.unwrap_or(0);
             let away_score = game.away_score.unwrap_or(0);
 
@@ -477,7 +581,7 @@ pub async fn update_game_status(
         channel_count += 1;
     }
 
-    match collection.find_one(filter).await? {
+    match find_game_tolerant(&collection, filter).await? {
         Some(game) => Ok(Json(game)),
         None => Err(AppError::DocumentNotFound),
     }
@@ -749,8 +853,7 @@ pub async fn get_lineups(
 ) -> Result<Json<serde_json::Value>> {
     let games_col: Collection<Game> = state.db.collection("fixtures");
 
-    let game = games_col
-        .find_one(doc! { "matchId": &match_id })
+    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -769,8 +872,7 @@ pub async fn get_simplified_lineups(
 ) -> Result<Json<serde_json::Value>> {
     let games_col: Collection<Game> = state.db.collection("fixtures");
 
-    let game = games_col
-        .find_one(doc! { "matchId": &match_id })
+    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -789,8 +891,7 @@ pub async fn check_lineups_available(
 ) -> Result<Json<serde_json::Value>> {
     let games_col: Collection<Game> = state.db.collection("fixtures");
 
-    let game = games_col
-        .find_one(doc! { "matchId": &match_id })
+    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1008,8 +1109,7 @@ pub async fn get_match_statistics(
 ) -> Result<Json<serde_json::Value>> {
     let games_col: Collection<Game> = state.db.collection("fixtures");
 
-    let game = games_col
-        .find_one(doc! { "matchId": &match_id })
+    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1027,8 +1127,7 @@ pub async fn get_latest_statistics(
 ) -> Result<Json<serde_json::Value>> {
     let games_col: Collection<Game> = state.db.collection("fixtures");
 
-    let game = games_col
-        .find_one(doc! { "matchId": &match_id })
+    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1093,8 +1192,7 @@ pub async fn get_statistics_at_minute(
 ) -> Result<Json<serde_json::Value>> {
     let games_col: Collection<Game> = state.db.collection("fixtures");
 
-    let game = games_col
-        .find_one(doc! { "matchId": &match_id })
+    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1118,8 +1216,7 @@ pub async fn get_fixture_vote_count_fast(
 ) -> Result<Json<serde_json::Value>> {
     let games_collection: Collection<Game> = state.db.collection("fixtures");
 
-    let game = games_collection
-        .find_one(doc! { "matchId": &fixture_id })
+    let game = find_game_tolerant(&games_collection, doc! { "matchId": &fixture_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1137,8 +1234,7 @@ pub async fn get_fixture_comment_count_fast(
 ) -> Result<Json<serde_json::Value>> {
     let games_collection: Collection<Game> = state.db.collection("fixtures");
 
-    let game = games_collection
-        .find_one(doc! { "matchId": &fixture_id })
+    let game = find_game_tolerant(&games_collection, doc! { "matchId": &fixture_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1156,8 +1252,7 @@ pub async fn get_fixture_counts_fast(
 ) -> Result<Json<serde_json::Value>> {
     let games_collection: Collection<Game> = state.db.collection("fixtures");
 
-    let game = games_collection
-        .find_one(doc! { "matchId": &fixture_id })
+    let game = find_game_tolerant(&games_collection, doc! { "matchId": &fixture_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1179,10 +1274,7 @@ pub async fn get_batch_fixture_counts_fast(
     let mut error_count = 0;
 
     for fixture_id in fixture_ids {
-        match games_collection
-            .find_one(doc! { "matchId": &fixture_id })
-            .await
-        {
+        match find_game_tolerant(&games_collection, doc! { "matchId": &fixture_id }).await {
             Ok(Some(game)) => {
                 results.push(json!({
                     "fixture_id": fixture_id,
@@ -1224,8 +1316,7 @@ pub async fn get_fixture_voters_fast(
 ) -> Result<Json<serde_json::Value>> {
     let games_collection: Collection<Game> = state.db.collection("fixtures");
 
-    let game = games_collection
-        .find_one(doc! { "matchId": &fixture_id })
+    let game = find_game_tolerant(&games_collection, doc! { "matchId": &fixture_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1278,7 +1369,7 @@ pub async fn check_user_voted_fast(
         "voters.userId": &user_id,
     };
 
-    let game = games_collection.find_one(filter).await?;
+    let game = find_game_tolerant(&games_collection, filter).await?;
 
     let has_voted = game.is_some();
     let selection = game.and_then(|g| {
@@ -1386,8 +1477,7 @@ pub async fn get_latest_commentary(
     let limit = params.limit.unwrap_or(20);
     let collection: Collection<Game> = state.db.collection("fixtures");
 
-    let game = collection
-        .find_one(doc! { "matchId": &match_id })
+    let game = find_game_tolerant(&collection, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1437,9 +1527,11 @@ pub async fn move_completed_to_history(
     let games_col: Collection<Game> = state.db.collection("fixtures");
     let history_col: Collection<HistoryGame> = state.db.collection("games_history");
 
-    let game_opt = games_col
-        .find_one(doc! { "matchId": &match_id, "status": "completed" })
-        .await?;
+    let game_opt = find_game_tolerant(
+        &games_col,
+        doc! { "matchId": &match_id, "status": "completed" },
+    )
+    .await?;
 
     let game = match game_opt {
         Some(g) => g,
@@ -1595,14 +1687,14 @@ pub async fn cleanup_stale_completed_games(
     let history_col: Collection<HistoryGame> = state.db.collection("games_history");
 
     let one_hour_ago = BsonDateTime::from_chrono(Utc::now() - chrono::Duration::hours(1));
-    let stale_games: Vec<Game> = games_col
-        .find(doc! {
+    let stale_games = find_games_tolerant(
+        &games_col,
+        doc! {
             "status": "completed",
             "scrapedAt": { "$lt": one_hour_ago }
-        })
-        .await?
-        .try_collect()
-        .await?;
+        },
+    )
+    .await?;
 
     let mut moved_count = 0;
     for game in stale_games {
