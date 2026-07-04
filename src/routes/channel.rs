@@ -23,11 +23,11 @@ use crate::handlers::channel::{
     get_channel_handler,
     get_channel_invite_code_handler,
     get_channel_leaderboard_handler,
+    get_channel_votes_handler,
     get_fixture_comment_count_handler,
     get_fixture_latest_comment_handler,
     get_fixture_likes_handler,
     get_fixture_pledgers_handler,
-    get_fixture_vote_count_handler,
     get_invite_channel_handler,
     get_messages_handler,
     get_pending_requests_handler,
@@ -82,13 +82,13 @@ pub fn channel_routes() -> Router<AppState> {
             post(compute_all_admin_payouts_handler).get(compute_all_admin_payouts_handler),
         )
         .route(
+            "/:channel_id/fixtures/:fixture_id/votes",
+            get(get_channel_votes_handler),
+        )
+        .route(
             "/admin-reward/compute-all",
             post(compute_all_admin_reward_scores_handler)
                 .get(compute_all_admin_reward_scores_handler),
-        )
-        .route(
-            "/:channel_id/fixtures/:fixture_id/votes/count",
-            get(get_fixture_vote_count_handler),
         )
         .route(
             "/:channel_id/invite-code",

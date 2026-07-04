@@ -8,6 +8,7 @@ use bson::{doc, oid::ObjectId, Bson, DateTime};
 use futures_util::StreamExt;
 use mongodb::Collection;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::models::game::Game;
@@ -2206,68 +2207,59 @@ pub async fn get_channel_invite_code_handler(
 // ============================================================================
 // GET CHANNEL VOTE COUNT (Same pattern as pledges and bets - reads from fixtures)
 // ============================================================================
-pub async fn get_fixture_vote_count_handler(
+pub async fn get_channel_votes_handler(
     State(state): State<AppState>,
     Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+) -> Result<Json<serde_json::Value>> {
+    let votes_col: Collection<Vote> = state.db.collection("votes");
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    // 1. Get channel members (same as pledges and bets)
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await
         .map_err(|e| AppError::MongoDB(e))?
         .ok_or(AppError::DocumentNotFound)?;
 
-    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
-
-    // 2. Get fixture to get vote count from fixtures collection
-    let game = games_col
-        .find_one(doc! { "match_id": &fixture_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    // 3. Get vote breakdown from votes collection (filtered by channel members)
-    let votes_col: Collection<Vote> = state.db.collection("votes");
+    // Build a map of user_id -> username from channel members
+    let member_map: HashMap<String, String> = channel
+        .members
+        .iter()
+        .map(|m| (m.user_id.clone(), m.username.clone()))
+        .collect();
 
     let mut cursor = votes_col
         .find(doc! { "fixture_id": &fixture_id })
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    let mut home_votes = 0;
-    let mut away_votes = 0;
-    let mut draw_votes = 0;
-
+    let mut channel_votes = Vec::new();
     while let Some(vote) = cursor.next().await {
         let vote: Vote = vote.map_err(|e| AppError::MongoDB(e))?;
-        // ✅ Only count votes from channel members (same as pledges and bets)
-        if member_ids.contains(&vote.user_id) {
-            match vote.selection.as_str() {
-                "home" => home_votes += 1,
-                "away" => away_votes += 1,
-                "draw" => draw_votes += 1,
-                _ => {}
-            }
+
+        // ✅ Only include votes from channel members
+        if let Some(username) = member_map.get(&vote.user_id) {
+            channel_votes.push(json!({
+                "user_id": vote.user_id,
+                "user_name": username,  // ✅ Now we have username
+                "selection": vote.selection,
+                "voted_at": vote.voted_at,
+                "is_correct": vote.is_correct,
+                "points_awarded": vote.points_awarded,
+            }));
         }
     }
 
-    let total_votes = home_votes + away_votes + draw_votes;
+    let vote_count = channel_votes.len();
 
     Ok(Json(json!({
         "success": true,
         "fixture_id": fixture_id,
         "channel_id": channel_id,
-        "home_votes": home_votes,
-        "away_votes": away_votes,
-        "draw_votes": draw_votes,
-        "total_votes": total_votes,
-        "vote_count": total_votes,  // ✅ Same field name as pledges/bets
+        "votes": channel_votes,
+        "count": vote_count,
+        "vote_count": vote_count,
     })))
 }
-
 // ============================================================================
 // FIXTURE LATEST COMMENT
 // ============================================================================
