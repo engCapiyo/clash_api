@@ -1,3 +1,4 @@
+use crate::errors::{AppError, Result};
 use crate::models::channel::{Channel, ChannelFixture, Message, ReplyToData, Vote};
 use crate::models::user::User;
 use axum::{
@@ -15,6 +16,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing;
+use uuid::Uuid;
 
 use crate::state::AppState;
 
@@ -282,7 +284,6 @@ async fn handle_incoming_message(
 
             let mut current = current_room.lock().await;
             if *current == new_room_key {
-                // Already in this room — just ack, no forwarder swap needed.
                 let ack = serde_json::json!({
                     "type": "room.joined",
                     "payload": { "room_id": new_room_key },
@@ -368,6 +369,9 @@ async fn handle_incoming_message(
                 user_id
             );
 
+            // ============================================================
+            // ✅ SAVE MESSAGE AND INCREMENT COMMENT COUNT
+            // ============================================================
             match save_message_to_database(
                 state,
                 &channel_id,
@@ -385,16 +389,18 @@ async fn handle_incoming_message(
                 }
             }
 
+            // ============================================================
+            // ✅ BROADCAST COMMENT COUNT UPDATE
+            // ============================================================
             let room_key = match &fixture_id {
                 Some(f) => format!("{}_{}", channel_id, f),
                 None => format!("{}_overall", channel_id),
             };
 
             let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+            let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
             if let Some(fixture_id) = &fixture_id {
-                let channel_fixtures_col =
-                    state.db.collection::<ChannelFixture>("channel_fixtures");
                 if let Ok(Some(cf)) = channel_fixtures_col
                     .find_one(doc! {
                         "channel_id": &channel_id,
@@ -406,16 +412,22 @@ async fn handle_incoming_message(
                         "type": "comment.count",
                         "payload": {
                             "fixture_id": fixture_id,
+                            "channel_id": &channel_id,
                             "count": cf.comment_count,
                         },
                         "timestamp": Utc::now().to_rfc3339(),
                     });
+
                     if let Ok(count_json) = serde_json::to_string(&count_msg) {
                         let _ = room_broadcaster.send(count_json);
+                        tracing::info!("📡 Broadcasted comment.count to room: {}", room_key);
                     }
                 }
             }
 
+            // ============================================================
+            // ✅ BROADCAST THE ACTUAL MESSAGE
+            // ============================================================
             let broadcast_msg = serde_json::json!({
                 "type": "chat.message",
                 "payload": payload,
@@ -425,7 +437,7 @@ async fn handle_incoming_message(
             match serde_json::to_string(&broadcast_msg) {
                 Ok(broadcast_json) => {
                     let _ = room_broadcaster.send(broadcast_json);
-                    tracing::info!("📡 Broadcasted to room: {}", room_key);
+                    tracing::info!("📡 Broadcasted chat.message to room: {}", room_key);
                 }
                 Err(e) => tracing::error!("❌ Serialize FAILED: {}", e),
             }
@@ -466,8 +478,6 @@ async fn handle_incoming_message(
         }
 
         Some("ping") => {
-            // Reply directly to this connection only — pings must never be
-            // broadcast to the whole room.
             let pong = serde_json::json!({
                 "type": "pong",
                 "timestamp": Utc::now().to_rfc3339(),
@@ -605,29 +615,28 @@ async fn save_message_to_database(
     fixture_id: &Option<String>,
     user_id: &str,
     username: &str,
-    payload: &Value,
-) -> Result<(), String> {
+    payload: &serde_json::Value,
+) -> Result<()> {
     let messages_col = state.db.collection::<Message>("messages");
-    let channels_col = state.db.collection::<Channel>("channels");
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+    let channels_col = state.db.collection::<Channel>("channels");
 
-    let now = BsonDateTime::now();
+    // ✅ FIX: Create a String, not a temporary &str
+    let message_id = payload
+        .get("messageId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("msg_{}", Uuid::new_v4()));
 
-    let message_text = payload
+    let text = payload
         .get("message")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
-    let message_id = payload
-        .get("messageId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
     let selection = payload
         .get("selection")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
     let image_url = payload
@@ -650,28 +659,53 @@ async fn save_message_to_database(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let reply_to: Option<ReplyToData> = payload
+    let reply_to = payload
         .get("replyTo")
-        .and_then(|v| if v.is_null() { None } else { Some(v) })
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            let message_id = obj
+                .get("messageId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let text = obj
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let username = obj
+                .get("username")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let selection = obj
+                .get("selection")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let is_me = obj.get("isMe").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    // ✅ FIX: final_fixture_id is already None for general chat
-    // This ensures the field is omitted from the document
-    let final_fixture_id = fixture_id
-        .as_ref()
-        .filter(|f| !f.is_empty())
-        .map(|f| f.to_string());
+            ReplyToData {
+                message_id,
+                text,
+                username,
+                selection,
+                is_me,
+            }
+        });
+
+    let now = chrono::Utc::now();
+    let now_bson = bson::DateTime::from_chrono(now);
 
     let message = Message {
         id: None,
         channel_id: channel_id.to_string(),
-        fixture_id: final_fixture_id, // ✅ None for general chat - field is omitted
+        fixture_id: fixture_id.clone(),
         sender_id: user_id.to_string(),
         sender_name: username.to_string(),
-        text: message_text.clone(),
-        sent_at: now,
-        message_id: message_id.clone(),
-        selection: selection.clone(),
+        text,
+        sent_at: now_bson,
+        message_id: Some(message_id), // ✅ Now message_id is String
+        selection,
         image_url,
         video_url,
         is_image,
@@ -679,88 +713,75 @@ async fn save_message_to_database(
         reply_to,
     };
 
-    // 1. Insert message
-    messages_col
-        .insert_one(&message)
-        .await
-        .map_err(|e| format!("Failed to insert message: {}", e))?;
+    // Save the message
+    messages_col.insert_one(&message).await?;
 
-    // 2. Update channel activity
+    // ============================================================
+    // ✅ INCREMENT COMMENT COUNT IN CHANNEL_FIXTURES
+    // ============================================================
+    if let Some(fixture_id) = fixture_id {
+        let update_result = channel_fixtures_col
+            .update_one(
+                doc! {
+                    "channel_id": channel_id,
+                    "fixture_id": fixture_id,
+                },
+                doc! { "$inc": { "comment_count": 1 } },
+            )
+            .await;
+
+        match update_result {
+            Ok(result) => {
+                if result.modified_count > 0 {
+                    tracing::info!("📊 Incremented comment_count for fixture {}", fixture_id);
+                } else {
+                    tracing::warn!(
+                        "⚠️ No channel_fixture found for channel {} fixture {}",
+                        channel_id,
+                        fixture_id
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!("❌ Failed to increment comment_count: {}", e);
+            }
+        }
+    }
+
+    // ============================================================
+    // ✅ UPDATE CHANNEL ACTIVITY
+    // ============================================================
+    let now_chrono = chrono::Utc::now();
+
+    // Update channel activity
     channels_col
         .update_one(
             doc! { "channel_id": channel_id },
             doc! {
                 "$inc": {
                     "activity.total_messages": 1,
-                    "activity.messages_this_week": 1
+                    "activity.messages_this_week": 1,
                 },
-                "$set": { "activity.last_message_at": now }
+                "$set": {
+                    "activity.last_message_at": bson::DateTime::from_chrono(now_chrono),
+                },
             },
         )
-        .await
-        .map_err(|e| format!("Failed to update channel activity: {}", e))?;
+        .await?;
 
-    // 3. Update member's message count AND last_active_at
+    // Update member's msg_count and last_active_at
     channels_col
         .update_one(
             doc! {
                 "channel_id": channel_id,
-                "members.user_id": user_id
+                "members.user_id": user_id,
             },
             doc! {
                 "$inc": { "members.$.msg_count": 1 },
-                "$set": { "members.$.last_active_at": now },
+                "$set": { "members.$.last_active_at": bson::DateTime::from_chrono(now_chrono) },
             },
         )
-        .await
-        .map_err(|e| format!("Failed to update member msg_count: {}", e))?;
-
-    // 4. UPDATE CHANNEL FIXTURE with comment_count and unread_counts
-    if let Some(fixture_id) = fixture_id {
-        if !fixture_id.is_empty() {
-            let channel = channels_col
-                .find_one(doc! { "channel_id": channel_id })
-                .await
-                .map_err(|e| format!("Failed to get channel: {}", e))?;
-
-            if let Some(channel) = channel {
-                let mut inc_doc = doc! {
-                    "comment_count": 1,
-                };
-
-                for member in &channel.members {
-                    if member.user_id != user_id {
-                        inc_doc.insert(format!("unread_counts.{}", member.user_id), 1);
-                    }
-                }
-
-                channel_fixtures_col
-                    .update_one(
-                        doc! {
-                            "channel_id": channel_id,
-                            "fixture_id": fixture_id,
-                        },
-                        doc! {
-                            "$inc": inc_doc,
-                            "$set": {
-                                "last_message": &message_text,
-                                "last_message_at": now,
-                                "last_sender": username,
-                            }
-                        },
-                    )
-                    .await
-                    .map_err(|e| format!("Failed to update channel fixture: {}", e))?;
-            }
-        }
-    }
-
-    tracing::info!(
-        "✅ Message saved — user: {}, channel: {}, fixture: {:?}",
-        user_id,
-        channel_id,
-        fixture_id
-    );
+        .await?;
 
     Ok(())
 }
