@@ -101,13 +101,10 @@ async fn handle_socket(
     username: String,
     state: AppState,
 ) {
-    let room_key = match &fixture_id {
+    let initial_room_key = match &fixture_id {
         Some(f) => format!("{}_{}", channel_id, f),
         None => format!("{}_overall", channel_id),
     };
-
-    let tx = state.get_or_create_broadcaster(&room_key);
-    let mut rx = tx.subscribe();
 
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(Mutex::new(sender));
@@ -116,6 +113,7 @@ async fn handle_socket(
         "type": "connected",
         "channel_id": channel_id,
         "fixture_id": fixture_id,
+        "room_id": initial_room_key,
         "timestamp": Utc::now().to_rfc3339(),
     });
 
@@ -130,34 +128,40 @@ async fn handle_socket(
         }
     }
 
-    tracing::info!("✅ WS connected: user {} to room {}", user_id, room_key);
+    tracing::info!(
+        "✅ WS connected: user {} to room {}",
+        user_id,
+        initial_room_key
+    );
+
+    // Tracks which room this connection is currently forwarding broadcasts
+    // from, and the handle of the task doing that forwarding — so a
+    // `room.join` message can swap it out without touching the socket.
+    let current_room: Arc<Mutex<String>> = Arc::new(Mutex::new(initial_room_key.clone()));
+    let forwarder: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+
+    let initial_handle = spawn_room_forwarder(&state, &initial_room_key, sender.clone());
+    *forwarder.lock().await = Some(initial_handle);
 
     let sender_clone = sender.clone();
     let state_clone = state.clone();
-    let tx_clone = tx.clone();
-
-    let mut send_task = tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(msg) => {
-                    let mut guard = sender.lock().await;
-                    if guard.send(WsMessage::Text(msg)).await.is_err() {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("WS client lagged {} messages", n);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    let current_room_clone = current_room.clone();
+    let forwarder_clone = forwarder.clone();
+    let user_id_clone = user_id.clone();
 
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             match msg {
                 WsMessage::Text(text) => {
-                    handle_incoming_message(text, &state_clone, &tx_clone).await;
+                    handle_incoming_message(
+                        text,
+                        &state_clone,
+                        &sender_clone,
+                        &current_room_clone,
+                        &forwarder_clone,
+                        &user_id_clone,
+                    )
+                    .await;
                 }
                 WsMessage::Close(_) => break,
                 WsMessage::Ping(_) => {
@@ -175,16 +179,51 @@ async fn handle_socket(
         }
     });
 
-    tokio::select! {
-        _ = &mut send_task => recv_task.abort(),
-        _ = &mut recv_task => send_task.abort(),
+    // The connection lives until the client closes it or the recv loop
+    // errors out. The forwarder task is swapped per-room but is not what
+    // keeps the connection alive, so we only need to await recv_task here.
+    let _ = &mut recv_task;
+    recv_task.await.ok();
+
+    if let Some(handle) = forwarder.lock().await.take() {
+        handle.abort();
     }
 
     tracing::info!(
         "🔌 WS disconnected: user {} from room {}",
         user_id,
-        room_key
+        current_room.lock().await
     );
+}
+
+// ============================================================================
+// ROOM FORWARDER — pipes one room's broadcast messages to this client
+// ============================================================================
+
+fn spawn_room_forwarder(
+    state: &AppState,
+    room_key: &str,
+    sender: Arc<Mutex<futures_util::stream::SplitSink<WebSocket, WsMessage>>>,
+) -> tokio::task::JoinHandle<()> {
+    let tx = state.get_or_create_broadcaster(room_key);
+    let mut rx = tx.subscribe();
+
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(msg) => {
+                    let mut guard = sender.lock().await;
+                    if guard.send(WsMessage::Text(msg)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("WS client lagged {} messages", n);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 // ============================================================================
@@ -194,7 +233,10 @@ async fn handle_socket(
 async fn handle_incoming_message(
     text: String,
     state: &AppState,
-    _broadcaster: &tokio::sync::broadcast::Sender<String>,
+    sender: &Arc<Mutex<futures_util::stream::SplitSink<WebSocket, WsMessage>>>,
+    current_room: &Arc<Mutex<String>>,
+    forwarder: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    connection_user_id: &str,
 ) {
     tracing::info!("🔥 RAW WS MESSAGE: {}", text);
 
@@ -209,6 +251,77 @@ async fn handle_incoming_message(
     let message_type = json_msg.get("type").and_then(|t| t.as_str());
 
     match message_type {
+        Some("room.join") => {
+            let payload = match json_msg.get("payload") {
+                Some(p) => p,
+                None => {
+                    tracing::error!("❌ room.join missing payload");
+                    return;
+                }
+            };
+
+            let new_channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let new_fixture_id = payload
+                .get("fixture_id")
+                .and_then(|v| if v.is_null() { None } else { v.as_str() })
+                .filter(|s| !s.is_empty());
+
+            if new_channel_id.is_empty() {
+                tracing::error!("❌ room.join missing channel_id");
+                return;
+            }
+
+            let new_room_key = match new_fixture_id {
+                Some(f) => format!("{}_{}", new_channel_id, f),
+                None => format!("{}_overall", new_channel_id),
+            };
+
+            let mut current = current_room.lock().await;
+            if *current == new_room_key {
+                // Already in this room — just ack, no forwarder swap needed.
+                let ack = serde_json::json!({
+                    "type": "room.joined",
+                    "payload": { "room_id": new_room_key },
+                    "timestamp": Utc::now().to_rfc3339(),
+                });
+                if let Ok(ack_json) = serde_json::to_string(&ack) {
+                    let mut guard = sender.lock().await;
+                    let _ = guard.send(WsMessage::Text(ack_json)).await;
+                }
+                return;
+            }
+
+            tracing::info!(
+                "🔀 User {} switching room: {} → {}",
+                connection_user_id,
+                current,
+                new_room_key
+            );
+
+            if let Some(old_handle) = forwarder.lock().await.take() {
+                old_handle.abort();
+            }
+
+            let new_handle = spawn_room_forwarder(state, &new_room_key, sender.clone());
+            *forwarder.lock().await = Some(new_handle);
+            *current = new_room_key.clone();
+            drop(current);
+
+            let ack = serde_json::json!({
+                "type": "room.joined",
+                "payload": { "room_id": new_room_key },
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+            if let Ok(ack_json) = serde_json::to_string(&ack) {
+                let mut guard = sender.lock().await;
+                let _ = guard.send(WsMessage::Text(ack_json)).await;
+            }
+        }
+
         Some("chat.message") => {
             tracing::info!("✅ Matched chat.message");
 
@@ -225,7 +338,6 @@ async fn handle_incoming_message(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            // ✅ FIX: Handle null and empty fixtureId properly
             let fixture_id = payload
                 .get("fixtureId")
                 .and_then(|v| if v.is_null() { None } else { v.as_str() })
@@ -326,7 +438,6 @@ async fn handle_incoming_message(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                // ✅ FIX: Handle null and empty fixtureId properly
                 let fixture_id = payload
                     .get("fixtureId")
                     .and_then(|v| if v.is_null() { None } else { v.as_str() })
@@ -355,12 +466,15 @@ async fn handle_incoming_message(
         }
 
         Some("ping") => {
+            // Reply directly to this connection only — pings must never be
+            // broadcast to the whole room.
             let pong = serde_json::json!({
                 "type": "pong",
                 "timestamp": Utc::now().to_rfc3339(),
             });
             if let Ok(pong_json) = serde_json::to_string(&pong) {
-                let _ = _broadcaster.send(pong_json);
+                let mut guard = sender.lock().await;
+                let _ = guard.send(WsMessage::Text(pong_json)).await;
             }
         }
 
@@ -393,13 +507,6 @@ async fn handle_incoming_message(
                     return;
                 }
 
-                tracing::info!(
-                    "📨 User {} wants to join channel {} ({})",
-                    username,
-                    channel_name,
-                    channel_id
-                );
-
                 let channels_col = state.db.collection::<Channel>("channels");
 
                 match channels_col
@@ -413,15 +520,6 @@ async fn handle_incoming_message(
                             .filter(|m| m.role == "admin")
                             .map(|m| m.user_id.clone())
                             .collect();
-
-                        if admin_user_ids.is_empty() {
-                            tracing::warn!("⚠️ No admins found for channel {}", channel_name);
-                        } else {
-                            tracing::info!(
-                                "📨 Sending real-time notification to {} admins",
-                                admin_user_ids.len()
-                            );
-                        }
 
                         for admin_id in &admin_user_ids {
                             let admin_room = format!("user_{}", admin_id);
@@ -440,15 +538,7 @@ async fn handle_incoming_message(
                             });
 
                             if let Ok(json) = serde_json::to_string(&notification) {
-                                if let Err(e) = admin_tx.send(json) {
-                                    tracing::error!(
-                                        "❌ Failed to send to admin {}: {}",
-                                        admin_id,
-                                        e
-                                    );
-                                } else {
-                                    tracing::info!("📨 Sent join request to admin {}", admin_id);
-                                }
+                                let _ = admin_tx.send(json);
                             }
                         }
 
@@ -481,14 +571,9 @@ async fn handle_incoming_message(
                         });
 
                         if let Ok(json) = serde_json::to_string(&confirmation) {
-                            let _ = _broadcaster.send(json);
+                            let mut guard = sender.lock().await;
+                            let _ = guard.send(WsMessage::Text(json)).await;
                         }
-
-                        tracing::info!(
-                            "✅ Join request notification sent for {} to {} admins",
-                            channel_name,
-                            admin_user_ids.len()
-                        );
                     }
                     Ok(None) => {
                         tracing::error!("❌ Channel not found: {}", channel_id);
@@ -505,6 +590,10 @@ async fn handle_incoming_message(
         }
     }
 }
+
+// ============================================================================
+// PER-CONNECTION LOGIC
+// ============================================================================
 
 // ============================================================================
 // SAVE MESSAGE TO DATABASE - FIXED
