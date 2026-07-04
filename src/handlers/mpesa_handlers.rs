@@ -629,6 +629,8 @@ pub struct B2CPaymentRequest {
     pub amount: String,
     pub remarks: String,
     pub occasion: Option<String>,
+    pub user_id: Option<String>,    // ✅ Add this
+    pub channel_id: Option<String>, // ✅ Add this for channel balance
 }
 
 pub async fn initiate_b2c_payment(
@@ -640,6 +642,7 @@ pub async fn initiate_b2c_payment(
         request.phone_number, request.amount
     );
 
+    // 1. Validate input
     if request.phone_number.is_empty() || request.amount.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -657,9 +660,88 @@ pub async fn initiate_b2c_payment(
         }
     };
 
+    // 2. GET USER BY PHONE NUMBER
+    let users: Collection<User> = state.db.collection("users");
+    let normalized = normalize_phone(&request.phone_number);
+
+    // Try multiple phone formats for flexibility
+    let phone_filters = vec![
+        doc! { "phone": &request.phone_number },
+        doc! { "phone": format!("254{}", normalized) },
+        doc! { "phone": format!("0{}", normalized) },
+        doc! { "phone": { "$regex": format!("{}$", normalized) } },
+    ];
+
+    let mut user = None;
+    for filter in phone_filters {
+        if let Ok(Some(u)) = users.find_one(filter).await {
+            user = Some(u);
+            break;
+        }
+    }
+
+    let user = match user {
+        Some(u) => u,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                AxumJson(
+                    json!({ "success": false, "error": "User not found with this phone number" }),
+                ),
+            ));
+        }
+    };
+
+    // 3. CHECK IF USER HAS SUFFICIENT BALANCE
+    let current_balance = user.balance;
+    if current_balance < amount {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            AxumJson(json!({
+                "success": false,
+                "error": format!("Insufficient balance. You have KES {:.2}, requested KES {:.2}", current_balance, amount)
+            })),
+        ));
+    }
+
+    // 4. DEDUCT FROM USER BALANCE (atomic update)
+    let now_bson = BsonDateTime::now();
+    let user_id = user.id.clone().unwrap();
+    let update = doc! {
+        "$inc": { "balance": -amount },
+        "$set": { "updated_at": now_bson }
+    };
+
+    match users.update_one(doc! { "_id": user_id }, update).await {
+        Ok(result) => {
+            if result.matched_count == 0 {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    AxumJson(json!({ "success": false, "error": "Failed to deduct balance" })),
+                ));
+            }
+            println!("✅ User balance deducted: KES {:.2}", amount);
+            println!("   New balance: KES {:.2}", current_balance - amount);
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                AxumJson(json!({ "success": false, "error": format!("Update failed: {}", e) })),
+            ));
+        }
+    }
+
+    // 5. SEND B2C PAYMENT
     let mpesa_service = match &state.mpesa_service {
         Some(s) => s,
         None => {
+            // ROLLBACK: Re-add the deducted amount
+            let rollback = doc! {
+                "$inc": { "balance": amount },
+                "$set": { "updated_at":BsonDateTime::now() }
+            };
+            let _ = users.update_one(doc! { "_id": user_id }, rollback).await;
+
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 AxumJson(json!({ "success": false, "error": "M-Pesa service is not available" })),
@@ -680,19 +762,83 @@ pub async fn initiate_b2c_payment(
     {
         Ok(r) => r,
         Err(e) => {
+            // ROLLBACK: Re-add the deducted amount if B2C fails
+            let rollback = doc! {
+                "$inc": { "balance": amount },
+                "$set": { "updated_at": BsonDateTime::now() }
+            };
+            let _ = users.update_one(doc! { "_id": user_id }, rollback).await;
+
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                AxumJson(json!({ "success": false, "error": e.to_string() })),
+                AxumJson(json!({
+                    "success": false,
+                    "error": format!("M-Pesa error: {}", e)
+                })),
             ));
         }
     };
 
+    // 6. CHECK IF B2C WAS SUCCESSFUL
+    if response.response_code != "0" {
+        // ROLLBACK: Re-add the deducted amount
+        let rollback = doc! {
+            "$inc": { "balance": amount },
+            "$set": { "updated_at": BsonDateTime::now() }
+        };
+        let _ = users.update_one(doc! { "_id": user_id }, rollback).await;
+
+        return Err((
+            StatusCode::BAD_REQUEST,
+            AxumJson(json!({
+                "success": false,
+                "error": format!("M-Pesa declined: {}", response.response_description)
+            })),
+        ));
+    }
+
+    // 7. CREATE TRANSACTION RECORD
+    let now = now_str();
+    let transaction = Transaction {
+        id: None,
+        user_id: user.id.clone().unwrap().to_string(),
+        phone_number: request.phone_number.clone(),
+        amount: -amount, // Negative for withdrawal
+        merchant_request_id: response.originator_conversation_id.clone(),
+        checkout_request_id: response.conversation_id.clone(),
+        response_code: response.response_code.clone(),
+        response_description: response.response_description.clone(),
+        customer_message: "Withdrawal initiated successfully".to_string(),
+        status: "completed".to_string(), // B2C is immediate
+        result_code: Some(0),
+        result_desc: Some("Payment sent successfully".to_string()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        completed_at: Some(now.clone()),
+    };
+
+    let transactions: Collection<Transaction> = state.db.collection("transactions");
+    if let Err(e) = transactions.insert_one(&transaction).await {
+        error!("Failed to save transaction: {}", e);
+        // Don't rollback here since B2C already succeeded
+    }
+
+    // 8. Return success with updated balance
+    let new_balance = current_balance - amount;
     println!("✅ [B2C] Payment initiated successfully");
+    println!("   Conversation ID: {}", response.conversation_id);
+    println!("   New balance: KES {:.2}", new_balance);
+
     Ok(AxumJson(json!({
         "success": true,
         "conversation_id": response.conversation_id,
         "originator_conversation_id": response.originator_conversation_id,
         "response_code": response.response_code,
         "response_description": response.response_description,
+        "amount": amount,
+        "previous_balance": current_balance,
+        "new_balance": new_balance,
+        "user_id": user.id.unwrap().to_string(),
     })))
 }
+// Helper function to normalize phone numbers
