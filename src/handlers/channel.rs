@@ -2203,48 +2203,69 @@ pub async fn get_channel_invite_code_handler(
 // FIXTURE VOTE COUNT
 // ============================================================================
 
+// ============================================================================
+// GET CHANNEL VOTE COUNT (Same pattern as pledges and bets - reads from fixtures)
+// ============================================================================
 pub async fn get_fixture_vote_count_handler(
-    Path((channel_id, fixture_id)): Path<(String, String)>,
     State(state): State<AppState>,
-) -> impl IntoResponse {
-    let collection = state.db.collection::<ChannelFixture>("channel_fixtures");
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    let filter = doc! {
-        "channel_id": &channel_id,
-        "fixture_id": &fixture_id
-    };
+    // 1. Get channel members (same as pledges and bets)
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
 
-    match collection.find_one(filter).await {
-        Ok(Some(channel_fixture)) => {
-            let vote_counts = channel_fixture.vote_counts;
+    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
 
-            Json(json!({
-                "success": true,
-                "fixture_id": fixture_id,
-                "channel_id": channel_id,
-                "home_votes": vote_counts.home,
-                "away_votes": vote_counts.away,
-                "draw_votes": vote_counts.draw,
-                "total_votes": vote_counts.home + vote_counts.away + vote_counts.draw
-            }))
+    // 2. Get fixture to get vote count from fixtures collection
+    let game = games_col
+        .find_one(doc! { "match_id": &fixture_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    // 3. Get vote breakdown from votes collection (filtered by channel members)
+    let votes_col: Collection<Vote> = state.db.collection("votes");
+
+    let mut cursor = votes_col
+        .find(doc! { "fixture_id": &fixture_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut home_votes = 0;
+    let mut away_votes = 0;
+    let mut draw_votes = 0;
+
+    while let Some(vote) = cursor.next().await {
+        let vote: Vote = vote.map_err(|e| AppError::MongoDB(e))?;
+        // ✅ Only count votes from channel members (same as pledges and bets)
+        if member_ids.contains(&vote.user_id) {
+            match vote.selection.as_str() {
+                "home" => home_votes += 1,
+                "away" => away_votes += 1,
+                "draw" => draw_votes += 1,
+                _ => {}
+            }
         }
-        Ok(None) => Json(json!({
-            "success": false,
-            "message": "Fixture not found in this channel",
-            "home_votes": 0,
-            "away_votes": 0,
-            "draw_votes": 0,
-            "total_votes": 0
-        })),
-        Err(e) => Json(json!({
-            "success": false,
-            "message": format!("Database error: {}", e),
-            "home_votes": 0,
-            "away_votes": 0,
-            "draw_votes": 0,
-            "total_votes": 0
-        })),
     }
+
+    let total_votes = home_votes + away_votes + draw_votes;
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "channel_id": channel_id,
+        "home_votes": home_votes,
+        "away_votes": away_votes,
+        "draw_votes": draw_votes,
+        "total_votes": total_votes,
+        "vote_count": total_votes,  // ✅ Same field name as pledges/bets
+    })))
 }
 
 // ============================================================================

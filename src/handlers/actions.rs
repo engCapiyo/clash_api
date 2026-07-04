@@ -1045,3 +1045,55 @@ pub async fn get_vote_breakdown_handler(
         "total": home + away + draw,
     })))
 }
+// ============================================================================
+// 16. GET CHANNEL VOTES (Same pattern as pledges and bets)
+// ============================================================================
+pub async fn get_channel_votes_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let votes_col: Collection<Vote> = state.db.collection("votes");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    // Get channel members
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
+
+    // Get ALL votes for this fixture
+    let mut cursor = votes_col
+        .find(doc! { "fixture_id": &fixture_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut channel_votes = Vec::new();
+    while let Some(vote) = cursor.next().await {
+        let vote: Vote = vote.map_err(|e| AppError::MongoDB(e))?;
+        // ✅ Only include votes from channel members (same as pledges and bets)
+        if member_ids.contains(&vote.user_id) {
+            channel_votes.push(json!({
+                "user_id": vote.user_id,
+                "user_name": vote.user_name,
+                "selection": vote.selection,
+                "voted_at": vote.voted_at,
+                "is_correct": vote.is_correct,
+                "points_awarded": vote.points_awarded,
+            }));
+        }
+    }
+
+    let vote_count = channel_votes.len();
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "channel_id": channel_id,
+        "votes": channel_votes,
+        "count": vote_count,
+        "vote_count": vote_count,
+    })))
+}
