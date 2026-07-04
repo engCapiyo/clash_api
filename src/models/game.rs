@@ -131,6 +131,37 @@ pub struct LineupsDocument {
 }
 
 // ============================================================================
+// FLEXIBLE NUMBER DESERIALIZATION
+// Some legacy/malformed documents in Mongo have score fields stored as
+// doubles (e.g. 3.0) instead of int32, which causes strict i32 deserialize
+// to fail with "invalid type: floating point `3.0`, expected i32".
+// This lets us tolerate + coerce those without needing to patch the DB.
+// ============================================================================
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum FlexibleInt {
+    Int(i32),
+    Float(f64),
+}
+
+impl FlexibleInt {
+    fn into_i32(self) -> i32 {
+        match self {
+            FlexibleInt::Int(i) => i,
+            FlexibleInt::Float(f) => f.round() as i32,
+        }
+    }
+}
+
+fn deserialize_flexible_opt_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<FlexibleInt>::deserialize(deserializer)?;
+    Ok(opt.map(FlexibleInt::into_i32))
+}
+
+// ============================================================================
 // MAIN GAME MODEL - MATCHES PYTHON SCRAPER AND FLUTTER
 // ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,12 +213,15 @@ pub struct Game {
     #[serde(rename = "kickoffUtc")]
     pub kickoff_utc: DateTime<Utc>,
 
+    // 🔧 FIXED: tolerate legacy documents where score was stored as a double
     #[serde(rename = "homeScore")]
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_flexible_opt_i32")]
     pub home_score: Option<i32>,
 
     #[serde(rename = "awayScore")]
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_flexible_opt_i32")]
     pub away_score: Option<i32>,
 
     pub status: String,
