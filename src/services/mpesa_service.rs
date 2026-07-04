@@ -157,7 +157,9 @@ impl MpesaService {
         base64.encode(password_string)
     }
 
-    pub async fn get_access_token(&self) -> Result<String, Box<dyn std::error::Error>> {
+    pub async fn get_access_token(
+        &self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         {
             let cached = self.cached_token.read().unwrap();
             if let Some((token, expiry)) = cached.as_ref() {
@@ -224,7 +226,7 @@ impl MpesaService {
         amount: &str,
         account_reference: Option<&str>,
         transaction_desc: Option<&str>,
-    ) -> Result<StkPushResponse, Box<dyn std::error::Error>> {
+    ) -> Result<StkPushResponse, Box<dyn std::error::Error + Send + Sync>> {
         info!("C2B: STK push for {} - KSh {}", phone_number, amount);
 
         let amount_parsed = amount.parse::<f64>()?;
@@ -286,7 +288,7 @@ impl MpesaService {
         command_id: &str,
         remarks: &str,
         occasion: Option<&str>,
-    ) -> Result<B2CResponse, Box<dyn std::error::Error>> {
+    ) -> Result<B2CResponse, Box<dyn std::error::Error + Send + Sync>> {
         info!("B2C: Sending to {} - KSh {}", phone_number, amount);
 
         println!("==========================================");
@@ -418,7 +420,7 @@ impl MpesaService {
 
     pub async fn check_connectivity(
         &self,
-    ) -> Result<ConnectivityStatus, Box<dyn std::error::Error>> {
+    ) -> Result<ConnectivityStatus, Box<dyn std::error::Error + Send + Sync>> {
         println!("[CONNECTIVITY] Checking M-Pesa connectivity...");
 
         let (auth_url, _, _) = self.config.get_mpesa_urls();

@@ -7,6 +7,7 @@ use serde_json::json;
 
 use crate::handlers::mpesa_handlers;
 use crate::state::AppState;
+use axum::Json;
 
 pub fn mpesa_routes() -> Router<AppState> {
     Router::new()
@@ -26,8 +27,8 @@ pub fn mpesa_routes() -> Router<AppState> {
         .route("/b2c/send", post(mpesa_handlers::initiate_b2c_payment))
 }
 
-async fn mpesa_health() -> axum::Json<serde_json::Value> {
-    axum::Json(json!({
+async fn mpesa_health() -> Json<serde_json::Value> {
+    Json(json!({
         "status": "ok",
         "service": "mpesa",
         "timestamp": Utc::now().to_rfc3339(),
