@@ -618,12 +618,43 @@ pub async fn receive_live_update(
     let games_col: Collection<Game> = state.db.collection("fixtures");
     let filter = doc! { "matchId": &update.fixture_id };
 
-    let (status, is_live, available_for_voting) = match update.event_type.as_str() {
+    let (mut status, mut is_live, mut available_for_voting) = match update.event_type.as_str() {
         "match_end" => ("completed", false, false),
         "half_time" => ("live", true, false),
         "second_half" => ("live", true, false),
         _ => ("live", true, false),
     };
+
+    // ✅ GUARD: never let this endpoint mark a fixture live before kickoff,
+    // regardless of what event_type triggered it.
+    if status == "live" {
+        if let Some(existing) = find_game_tolerant(&games_col, filter.clone()).await? {
+            let kickoff_chrono = existing.kickoff_utc;
+            let now = Utc::now();
+
+            if now < kickoff_chrono {
+                let one_hour_before_kickoff = kickoff_chrono - chrono::Duration::hours(1);
+
+                let corrected = if now >= one_hour_before_kickoff {
+                    "soon"
+                } else {
+                    "upcoming"
+                };
+
+                tracing::warn!(
+                    "🚫 Blocked premature live-update status for {}: now={} < kickoff={} — correcting to '{}'",
+                    update.fixture_id,
+                    now,
+                    kickoff_chrono,
+                    corrected
+                );
+
+                status = corrected;
+                is_live = false;
+                available_for_voting = matches!(corrected, "upcoming" | "soon");
+            }
+        }
+    }
 
     let mut set_doc = doc! {
         "homeScore": update.home_score,
