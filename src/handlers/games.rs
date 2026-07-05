@@ -1588,87 +1588,72 @@ pub async fn move_completed_to_history(
         "match_id": match_id,
     })))
 }
-pub async fn get_history_games(
-    State(state): State<AppState>,
-    Query(query): Query<HistoryQuery>,
-) -> Result<Json<serde_json::Value>> {
-    tracing::info!("📜 GET /api/games/history called");
 
-    let collection: Collection<HistoryGame> = state.db.collection("games_history");
-    let mut filter = doc! {};
-
-    if let Some(league) = &query.league {
-        filter.insert("league", league);
-    }
-    if let Some(home_team) = &query.home_team {
-        filter.insert("homeTeam", home_team);
-    }
-    if let Some(away_team) = &query.away_team {
-        filter.insert("awayTeam", away_team);
-    }
-    if let Some(from_date) = &query.from_date {
-        if let Ok(date) = chrono::NaiveDate::parse_from_str(from_date, "%Y-%m-%d") {
-            let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
-                date.and_hms_opt(0, 0, 0).unwrap(),
-                Utc,
-            );
-            filter.insert(
-                "completedAt",
-                doc! { "$gte": BsonDateTime::from_chrono(dt) },
-            );
-        }
-    }
-    if let Some(to_date) = &query.to_date {
-        if let Ok(date) = chrono::NaiveDate::parse_from_str(to_date, "%Y-%m-%d") {
-            let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
-                date.and_hms_opt(23, 59, 59).unwrap(),
-                Utc,
-            );
-            filter.insert(
-                "completedAt",
-                doc! { "$lte": BsonDateTime::from_chrono(dt) },
-            );
-        }
-    }
-
-    let limit = query.limit.unwrap_or(50);
-    let skip = query.skip.unwrap_or(0);
-
-    // ✅ Deserialize directly as HistoryGame
-    let history_games: Vec<HistoryGame> = collection
-        .find(filter)
-        .sort(doc! { "completedAt": -1 })
+// ============================================================================
+// ADD this helper next to find_game_tolerant / find_games_tolerant
+// ============================================================================
+async fn find_history_games_tolerant(
+    collection: &Collection<HistoryGame>,
+    filter: Document,
+    sort: Document,
+    skip: u64,
+    limit: i64,
+) -> Result<(Vec<HistoryGame>, i64)> {
+    let raw_collection: Collection<Document> = collection.clone_with_type();
+    let mut cursor = raw_collection
+        .find(filter.clone())
+        .sort(sort)
         .skip(skip)
         .limit(limit)
-        .await?
-        .try_collect()
         .await?;
 
-    let total = collection.count_documents(doc! {}).await?;
+    let mut games: Vec<HistoryGame> = Vec::new();
+    let mut skipped = 0;
 
-    tracing::info!("✅ Retrieved {} history games", history_games.len());
+    while cursor.advance().await? {
+        let raw_doc = cursor.deserialize_current()?;
+        match mongodb::bson::from_document::<HistoryGame>(raw_doc.clone()) {
+            Ok(game) => games.push(game),
+            Err(e) => {
+                let match_id = raw_doc
+                    .get_str("matchId")
+                    .unwrap_or("<unknown>")
+                    .to_string();
 
-    Ok(Json(json!({
-        "success": true,
-        "data": history_games,
-        "total": total,
-        "limit": limit,
-        "skip": skip,
-        "timestamp": Utc::now().to_rfc3339(),
-    })))
-}
-pub async fn get_history_game_by_match_id(
-    State(state): State<AppState>,
-    Path(match_id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    let collection: Collection<HistoryGame> = state.db.collection("games_history");
+                // same recovery strategy as the fixtures-tolerant path:
+                // strip lineups first, since that's the field most likely
+                // to carry stale/malformed shape from old scrapes
+                let mut stripped = raw_doc;
+                stripped.remove("lineups");
 
-    match collection.find_one(doc! { "matchId": &match_id }).await? {
-        Some(game) => Ok(Json(json!({ "success": true, "data": game }))),
-        None => Err(AppError::DocumentNotFound),
+                match mongodb::bson::from_document::<HistoryGame>(stripped) {
+                    Ok(game) => {
+                        tracing::warn!(
+                            "⚠️ Recovered history fixture {} by dropping malformed 'lineups' field",
+                            match_id
+                        );
+                        games.push(game);
+                    }
+                    Err(e2) => {
+                        skipped += 1;
+                        tracing::warn!(
+                            "⚠️ Skipping malformed history document {}: {} (original: {})",
+                            match_id,
+                            e2,
+                            e
+                        );
+                    }
+                }
+            }
+        }
     }
-}
 
+    if skipped > 0 {
+        tracing::warn!("⚠️ Skipped {} malformed history document(s)", skipped);
+    }
+    let total = collection.count_documents(doc! {}).await? as i64;
+    Ok((games, total))
+}
 pub async fn cleanup_stale_completed_games(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>> {
@@ -1749,6 +1734,92 @@ pub async fn cleanup_stale_completed_games(
         "message": format!("Moved {} stale games to history", moved_count),
         "moved_count": moved_count,
     })))
+}
+
+// ============================================================================
+// REPLACE the body of get_history_games with this
+// ============================================================================
+pub async fn get_history_games(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<serde_json::Value>> {
+    tracing::info!("📜 GET /api/games/history called");
+
+    let collection: Collection<HistoryGame> = state.db.collection("games_history");
+    let mut filter = doc! {};
+
+    if let Some(league) = &query.league {
+        filter.insert("league", league);
+    }
+    if let Some(home_team) = &query.home_team {
+        filter.insert("homeTeam", home_team);
+    }
+    if let Some(away_team) = &query.away_team {
+        filter.insert("awayTeam", away_team);
+    }
+
+    // NOTE: also fixes the from_date/to_date overwrite bug — both
+    // now merge into one completedAt filter instead of clobbering
+    // each other via repeated filter.insert("completedAt", ...).
+    let mut completed_at_filter = Document::new();
+    if let Some(from_date) = &query.from_date {
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(from_date, "%Y-%m-%d") {
+            let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+                date.and_hms_opt(0, 0, 0).unwrap(),
+                Utc,
+            );
+            completed_at_filter.insert("$gte", BsonDateTime::from_chrono(dt));
+        }
+    }
+    if let Some(to_date) = &query.to_date {
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(to_date, "%Y-%m-%d") {
+            let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+                date.and_hms_opt(23, 59, 59).unwrap(),
+                Utc,
+            );
+            completed_at_filter.insert("$lte", BsonDateTime::from_chrono(dt));
+        }
+    }
+    if !completed_at_filter.is_empty() {
+        filter.insert("completedAt", completed_at_filter);
+    }
+
+    let limit = query.limit.unwrap_or(50);
+    let skip = query.skip.unwrap_or(0);
+    let sort = doc! { "completedAt": -1 };
+
+    let (history_games, total) =
+        find_history_games_tolerant(&collection, filter, sort, skip, limit).await?;
+
+    tracing::info!("✅ Retrieved {} history games", history_games.len());
+
+    Ok(Json(json!({
+        "success": true,
+        "data": history_games,
+        "total": total,
+        "limit": limit,
+        "skip": skip,
+        "timestamp": Utc::now().to_rfc3339(),
+    })))
+}
+
+// ============================================================================
+// REPLACE get_history_game_by_match_id's body with this
+// (uses find_history_games_tolerant with a single-match filter)
+// ============================================================================
+pub async fn get_history_game_by_match_id(
+    State(state): State<AppState>,
+    Path(match_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let collection: Collection<HistoryGame> = state.db.collection("games_history");
+    let filter = doc! { "matchId": &match_id };
+
+    let (mut games, _) = find_history_games_tolerant(&collection, filter, doc! {}, 0, 1).await?;
+
+    match games.pop() {
+        Some(game) => Ok(Json(json!({ "success": true, "data": game }))),
+        None => Err(AppError::DocumentNotFound),
+    }
 }
 
 #[derive(Debug, Deserialize)]
