@@ -296,6 +296,9 @@ pub struct Game {
 // ============================================================================
 // HISTORY GAME - FOR games_history COLLECTION
 // ============================================================================
+// ============================================================================
+// HISTORY GAME - FOR games_history COLLECTION (FLAT STRUCTURE)
+// ============================================================================
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryGame {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -346,12 +349,10 @@ pub struct HistoryGame {
 
     #[serde(rename = "homeScore")]
     #[serde(default)]
-    #[serde(deserialize_with = "deserialize_flexible_opt_i32")]
     pub home_score: Option<i32>,
 
     #[serde(rename = "awayScore")]
     #[serde(default)]
-    #[serde(deserialize_with = "deserialize_flexible_opt_i32")]
     pub away_score: Option<i32>,
 
     pub status: String,
@@ -414,6 +415,7 @@ pub struct HistoryGame {
     #[serde(rename = "forwardedEventSignatures")]
     pub forwarded_event_signatures: Vec<String>,
 
+    // ✅ ONLY ONE completedAt - this is the history-specific field
     #[serde(rename = "completedAt")]
     pub completed_at: BsonDateTime,
 
@@ -422,32 +424,6 @@ pub struct HistoryGame {
 
     #[serde(rename = "createdAt")]
     pub created_at: BsonDateTime,
-}
-
-// ============================================================================
-// REQUEST STRUCTS
-// ============================================================================
-#[derive(Debug, Deserialize)]
-pub struct CreateGameRequest {
-    #[serde(rename = "matchId")]
-    pub match_id: String,
-    #[serde(rename = "homeTeam")]
-    pub home_team: String,
-    #[serde(rename = "awayTeam")]
-    pub away_team: String,
-    pub league: String,
-    #[serde(rename = "homeWin")]
-    pub home_win: Option<f64>,
-    #[serde(rename = "awayWin")]
-    pub away_win: Option<f64>,
-    pub draw: Option<f64>,
-    pub date: String,
-    pub time: String,
-    #[serde(rename = "dateIso")]
-    pub date_iso: String,
-    #[serde(rename = "kickoffUtc")]
-    pub kickoff_utc: DateTime<Utc>,
-    pub source: String,
 }
 
 #[derive(Debug, Deserialize)]

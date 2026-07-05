@@ -1514,7 +1514,7 @@ pub async fn move_completed_to_history(
 
     let match_id_clone = game.match_id.clone();
 
-    // ✅ Convert Game to HistoryGame (all fields at root level)
+    // ✅ Construct HistoryGame with ALL fields explicitly (no flatten)
     let history_game = HistoryGame {
         id: game.id.clone(),
         match_id: game.match_id.clone(),
@@ -1554,7 +1554,7 @@ pub async fn move_completed_to_history(
         statistics: game.statistics,
         last_statistics_minute: game.last_statistics_minute,
         forwarded_event_signatures: game.forwarded_event_signatures,
-        completed_at: BsonDateTime::from_chrono(Utc::now()),
+        completed_at: BsonDateTime::from_chrono(Utc::now()), // ✅ History-specific
         moved_to_history: true,
         created_at: game.created_at,
     };
