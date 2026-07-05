@@ -499,12 +499,33 @@ pub async fn update_game_status(
         )));
     }
 
-    let is_live = payload.status == "live";
-    let available_for_voting = matches!(payload.status.as_str(), "upcoming" | "soon");
-
     let filter = doc! { "matchId": &match_id };
+
+    // ✅ GUARD: refuse to set "live" before kickoff time
+    let mut requested_status = payload.status.clone();
+    if requested_status == "live" {
+        if let Some(existing) = find_game_tolerant(&collection, filter.clone()).await? {
+            if let Some(kickoff) = existing.kickoff_utc {
+                let kickoff_chrono = kickoff.to_chrono();
+                if Utc::now() < kickoff_chrono {
+                    tracing::warn!(
+                        "🚫 Blocked premature 'live' status for {}: now={} < kickoff={}",
+                        match_id,
+                        Utc::now(),
+                        kickoff_chrono
+                    );
+                    // fall back to a safe pre-kickoff status instead of trusting the caller
+                    requested_status = "soon".to_string();
+                }
+            }
+        }
+    }
+
+    let is_live = requested_status == "live";
+    let available_for_voting = matches!(requested_status.as_str(), "upcoming" | "soon");
+
     let update = doc! { "$set": {
-        "status": &payload.status,
+        "status": &requested_status,
         "isLive": is_live,
         "availableForVoting": available_for_voting,
         "scrapedAt": BsonDateTime::from_chrono(Utc::now()),
@@ -512,7 +533,7 @@ pub async fn update_game_status(
 
     collection.update_one(filter.clone(), update).await?;
 
-    if payload.status == "completed" {
+    if requested_status == "completed" {
         tracing::info!("🏁 Match {} auto-finalizing...", match_id);
 
         if let Some(game) = find_game_tolerant(&collection, filter.clone()).await? {
@@ -544,7 +565,7 @@ pub async fn update_game_status(
 
     let status_payload = json!({
         "fixture_id": match_id,
-        "status": payload.status,
+        "status": requested_status,
         "is_live": is_live,
         "available_for_voting": available_for_voting,
     });
@@ -568,7 +589,6 @@ pub async fn update_game_status(
         None => Err(AppError::DocumentNotFound),
     }
 }
-
 // ============================================================================
 // RECEIVE LIVE UPDATE - ✅ ALREADY HAS minuteDisplay
 // ============================================================================
