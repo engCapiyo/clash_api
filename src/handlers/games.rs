@@ -501,22 +501,33 @@ pub async fn update_game_status(
 
     let filter = doc! { "matchId": &match_id };
 
-    // ✅ GUARD: refuse to set "live" before kickoff time
+    // ✅ GUARD: don't allow "live" until kickoff actually arrives.
+    // If it's within 1 hour of kickoff, correct to "soon" instead.
+    // If it's earlier than that, correct to "upcoming".
     let mut requested_status = payload.status.clone();
     if requested_status == "live" {
         if let Some(existing) = find_game_tolerant(&collection, filter.clone()).await? {
-            if let Some(kickoff) = existing.kickoff_utc {
-                let kickoff_chrono = kickoff.to_chrono();
-                if Utc::now() < kickoff_chrono {
-                    tracing::warn!(
-                        "🚫 Blocked premature 'live' status for {}: now={} < kickoff={}",
-                        match_id,
-                        Utc::now(),
-                        kickoff_chrono
-                    );
-                    // fall back to a safe pre-kickoff status instead of trusting the caller
-                    requested_status = "soon".to_string();
-                }
+            let kickoff_chrono = existing.kickoff_utc;
+            let now = Utc::now();
+
+            if now < kickoff_chrono {
+                let one_hour_before_kickoff = kickoff_chrono - chrono::Duration::hours(1);
+
+                let corrected_status = if now >= one_hour_before_kickoff {
+                    "soon"
+                } else {
+                    "upcoming"
+                };
+
+                tracing::warn!(
+                    "🚫 Blocked premature 'live' status for {}: now={} < kickoff={} — correcting to '{}'",
+                    match_id,
+                    now,
+                    kickoff_chrono,
+                    corrected_status
+                );
+
+                requested_status = corrected_status.to_string();
             }
         }
     }
