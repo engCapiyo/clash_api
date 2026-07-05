@@ -14,8 +14,8 @@ use tracing;
 use crate::errors::{AppError, Result};
 use crate::handlers::ws_handler::broadcast_live_match_update;
 use crate::models::game::{
-    Coach, CommentaryEntry, Game, GameQuery, LineupsDocument, LiveGameUpdate, MatchStatistics,
-    Player, StatisticsSnapshot, TeamLineup, TeamStatistics, Voter,
+    Coach, CommentaryEntry, Game, GameQuery, HistoryGame, LineupsDocument, LiveGameUpdate,
+    MatchStatistics, Player, StatisticsSnapshot, TeamLineup, TeamStatistics, Voter,
 };
 use crate::models::notification::FCMToken;
 use crate::state::AppState;
@@ -1478,16 +1478,6 @@ pub struct HistoryQuery {
     pub to_date: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HistoryGame {
-    #[serde(flatten)]
-    pub game: Game,
-    #[serde(rename = "completedAt")]
-    pub completed_at: BsonDateTime,
-    #[serde(rename = "movedToHistory")]
-    pub moved_to_history: bool,
-}
-
 pub async fn move_completed_to_history(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
@@ -1524,15 +1514,53 @@ pub async fn move_completed_to_history(
 
     let match_id_clone = game.match_id.clone();
 
+    // ✅ Convert Game to HistoryGame (all fields at root level)
+    let history_game = HistoryGame {
+        id: game.id.clone(),
+        match_id: game.match_id.clone(),
+        threesixtyfive_game_id: game.threesixtyfive_game_id.clone(),
+        home_team: game.home_team.clone(),
+        away_team: game.away_team.clone(),
+        league: game.league.clone(),
+        minutes_played: game.minutes_played,
+        minute_display: game.minute_display.clone(),
+        home_win: game.home_win,
+        away_win: game.away_win,
+        draw: game.draw,
+        date: game.date.clone(),
+        time: game.time.clone(),
+        date_iso: game.date_iso.clone(),
+        kickoff_utc: game.kickoff_utc,
+        home_score: game.home_score,
+        away_score: game.away_score,
+        status: game.status.clone(),
+        is_live: game.is_live,
+        available_for_voting: game.available_for_voting,
+        time_elapsed: game.time_elapsed,
+        result: game.result.clone(),
+        source: game.source.clone(),
+        scraped_at: game.scraped_at,
+        last_scraped_at: game.last_scraped_at,
+        last_polled_at: game.last_polled_at,
+        votes: game.votes,
+        voters: game.voters,
+        comments: game.comments,
+        commentary: game.commentary,
+        commentary_count: game.commentary_count,
+        last_commentary_at: game.last_commentary_at,
+        lineups: game.lineups,
+        lineups_fetched: game.lineups_fetched,
+        lineups_fetched_at: game.lineups_fetched_at,
+        statistics: game.statistics,
+        last_statistics_minute: game.last_statistics_minute,
+        forwarded_event_signatures: game.forwarded_event_signatures,
+        completed_at: BsonDateTime::from_chrono(Utc::now()),
+        moved_to_history: true,
+        created_at: game.created_at,
+    };
+
     history_col
-        .replace_one(
-            doc! { "matchId": &match_id_clone },
-            HistoryGame {
-                game,
-                completed_at: BsonDateTime::from_chrono(Utc::now()),
-                moved_to_history: true,
-            },
-        )
+        .replace_one(doc! { "matchId": &match_id_clone }, history_game)
         .upsert(true)
         .await
         .map_err(|e| {
@@ -1560,7 +1588,6 @@ pub async fn move_completed_to_history(
         "match_id": match_id,
     })))
 }
-
 pub async fn get_history_games(
     State(state): State<AppState>,
     Query(query): Query<HistoryQuery>,
@@ -1607,6 +1634,7 @@ pub async fn get_history_games(
     let limit = query.limit.unwrap_or(50);
     let skip = query.skip.unwrap_or(0);
 
+    // ✅ Deserialize directly as HistoryGame
     let history_games: Vec<HistoryGame> = collection
         .find(filter)
         .sort(doc! { "completedAt": -1 })
@@ -1629,7 +1657,6 @@ pub async fn get_history_games(
         "timestamp": Utc::now().to_rfc3339(),
     })))
 }
-
 pub async fn get_history_game_by_match_id(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
@@ -1663,13 +1690,54 @@ pub async fn cleanup_stale_completed_games(
     let mut moved_count = 0;
     for game in stale_games {
         let match_id = game.match_id.clone();
-        history_col
-            .insert_one(HistoryGame {
-                game,
-                completed_at: BsonDateTime::from_chrono(Utc::now()),
-                moved_to_history: true,
-            })
-            .await?;
+
+        // ✅ Convert Game to HistoryGame (all fields at root level)
+        let history_game = HistoryGame {
+            id: game.id.clone(),
+            match_id: game.match_id.clone(),
+            threesixtyfive_game_id: game.threesixtyfive_game_id.clone(),
+            home_team: game.home_team.clone(),
+            away_team: game.away_team.clone(),
+            league: game.league.clone(),
+            minutes_played: game.minutes_played,
+            minute_display: game.minute_display.clone(),
+            home_win: game.home_win,
+            away_win: game.away_win,
+            draw: game.draw,
+            date: game.date.clone(),
+            time: game.time.clone(),
+            date_iso: game.date_iso.clone(),
+            kickoff_utc: game.kickoff_utc,
+            home_score: game.home_score,
+            away_score: game.away_score,
+            status: game.status.clone(),
+            is_live: game.is_live,
+            available_for_voting: game.available_for_voting,
+            time_elapsed: game.time_elapsed,
+            result: game.result.clone(),
+            source: game.source.clone(),
+            scraped_at: game.scraped_at,
+            last_scraped_at: game.last_scraped_at,
+            last_polled_at: game.last_polled_at,
+            votes: game.votes,
+            voters: game.voters,
+            comments: game.comments,
+            commentary: game.commentary,
+            commentary_count: game.commentary_count,
+            last_commentary_at: game.last_commentary_at,
+            lineups: game.lineups,
+            lineups_fetched: game.lineups_fetched,
+            lineups_fetched_at: game.lineups_fetched_at,
+            statistics: game.statistics,
+            last_statistics_minute: game.last_statistics_minute,
+            forwarded_event_signatures: game.forwarded_event_signatures,
+            completed_at: BsonDateTime::from_chrono(Utc::now()),
+            moved_to_history: true,
+            created_at: game.created_at,
+        };
+
+        history_col.insert_one(history_game).await?;
+
         games_col.delete_one(doc! { "matchId": &match_id }).await?;
         moved_count += 1;
     }
