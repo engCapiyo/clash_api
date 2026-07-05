@@ -347,12 +347,15 @@ pub struct HistoryGame {
     #[serde(rename = "kickoffUtc")]
     pub kickoff_utc: DateTime<Utc>,
 
+    // ✅ ADD flexible deserialization here
     #[serde(rename = "homeScore")]
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_flexible_opt_i32")]
     pub home_score: Option<i32>,
 
     #[serde(rename = "awayScore")]
     #[serde(default)]
+    #[serde(deserialize_with = "deserialize_flexible_opt_i32")]
     pub away_score: Option<i32>,
 
     pub status: String,
@@ -415,7 +418,6 @@ pub struct HistoryGame {
     #[serde(rename = "forwardedEventSignatures")]
     pub forwarded_event_signatures: Vec<String>,
 
-    // ✅ ONLY ONE completedAt - this is the history-specific field
     #[serde(rename = "completedAt")]
     pub completed_at: BsonDateTime,
 
@@ -425,7 +427,6 @@ pub struct HistoryGame {
     #[serde(rename = "createdAt")]
     pub created_at: BsonDateTime,
 }
-
 #[derive(Debug, Deserialize)]
 pub struct UpdateGameScoreRequest {
     #[serde(rename = "matchId")]
