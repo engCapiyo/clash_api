@@ -124,6 +124,74 @@ async fn find_games_tolerant(collection: &Collection<Game>, filter: Document) ->
 }
 
 // ============================================================================
+// TOLERANT HISTORY GAME FETCHING
+// ============================================================================
+
+async fn find_history_games_tolerant(
+    collection: &Collection<HistoryGame>,
+    filter: Document,
+    sort: Document,
+    skip: u64,
+    limit: i64,
+) -> Result<(Vec<HistoryGame>, i64)> {
+    let raw_collection: Collection<Document> = collection.clone_with_type();
+    let mut cursor = raw_collection
+        .find(filter.clone())
+        .sort(sort)
+        .skip(skip)
+        .limit(limit)
+        .await?;
+
+    let mut games: Vec<HistoryGame> = Vec::new();
+    let mut skipped = 0;
+
+    while cursor.advance().await? {
+        let raw_doc = cursor.deserialize_current()?;
+        match mongodb::bson::from_document::<HistoryGame>(raw_doc.clone()) {
+            Ok(game) => games.push(game),
+            Err(e) => {
+                let match_id = raw_doc
+                    .get_str("matchId")
+                    .unwrap_or("<unknown>")
+                    .to_string();
+
+                // same recovery strategy as the fixtures-tolerant path:
+                // strip lineups first, since that's the field most likely
+                // to carry stale/malformed shape from old scrapes
+                let mut stripped = raw_doc;
+                stripped.remove("lineups");
+
+                match mongodb::bson::from_document::<HistoryGame>(stripped) {
+                    Ok(game) => {
+                        tracing::warn!(
+                            "⚠️ Recovered history fixture {} by dropping malformed 'lineups' field",
+                            match_id
+                        );
+                        games.push(game);
+                    }
+                    Err(e2) => {
+                        skipped += 1;
+                        tracing::warn!(
+                            "⚠️ Skipping malformed history document {}: {} (original: {})",
+                            match_id,
+                            e2,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if skipped > 0 {
+        tracing::warn!("⚠️ Skipped {} malformed history document(s)", skipped);
+    }
+
+    let total = collection.count_documents(doc! {}).await? as i64;
+    Ok((games, total))
+}
+
+// ============================================================================
 // TEST NOTIFICATION
 // ============================================================================
 
@@ -499,44 +567,12 @@ pub async fn update_game_status(
         )));
     }
 
+    let is_live = payload.status == "live";
+    let available_for_voting = matches!(payload.status.as_str(), "upcoming" | "soon");
+
     let filter = doc! { "matchId": &match_id };
-
-    // ✅ GUARD: don't allow "live" until kickoff actually arrives.
-    // If it's within 1 hour of kickoff, correct to "soon" instead.
-    // If it's earlier than that, correct to "upcoming".
-    let mut requested_status = payload.status.clone();
-    if requested_status == "live" {
-        if let Some(existing) = find_game_tolerant(&collection, filter.clone()).await? {
-            let kickoff_chrono = existing.kickoff_utc;
-            let now = Utc::now();
-
-            if now < kickoff_chrono {
-                let one_hour_before_kickoff = kickoff_chrono - chrono::Duration::hours(1);
-
-                let corrected_status = if now >= one_hour_before_kickoff {
-                    "soon"
-                } else {
-                    "upcoming"
-                };
-
-                tracing::warn!(
-                    "🚫 Blocked premature 'live' status for {}: now={} < kickoff={} — correcting to '{}'",
-                    match_id,
-                    now,
-                    kickoff_chrono,
-                    corrected_status
-                );
-
-                requested_status = corrected_status.to_string();
-            }
-        }
-    }
-
-    let is_live = requested_status == "live";
-    let available_for_voting = matches!(requested_status.as_str(), "upcoming" | "soon");
-
     let update = doc! { "$set": {
-        "status": &requested_status,
+        "status": &payload.status,
         "isLive": is_live,
         "availableForVoting": available_for_voting,
         "scrapedAt": BsonDateTime::from_chrono(Utc::now()),
@@ -544,7 +580,7 @@ pub async fn update_game_status(
 
     collection.update_one(filter.clone(), update).await?;
 
-    if requested_status == "completed" {
+    if payload.status == "completed" {
         tracing::info!("🏁 Match {} auto-finalizing...", match_id);
 
         if let Some(game) = find_game_tolerant(&collection, filter.clone()).await? {
@@ -576,7 +612,7 @@ pub async fn update_game_status(
 
     let status_payload = json!({
         "fixture_id": match_id,
-        "status": requested_status,
+        "status": payload.status,
         "is_live": is_live,
         "available_for_voting": available_for_voting,
     });
@@ -600,6 +636,7 @@ pub async fn update_game_status(
         None => Err(AppError::DocumentNotFound),
     }
 }
+
 // ============================================================================
 // RECEIVE LIVE UPDATE - ✅ ALREADY HAS minuteDisplay
 // ============================================================================
@@ -618,43 +655,12 @@ pub async fn receive_live_update(
     let games_col: Collection<Game> = state.db.collection("fixtures");
     let filter = doc! { "matchId": &update.fixture_id };
 
-    let (mut status, mut is_live, mut available_for_voting) = match update.event_type.as_str() {
+    let (status, is_live, available_for_voting) = match update.event_type.as_str() {
         "match_end" => ("completed", false, false),
         "half_time" => ("live", true, false),
         "second_half" => ("live", true, false),
         _ => ("live", true, false),
     };
-
-    // ✅ GUARD: never let this endpoint mark a fixture live before kickoff,
-    // regardless of what event_type triggered it.
-    if status == "live" {
-        if let Some(existing) = find_game_tolerant(&games_col, filter.clone()).await? {
-            let kickoff_chrono = existing.kickoff_utc;
-            let now = Utc::now();
-
-            if now < kickoff_chrono {
-                let one_hour_before_kickoff = kickoff_chrono - chrono::Duration::hours(1);
-
-                let corrected = if now >= one_hour_before_kickoff {
-                    "soon"
-                } else {
-                    "upcoming"
-                };
-
-                tracing::warn!(
-                    "🚫 Blocked premature live-update status for {}: now={} < kickoff={} — correcting to '{}'",
-                    update.fixture_id,
-                    now,
-                    kickoff_chrono,
-                    corrected
-                );
-
-                status = corrected;
-                is_live = false;
-                available_for_voting = matches!(corrected, "upcoming" | "soon");
-            }
-        }
-    }
 
     let mut set_doc = doc! {
         "homeScore": update.home_score,
@@ -1651,71 +1657,91 @@ pub async fn move_completed_to_history(
     })))
 }
 
-// ============================================================================
-// ADD this helper next to find_game_tolerant / find_games_tolerant
-// ============================================================================
-async fn find_history_games_tolerant(
-    collection: &Collection<HistoryGame>,
-    filter: Document,
-    sort: Document,
-    skip: u64,
-    limit: i64,
-) -> Result<(Vec<HistoryGame>, i64)> {
-    let raw_collection: Collection<Document> = collection.clone_with_type();
-    let mut cursor = raw_collection
-        .find(filter.clone())
-        .sort(sort)
-        .skip(skip)
-        .limit(limit)
-        .await?;
+pub async fn get_history_games(
+    State(state): State<AppState>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<serde_json::Value>> {
+    tracing::info!("📜 GET /api/games/history called");
 
-    let mut games: Vec<HistoryGame> = Vec::new();
-    let mut skipped = 0;
+    let collection: Collection<HistoryGame> = state.db.collection("games_history");
+    let mut filter = doc! {};
 
-    while cursor.advance().await? {
-        let raw_doc = cursor.deserialize_current()?;
-        match mongodb::bson::from_document::<HistoryGame>(raw_doc.clone()) {
-            Ok(game) => games.push(game),
-            Err(e) => {
-                let match_id = raw_doc
-                    .get_str("matchId")
-                    .unwrap_or("<unknown>")
-                    .to_string();
+    if let Some(league) = &query.league {
+        filter.insert("league", league);
+    }
+    if let Some(home_team) = &query.home_team {
+        filter.insert("homeTeam", home_team);
+    }
+    if let Some(away_team) = &query.away_team {
+        filter.insert("awayTeam", away_team);
+    }
 
-                // same recovery strategy as the fixtures-tolerant path:
-                // strip lineups first, since that's the field most likely
-                // to carry stale/malformed shape from old scrapes
-                let mut stripped = raw_doc;
-                stripped.remove("lineups");
-
-                match mongodb::bson::from_document::<HistoryGame>(stripped) {
-                    Ok(game) => {
-                        tracing::warn!(
-                            "⚠️ Recovered history fixture {} by dropping malformed 'lineups' field",
-                            match_id
-                        );
-                        games.push(game);
-                    }
-                    Err(e2) => {
-                        skipped += 1;
-                        tracing::warn!(
-                            "⚠️ Skipping malformed history document {}: {} (original: {})",
-                            match_id,
-                            e2,
-                            e
-                        );
-                    }
-                }
-            }
+    // Both from_date and to_date now merge into a single completedAt
+    // filter document instead of overwriting each other -- previously,
+    // passing both params only ever applied to_date, since Document::insert
+    // silently overwrites a key that's inserted twice.
+    let mut completed_at_filter = Document::new();
+    if let Some(from_date) = &query.from_date {
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(from_date, "%Y-%m-%d") {
+            let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+                date.and_hms_opt(0, 0, 0).unwrap(),
+                Utc,
+            );
+            completed_at_filter.insert("$gte", BsonDateTime::from_chrono(dt));
         }
     }
-
-    if skipped > 0 {
-        tracing::warn!("⚠️ Skipped {} malformed history document(s)", skipped);
+    if let Some(to_date) = &query.to_date {
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(to_date, "%Y-%m-%d") {
+            let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+                date.and_hms_opt(23, 59, 59).unwrap(),
+                Utc,
+            );
+            completed_at_filter.insert("$lte", BsonDateTime::from_chrono(dt));
+        }
     }
-    let total = collection.count_documents(doc! {}).await? as i64;
-    Ok((games, total))
+    if !completed_at_filter.is_empty() {
+        filter.insert("completedAt", completed_at_filter);
+    }
+
+    let limit = query.limit.unwrap_or(50);
+    let skip = query.skip.unwrap_or(0);
+    let sort = doc! { "completedAt": -1 };
+
+    // Tolerant fetch: previously this used collection.find(...).try_collect(),
+    // which aborts the ENTIRE query the moment a single document fails to
+    // deserialize (e.g. the duplicate-completedAt-field corruption seen on
+    // wc26_4750009), 500ing the whole /api/games/history endpoint instead of
+    // just skipping the one bad document.
+    let (history_games, total) =
+        find_history_games_tolerant(&collection, filter, sort, skip, limit).await?;
+
+    tracing::info!("✅ Retrieved {} history games", history_games.len());
+
+    Ok(Json(json!({
+        "success": true,
+        "data": history_games,
+        "total": total,
+        "limit": limit,
+        "skip": skip,
+        "timestamp": Utc::now().to_rfc3339(),
+    })))
 }
+
+pub async fn get_history_game_by_match_id(
+    State(state): State<AppState>,
+    Path(match_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let collection: Collection<HistoryGame> = state.db.collection("games_history");
+    let filter = doc! { "matchId": &match_id };
+
+    let (mut games, _) = find_history_games_tolerant(&collection, filter, doc! {}, 0, 1).await?;
+
+    match games.pop() {
+        Some(game) => Ok(Json(json!({ "success": true, "data": game }))),
+        None => Err(AppError::DocumentNotFound),
+    }
+}
+
 pub async fn cleanup_stale_completed_games(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>> {
@@ -1796,92 +1822,6 @@ pub async fn cleanup_stale_completed_games(
         "message": format!("Moved {} stale games to history", moved_count),
         "moved_count": moved_count,
     })))
-}
-
-// ============================================================================
-// REPLACE the body of get_history_games with this
-// ============================================================================
-pub async fn get_history_games(
-    State(state): State<AppState>,
-    Query(query): Query<HistoryQuery>,
-) -> Result<Json<serde_json::Value>> {
-    tracing::info!("📜 GET /api/games/history called");
-
-    let collection: Collection<HistoryGame> = state.db.collection("games_history");
-    let mut filter = doc! {};
-
-    if let Some(league) = &query.league {
-        filter.insert("league", league);
-    }
-    if let Some(home_team) = &query.home_team {
-        filter.insert("homeTeam", home_team);
-    }
-    if let Some(away_team) = &query.away_team {
-        filter.insert("awayTeam", away_team);
-    }
-
-    // NOTE: also fixes the from_date/to_date overwrite bug — both
-    // now merge into one completedAt filter instead of clobbering
-    // each other via repeated filter.insert("completedAt", ...).
-    let mut completed_at_filter = Document::new();
-    if let Some(from_date) = &query.from_date {
-        if let Ok(date) = chrono::NaiveDate::parse_from_str(from_date, "%Y-%m-%d") {
-            let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
-                date.and_hms_opt(0, 0, 0).unwrap(),
-                Utc,
-            );
-            completed_at_filter.insert("$gte", BsonDateTime::from_chrono(dt));
-        }
-    }
-    if let Some(to_date) = &query.to_date {
-        if let Ok(date) = chrono::NaiveDate::parse_from_str(to_date, "%Y-%m-%d") {
-            let dt = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
-                date.and_hms_opt(23, 59, 59).unwrap(),
-                Utc,
-            );
-            completed_at_filter.insert("$lte", BsonDateTime::from_chrono(dt));
-        }
-    }
-    if !completed_at_filter.is_empty() {
-        filter.insert("completedAt", completed_at_filter);
-    }
-
-    let limit = query.limit.unwrap_or(50);
-    let skip = query.skip.unwrap_or(0);
-    let sort = doc! { "completedAt": -1 };
-
-    let (history_games, total) =
-        find_history_games_tolerant(&collection, filter, sort, skip, limit).await?;
-
-    tracing::info!("✅ Retrieved {} history games", history_games.len());
-
-    Ok(Json(json!({
-        "success": true,
-        "data": history_games,
-        "total": total,
-        "limit": limit,
-        "skip": skip,
-        "timestamp": Utc::now().to_rfc3339(),
-    })))
-}
-
-// ============================================================================
-// REPLACE get_history_game_by_match_id's body with this
-// (uses find_history_games_tolerant with a single-match filter)
-// ============================================================================
-pub async fn get_history_game_by_match_id(
-    State(state): State<AppState>,
-    Path(match_id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    let collection: Collection<HistoryGame> = state.db.collection("games_history");
-    let filter = doc! { "matchId": &match_id };
-
-    let (mut games, _) = find_history_games_tolerant(&collection, filter, doc! {}, 0, 1).await?;
-
-    match games.pop() {
-        Some(game) => Ok(Json(json!({ "success": true, "data": game }))),
-        None => Err(AppError::DocumentNotFound),
-    }
 }
 
 #[derive(Debug, Deserialize)]
