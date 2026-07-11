@@ -346,7 +346,7 @@ pub async fn get_games(
     // one response. ?limit=N still works if the frontend wants a
     // different page size; default is 30.
     games.sort_by(|a, b| a.kickoff_utc.cmp(&b.kickoff_utc));
-    let limit = query.limit.unwrap_or(30).max(0) as usize;
+    let limit = query.limit.unwrap_or(100).max(0) as usize;
     games.truncate(limit);
 
     tracing::info!("✅ Returning {} games", games.len());
