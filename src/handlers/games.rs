@@ -320,7 +320,7 @@ pub async fn get_games(
 ) -> Result<Json<Vec<Game>>> {
     tracing::info!("🔍 GET /api/games called");
 
-    let collection: Collection<Game> = state.db.collection("fixtures");
+    let collection: Collection<Game> = state.db.collection("games");
     let mut filter = doc! {};
 
     if query.status.is_none() && query.is_live.is_none() {
@@ -338,7 +338,16 @@ pub async fn get_games(
     }
 
     let mut games = find_games_tolerant(&collection, filter).await?;
-    games.sort_by(|a, b| b.scraped_at.cmp(&a.scraped_at));
+
+    // Soonest kickoff first (live/imminent matches surface before ones
+    // weeks away), then cap what actually goes to the frontend -- without
+    // this, every in-window fixture (e.g. 74 UCL/Europa qualifiers +
+    // whatever else is currently upserted) gets dumped on the client in
+    // one response. ?limit=N still works if the frontend wants a
+    // different page size; default is 30.
+    games.sort_by(|a, b| a.kickoff_utc.cmp(&b.kickoff_utc));
+    let limit = query.limit.unwrap_or(30).max(0) as usize;
+    games.truncate(limit);
 
     tracing::info!("✅ Returning {} games", games.len());
     Ok(Json(games))
@@ -348,7 +357,7 @@ pub async fn get_game_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Game>> {
-    let collection: Collection<Game> = state.db.collection("fixtures");
+    let collection: Collection<Game> = state.db.collection("games");
     let filter = doc! { "_id": &id };
 
     match find_game_tolerant(&collection, filter).await? {
@@ -361,7 +370,7 @@ pub async fn get_game_by_match_id(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<Game>> {
-    let collection: Collection<Game> = state.db.collection("fixtures");
+    let collection: Collection<Game> = state.db.collection("games");
     let filter = doc! { "matchId": &match_id };
 
     match find_game_tolerant(&collection, filter).await? {
@@ -371,7 +380,7 @@ pub async fn get_game_by_match_id(
 }
 
 pub async fn get_live_games(State(state): State<AppState>) -> Result<Json<Vec<Game>>> {
-    let collection: Collection<Game> = state.db.collection("fixtures");
+    let collection: Collection<Game> = state.db.collection("games");
     let filter = doc! { "status": "live", "isLive": true };
 
     let live_games = find_games_tolerant(&collection, filter).await?;
@@ -380,7 +389,7 @@ pub async fn get_live_games(State(state): State<AppState>) -> Result<Json<Vec<Ga
 }
 
 pub async fn get_upcoming_games(State(state): State<AppState>) -> Result<Json<Vec<Game>>> {
-    let collection: Collection<Game> = state.db.collection("fixtures");
+    let collection: Collection<Game> = state.db.collection("games");
     let filter = doc! { "status": "upcoming" };
 
     let games = find_games_tolerant(&collection, filter).await?;
@@ -455,7 +464,7 @@ pub async fn update_game_score(
 ) -> Result<Json<Game>> {
     use crate::models::channel::ChannelFixture;
 
-    let collection: Collection<Game> = state.db.collection("fixtures");
+    let collection: Collection<Game> = state.db.collection("games");
     let filter = doc! { "matchId": &match_id };
     let mut update_doc = doc! {};
 
@@ -557,7 +566,7 @@ pub async fn update_game_status(
     use crate::handlers::ws_handler::broadcast_live_match_update;
     use crate::models::channel::ChannelFixture;
 
-    let collection: Collection<Game> = state.db.collection("fixtures");
+    let collection: Collection<Game> = state.db.collection("games");
 
     let valid_statuses = ["upcoming", "soon", "live", "completed"];
     if !valid_statuses.contains(&payload.status.as_str()) {
@@ -652,7 +661,7 @@ pub async fn receive_live_update(
 
     tracing::info!("🔴 Live update received: {:?}", update);
 
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
     let filter = doc! { "matchId": &update.fixture_id };
 
     let (status, is_live, available_for_voting) = match update.event_type.as_str() {
@@ -826,7 +835,7 @@ pub async fn store_lineups(
 ) -> Result<Json<serde_json::Value>> {
     tracing::info!("📋 Storing lineups for fixture: {}", payload.fixture_id);
 
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
 
     let home_lineup = TeamLineup {
         formation: payload.lineups.home.formation.clone(),
@@ -891,7 +900,7 @@ pub async fn get_lineups(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
 
     let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
@@ -910,7 +919,7 @@ pub async fn get_simplified_lineups(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
 
     let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
@@ -929,7 +938,7 @@ pub async fn check_lineups_available(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
 
     let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
@@ -1046,7 +1055,7 @@ pub async fn add_statistics_snapshot(
 ) -> Result<Json<serde_json::Value>> {
     tracing::info!("📊 Adding statistics snapshot for {}", payload.fixture_id);
 
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
 
     let snapshot = StatisticsSnapshot {
         minute: payload.minute,
@@ -1095,7 +1104,7 @@ pub async fn bulk_update_statistics(
         .as_array()
         .ok_or_else(|| AppError::invalid_data("Missing snapshots array"))?;
 
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
 
     let mut bson_snapshots = Vec::new();
     for snapshot in snapshots {
@@ -1146,7 +1155,7 @@ pub async fn get_match_statistics(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
 
     let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
@@ -1164,7 +1173,7 @@ pub async fn get_latest_statistics(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
 
     let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
@@ -1229,7 +1238,7 @@ pub async fn get_statistics_at_minute(
     State(state): State<AppState>,
     Path((match_id, minute)): Path<(String, i32)>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
 
     let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
         .await?
@@ -1253,7 +1262,7 @@ pub async fn get_fixture_vote_count_fast(
     State(state): State<AppState>,
     Path(fixture_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_collection: Collection<Game> = state.db.collection("fixtures");
+    let games_collection: Collection<Game> = state.db.collection("games");
 
     let game = find_game_tolerant(&games_collection, doc! { "matchId": &fixture_id })
         .await?
@@ -1271,7 +1280,7 @@ pub async fn get_fixture_comment_count_fast(
     State(state): State<AppState>,
     Path(fixture_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_collection: Collection<Game> = state.db.collection("fixtures");
+    let games_collection: Collection<Game> = state.db.collection("games");
 
     let game = find_game_tolerant(&games_collection, doc! { "matchId": &fixture_id })
         .await?
@@ -1289,7 +1298,7 @@ pub async fn get_fixture_counts_fast(
     State(state): State<AppState>,
     Path(fixture_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_collection: Collection<Game> = state.db.collection("fixtures");
+    let games_collection: Collection<Game> = state.db.collection("games");
 
     let game = find_game_tolerant(&games_collection, doc! { "matchId": &fixture_id })
         .await?
@@ -1308,7 +1317,7 @@ pub async fn get_batch_fixture_counts_fast(
     State(state): State<AppState>,
     Json(fixture_ids): Json<Vec<String>>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_collection: Collection<Game> = state.db.collection("fixtures");
+    let games_collection: Collection<Game> = state.db.collection("games");
     let mut results = Vec::new();
     let mut error_count = 0;
 
@@ -1353,7 +1362,7 @@ pub async fn get_fixture_voters_fast(
     State(state): State<AppState>,
     Path(fixture_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_collection: Collection<Game> = state.db.collection("fixtures");
+    let games_collection: Collection<Game> = state.db.collection("games");
 
     let game = find_game_tolerant(&games_collection, doc! { "matchId": &fixture_id })
         .await?
@@ -1402,7 +1411,7 @@ pub async fn check_user_voted_fast(
     State(state): State<AppState>,
     Path((fixture_id, user_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_collection: Collection<Game> = state.db.collection("fixtures");
+    let games_collection: Collection<Game> = state.db.collection("games");
     let filter = doc! {
         "matchId": &fixture_id,
         "voters.userId": &user_id,
@@ -1448,7 +1457,7 @@ pub async fn add_commentary(
 ) -> Result<Json<serde_json::Value>> {
     tracing::info!("📝 Adding commentary for match: {}", payload.match_id);
 
-    let collection: Collection<Game> = state.db.collection("fixtures");
+    let collection: Collection<Game> = state.db.collection("games");
     let now = BsonDateTime::from_chrono(Utc::now());
     let mut entry = payload.entry;
     entry.created_at = now;
@@ -1513,7 +1522,7 @@ pub async fn get_latest_commentary(
     Query(params): Query<LatestCommentaryQuery>,
 ) -> Result<Json<serde_json::Value>> {
     let limit = params.limit.unwrap_or(20);
-    let collection: Collection<Game> = state.db.collection("fixtures");
+    let collection: Collection<Game> = state.db.collection("games");
 
     let game = find_game_tolerant(&collection, doc! { "matchId": &match_id })
         .await?
@@ -1552,7 +1561,7 @@ pub async fn move_completed_to_history(
 ) -> Result<Json<serde_json::Value>> {
     tracing::info!("📦 Moving completed game {} to history", match_id);
 
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
     let history_col: Collection<HistoryGame> = state.db.collection("games_history");
 
     let game_opt = find_game_tolerant(
@@ -1747,7 +1756,7 @@ pub async fn cleanup_stale_completed_games(
 ) -> Result<Json<serde_json::Value>> {
     tracing::info!("🧹 Cleaning up stale completed games");
 
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
     let history_col: Collection<HistoryGame> = state.db.collection("games_history");
 
     let one_hour_ago = BsonDateTime::from_chrono(Utc::now() - chrono::Duration::hours(1));
@@ -1848,7 +1857,7 @@ pub async fn add_commentary_bulk(
         })));
     }
 
-    let collection: Collection<Game> = state.db.collection("fixtures");
+    let collection: Collection<Game> = state.db.collection("games");
 
     let mut bson_entries = Vec::with_capacity(payload.entries.len());
     let mut broadcast_entries = Vec::with_capacity(payload.entries.len());
