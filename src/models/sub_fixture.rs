@@ -1,163 +1,116 @@
-use bson::{oid::ObjectId, DateTime as BsonDateTime};
-use chrono::Utc;
+use mongodb::bson::{oid::ObjectId, DateTime};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-// ========== SUB-FIXTURE (PROP BET) MODEL ==========
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubFixture {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SubFixtureBet {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
-    pub sub_fixture_id: String,
-    pub parent_fixture_id: String,
-    pub fixture_type: String,
-    pub question: String,
-    pub option_a: String,
-    pub option_b: String,
-    pub option_c: Option<String>,
-    pub odds_a: f64,
-    pub odds_b: f64,
-    pub odds_c: Option<f64>,
-    pub is_active: bool,
-    pub display_order: i32,
-    pub icon: String,
-    pub created_at: BsonDateTime,
-    pub updated_at: BsonDateTime,
+    pub match_id: String,
+    pub market_id: String,
+    pub starter_id: ObjectId,
+    pub starter_name: String,
+    pub starter_selection: String,
+    pub starter_amount: f64,
+    pub finisher_id: Option<ObjectId>,
+    pub finisher_name: Option<String>,
+    pub finisher_selection: Option<String>,
+    pub finisher_amount: Option<f64>,
+    pub status: BetStatus,
+    pub total_pot: f64,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub settled_at: Option<DateTime>,
 }
 
-// ========== SUB-FIXTURE VOTE MODEL ==========
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubFixtureVote {
-    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    pub id: Option<ObjectId>,
-    pub voter_id: String,
-    pub username: String,
-    pub sub_fixture_id: String,
-    pub parent_fixture_id: String,
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum BetStatus {
+    Open,
+    Matched,
+    Settled,
+    Refunded,
+    Cancelled,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSubFixtureBetRequest {
+    pub match_id: String,
+    pub market_id: String,
+    pub starter_id: String,
+    pub starter_name: String,
     pub selection: String,
-    pub voted_at: BsonDateTime,
-    pub created_at: BsonDateTime,
+    pub amount: f64,
 }
 
-impl SubFixtureVote {
-    /// Create a new SubFixtureVote with current timestamp
-    pub fn new(
-        voter_id: &str,
-        username: &str,
-        sub_fixture_id: &str,
-        parent_fixture_id: &str,
-        selection: &str,
-    ) -> Self {
-        let now = BsonDateTime::from_chrono(Utc::now());
+#[derive(Debug, Deserialize)]
+pub struct FillSubFixtureBetRequest {
+    pub match_id: String,
+    pub market_id: String,
+    pub finisher_id: String,
+    pub finisher_name: String,
+    pub selection: String,
+    pub amount: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubFixtureBetResponse {
+    pub id: String,
+    pub match_id: String,
+    pub market_id: String,
+    pub starter_id: String,
+    pub starter_name: String,
+    pub starter_selection: String,
+    pub starter_amount: f64,
+    pub finisher_id: Option<String>,
+    pub finisher_name: Option<String>,
+    pub finisher_selection: Option<String>,
+    pub finisher_amount: Option<f64>,
+    pub status: String,
+    pub total_pot: f64,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub settled_at: Option<DateTime>,
+}
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SubFixtureMarket {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub match_id: String,
+    pub market_id: String,
+    pub market_type: String,
+    pub options: Vec<String>,
+    pub line: Option<f64>,
+    pub status: String,
+    pub lock_at: Option<DateTime>,
+    pub pledge_counts: HashMap<String, i32>,
+    pub pledge_totals: HashMap<String, i32>,
+    pub result: Option<String>,
+    pub is_visible: bool,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub settled_at: Option<DateTime>,
+}
+
+impl From<SubFixtureBet> for SubFixtureBetResponse {
+    fn from(bet: SubFixtureBet) -> Self {
         Self {
-            id: None,
-            voter_id: voter_id.to_string(),
-            username: username.to_string(),
-            sub_fixture_id: sub_fixture_id.to_string(),
-            parent_fixture_id: parent_fixture_id.to_string(),
-            selection: selection.to_string(),
-            voted_at: now,
-            created_at: now,
+            id: bet.id.unwrap().to_hex(),
+            match_id: bet.match_id,
+            market_id: bet.market_id,
+            starter_id: bet.starter_id.to_hex(),
+            starter_name: bet.starter_name,
+            starter_selection: bet.starter_selection,
+            starter_amount: bet.starter_amount,
+            finisher_id: bet.finisher_id.map(|id| id.to_hex()),
+            finisher_name: bet.finisher_name,
+            finisher_selection: bet.finisher_selection,
+            finisher_amount: bet.finisher_amount,
+            status: format!("{:?}", bet.status).to_lowercase(),
+            total_pot: bet.total_pot,
+            created_at: bet.created_at,
+            updated_at: bet.updated_at,
+            settled_at: bet.settled_at,
         }
     }
-}
-
-// ========== REQUEST MODELS ==========
-#[derive(Debug, Deserialize)]
-pub struct CreateSubFixtureVoteRequest {
-    pub voter_id: String,
-    pub username: String,
-    pub sub_fixture_id: String,
-    pub parent_fixture_id: String,
-    pub selection: String,
-    // Optional fields for auto-creation
-    #[serde(default)]
-    pub question: Option<String>,
-    #[serde(default)]
-    pub option_a: Option<String>,
-    #[serde(default)]
-    pub option_b: Option<String>,
-    #[serde(default)]
-    pub option_c: Option<String>,
-    #[serde(default)]
-    pub icon: Option<String>,
-    #[serde(default)]
-    pub fixture_type: Option<String>, // ✅ FIX: Added fixture_type field
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreateSubFixtureRequest {
-    pub parent_fixture_id: String,
-    pub fixture_type: String,
-    pub question: String,
-    pub option_a: String,
-    pub option_b: String,
-    pub option_c: Option<String>,
-    pub odds_a: f64,
-    pub odds_b: f64,
-    pub odds_c: Option<f64>,
-    pub display_order: i32,
-    pub icon: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateSubFixtureRequest {
-    pub question: Option<String>,
-    pub option_a: Option<String>,
-    pub option_b: Option<String>,
-    pub option_c: Option<String>,
-    pub odds_a: Option<f64>,
-    pub odds_b: Option<f64>,
-    pub odds_c: Option<f64>,
-    pub is_active: Option<bool>,
-    pub display_order: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SubFixtureQuery {
-    pub parent_fixture_id: Option<String>,
-    pub fixture_type: Option<String>,
-    pub is_active: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct VotersQuery {
-    pub selection: Option<String>,
-    pub limit: Option<i64>,
-    pub offset: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BulkStatsRequest {
-    pub sub_fixture_ids: Vec<String>,
-}
-
-// ========== RESPONSE MODELS ==========
-#[derive(Debug, Serialize)]
-pub struct SubFixtureVoteResponse {
-    pub success: bool,
-    pub message: String,
-    pub vote_id: Option<String>,
-    pub data: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SubFixtureStats {
-    pub sub_fixture_id: String,
-    pub question: String,
-    pub total_votes: i64,
-    pub option_a_votes: i64,
-    pub option_b_votes: i64,
-    pub option_c_votes: Option<i64>,
-    pub option_a_percentage: f64,
-    pub option_b_percentage: f64,
-    pub option_c_percentage: Option<f64>,
-    pub user_vote: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VoterInfo {
-    pub voter_id: String,
-    pub username: String,
-    pub selection: String,
-    pub voted_at: BsonDateTime,
 }

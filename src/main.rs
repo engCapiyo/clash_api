@@ -139,6 +139,10 @@ async fn build_router(app_state: AppState) -> Router {
         .nest("/api/lipaclash", routes::mpesa::mpesa_routes())
         .nest("/api/votes", routes::vote_routes::vote_routes())
         .nest("/api/archive", routes::archive::archive_routes())
+        .nest(
+            "/api/sub_fixtures",
+            routes::sub_fixture_routes::sub_fixture_routes(),
+        )
         .nest("/api/chats", routes::chat::routes())
         .nest("/api/visibility", routes::visibility::visibility_routes())
         .nest("/ws", routes::vote_routes::ws_routes())

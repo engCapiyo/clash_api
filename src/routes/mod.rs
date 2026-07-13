@@ -9,6 +9,7 @@ pub(crate) mod games;
 pub(crate) mod mpesa;
 pub(crate) mod pledges;
 pub(crate) mod posts;
+pub(crate) mod sub_fixture_routes;
 pub(crate) mod user_profile;
 pub(crate) mod visibility;
 pub(crate) mod vote_routes;

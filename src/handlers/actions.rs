@@ -465,6 +465,9 @@ pub async fn fill_bet_handler(
 // ============================================================================
 // 5. SETTLE BETS
 // ============================================================================
+// ============================================================================
+// 5. SETTLE BETS - WITH FULL REFUND LOGIC
+// ============================================================================
 pub async fn settle_bets_handler(
     State(state): State<AppState>,
     Json(payload): Json<SettleBetRequest>,
@@ -476,7 +479,13 @@ pub async fn settle_bets_handler(
     let channels_col: Collection<Channel> = state.db.collection("channels");
     let now = BsonDateTime::now();
 
-    let mut cursor = bets_col
+    let mut settled_count = 0;
+    let mut refund_count = 0;
+
+    // ========================================================================
+    // PART 1: SETTLE MATCHED BETS
+    // ========================================================================
+    let mut matched_cursor = bets_col
         .find(doc! {
             "fixture_id": &payload.fixture_id,
             "status": "matched",
@@ -484,9 +493,7 @@ pub async fn settle_bets_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    let mut settled_count = 0;
-
-    while let Some(bet) = cursor.next().await {
+    while let Some(bet) = matched_cursor.next().await {
         let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
 
         let (starter_won, finisher_won) = match payload.result.as_str() {
@@ -505,22 +512,6 @@ pub async fn settle_bets_handler(
             _ => (false, false),
         };
 
-        let (winner_id, starter_result, finisher_result) = if starter_won && !finisher_won {
-            (
-                Some(bet.starter_id.clone()),
-                Some("won".to_string()),
-                Some("lost".to_string()),
-            )
-        } else if finisher_won && !starter_won {
-            (
-                bet.finisher_id.clone(),
-                Some("lost".to_string()),
-                Some("won".to_string()),
-            )
-        } else {
-            (None, Some("draw".to_string()), Some("draw".to_string()))
-        };
-
         let total_pot = bet.starter_amount + bet.finisher_amount.unwrap_or(0.0);
 
         let mut session = state
@@ -534,36 +525,90 @@ pub async fn settle_bets_handler(
             .map_err(|e| AppError::MongoDB(e))?;
 
         let bet_id = bet.id.ok_or(AppError::DocumentNotFound)?;
-        bets_col
-            .update_one(
-                doc! { "_id": bet_id },
-                doc! {
-                    "$set": {
-                        "status": "settled",
-                        "winner_id": &winner_id,
-                        "starter_result": &starter_result,
-                        "finisher_result": &finisher_result,
-                        "settled_at": now,
-                    }
-                },
-            )
-            .session(&mut session)
-            .await
-            .map_err(|e| AppError::MongoDB(e))?;
 
-        if let Some(winner_id) = &winner_id {
-            let winner_oid = bson::oid::ObjectId::parse_str(winner_id)
+        // ✅ CASE 1: STARTER WINS
+        if starter_won && !finisher_won {
+            let starter_oid = bson::oid::ObjectId::parse_str(&bet.starter_id)
                 .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+
+            // Starter gets full pot (both stakes)
             users_col
                 .update_one(
-                    doc! { "_id": winner_oid },
+                    doc! { "_id": starter_oid },
                     doc! { "$inc": { "balance": total_pot } },
                 )
                 .session(&mut session)
                 .await
                 .map_err(|e| AppError::MongoDB(e))?;
-        } else {
-            // Draw — refund both
+
+            bets_col
+                .update_one(
+                    doc! { "_id": bet_id },
+                    doc! {
+                        "$set": {
+                            "status": "settled",
+                            "winner_id": &bet.starter_id,
+                            "starter_result": "won",
+                            "finisher_result": "lost",
+                            "settled_at": now,
+                        }
+                    },
+                )
+                .session(&mut session)
+                .await
+                .map_err(|e| AppError::MongoDB(e))?;
+
+            tracing::info!(
+                "✅ Bet {}: Starter {} won {} (total pot)",
+                bet_id.to_hex(),
+                bet.starter_id,
+                total_pot
+            );
+        }
+        // ✅ CASE 2: FINISHER WINS
+        else if finisher_won && !starter_won {
+            if let Some(finisher_id) = &bet.finisher_id {
+                let finisher_oid = bson::oid::ObjectId::parse_str(finisher_id)
+                    .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+
+                // Finisher gets full pot (both stakes)
+                users_col
+                    .update_one(
+                        doc! { "_id": finisher_oid },
+                        doc! { "$inc": { "balance": total_pot } },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(|e| AppError::MongoDB(e))?;
+            }
+
+            bets_col
+                .update_one(
+                    doc! { "_id": bet_id },
+                    doc! {
+                        "$set": {
+                            "status": "settled",
+                            "winner_id": &bet.finisher_id,
+                            "starter_result": "lost",
+                            "finisher_result": "won",
+                            "settled_at": now,
+                        }
+                    },
+                )
+                .session(&mut session)
+                .await
+                .map_err(|e| AppError::MongoDB(e))?;
+
+            tracing::info!(
+                "✅ Bet {}: Finisher {} won {} (total pot)",
+                bet_id.to_hex(),
+                bet.finisher_id.as_deref().unwrap_or("unknown"),
+                total_pot
+            );
+        }
+        // ✅ CASE 3: DRAW / NO WINNER - REFUND BOTH (both lose = both get money back)
+        else {
+            // Refund starter their full stake
             let starter_oid = bson::oid::ObjectId::parse_str(&bet.starter_id)
                 .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
             users_col
@@ -575,6 +620,7 @@ pub async fn settle_bets_handler(
                 .await
                 .map_err(|e| AppError::MongoDB(e))?;
 
+            // Refund finisher their full stake
             if let Some(finisher_id) = &bet.finisher_id {
                 let finisher_oid = bson::oid::ObjectId::parse_str(finisher_id)
                     .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
@@ -587,6 +633,27 @@ pub async fn settle_bets_handler(
                     .await
                     .map_err(|e| AppError::MongoDB(e))?;
             }
+
+            bets_col
+                .update_one(
+                    doc! { "_id": bet_id },
+                    doc! {
+                        "$set": {
+                            "status": "refunded",
+                            "starter_result": "draw",
+                            "finisher_result": "draw",
+                            "settled_at": now,
+                        }
+                    },
+                )
+                .session(&mut session)
+                .await
+                .map_err(|e| AppError::MongoDB(e))?;
+
+            tracing::info!(
+                "🔄 Bet {}: Draw/No winner - refunded both parties",
+                bet_id.to_hex()
+            );
         }
 
         session
@@ -596,7 +663,76 @@ pub async fn settle_bets_handler(
         settled_count += 1;
     }
 
-    // Update fixture status
+    // ========================================================================
+    // PART 2: REFUND UNMATCHED BETS (no one bet against you)
+    // ========================================================================
+    let mut open_cursor = bets_col
+        .find(doc! {
+            "fixture_id": &payload.fixture_id,
+            "status": "open",
+        })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    while let Some(bet) = open_cursor.next().await {
+        let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
+
+        let mut session = state
+            .client
+            .start_session()
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+        session
+            .start_transaction()
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+
+        let bet_id = bet.id.ok_or(AppError::DocumentNotFound)?;
+
+        // ✅ REFUND STARTER - no one filled their bet
+        let starter_oid = bson::oid::ObjectId::parse_str(&bet.starter_id)
+            .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+        users_col
+            .update_one(
+                doc! { "_id": starter_oid },
+                doc! { "$inc": { "balance": bet.starter_amount } },
+            )
+            .session(&mut session)
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+
+        bets_col
+            .update_one(
+                doc! { "_id": bet_id },
+                doc! {
+                    "$set": {
+                        "status": "refunded",
+                        "starter_result": "unmatched",
+                        "settled_at": now,
+                    }
+                },
+            )
+            .session(&mut session)
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+
+        session
+            .commit_transaction()
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+        refund_count += 1;
+
+        tracing::info!(
+            "🔄 Bet {}: Unmatched - refunded starter {} ({} KES)",
+            bet_id.to_hex(),
+            bet.starter_id,
+            bet.starter_amount
+        );
+    }
+
+    // ========================================================================
+    // PART 3: UPDATE FIXTURE STATUS
+    // ========================================================================
     games_col
         .update_one(
             doc! { "match_id": &payload.fixture_id },
@@ -611,7 +747,9 @@ pub async fn settle_bets_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // Mark votes correct/incorrect
+    // ========================================================================
+    // PART 4: MARK VOTES CORRECT/INCORRECT
+    // ========================================================================
     votes_col
         .update_many(
             doc! {
@@ -636,7 +774,9 @@ pub async fn settle_bets_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // Update channel members
+    // ========================================================================
+    // PART 5: UPDATE CHANNEL MEMBERS
+    // ========================================================================
     let mut correct_cursor = votes_col
         .find(doc! { "fixture_id": &payload.fixture_id, "is_correct": true })
         .await
@@ -687,8 +827,9 @@ pub async fn settle_bets_handler(
 
     Ok(Json(json!({
         "success": true,
-        "message": format!("Settled {} bets", settled_count),
+        "message": format!("Settled {} bets, refunded {} unmatched bets", settled_count, refund_count),
         "settled": settled_count,
+        "refunded": refund_count,
         "votes_correct": correct_ids.len(),
         "votes_incorrect": incorrect_ids.len(),
     })))

@@ -103,47 +103,7 @@ pub fn vote_routes() -> Router<AppState> {
             "/comments/:comment_id/like",
             post(crate::handlers::vote_handlers::like_comment),
         )
-        // ========== SUB-FIXTURE (PROP BETS) ROUTES ==========
-        .route(
-            "/sub-fixtures",
-            get(crate::handlers::sub_fixture_handler::get_sub_fixtures),
-        )
-        .route(
-            "/sub-fixture/:id",
-            get(crate::handlers::sub_fixture_handler::get_sub_fixture_by_id),
-        )
-        .route(
-            "/sub-fixture",
-            post(crate::handlers::sub_fixture_handler::submit_sub_fixture_vote),
-        )
-        .route(
-            "/sub-fixture/:id/stats",
-            get(crate::handlers::sub_fixture_handler::get_sub_fixture_stats),
-        )
-        .route(
-            "/sub-fixture/:id/voters",
-            get(crate::handlers::sub_fixture_handler::get_sub_fixture_voters),
-        )
-        .route(
-            "/user/:user_id/fixture/:fixture_id/sub-votes",
-            get(crate::handlers::sub_fixture_handler::get_user_sub_fixture_votes),
-        )
-        .route(
-            "/sub-fixture/:id/all-votes",
-            get(crate::handlers::sub_fixture_handler::get_all_sub_fixture_votes),
-        )
-        .route(
-            "/sub-fixture/:id/counts",
-            get(crate::handlers::sub_fixture_handler::get_sub_fixture_vote_counts),
-        )
-        .route(
-            "/sub-fixture/:id/user/:user_id",
-            get(crate::handlers::sub_fixture_handler::check_user_sub_fixture_vote),
-        )
-        .route(
-            "/sub-fixtures/fixture/:fixture_id/user/:user_id",
-            get(crate::handlers::sub_fixture_handler::get_sub_fixtures_with_user_votes),
-        )
+    // ========== SUB-FIXTURE (PROP BETS) ROUTES ==========
 }
 
 pub fn ws_routes() -> Router<AppState> {
@@ -205,14 +165,6 @@ pub fn vote_stats_routes() -> Router<AppState> {
             post(crate::handlers::vote_handlers::get_combined_stats_for_multiple_fixtures),
         )
         // ========== SUB-FIXTURE STATS ROUTES ==========
-        .route(
-            "/stats/sub-fixtures/bulk",
-            post(crate::handlers::sub_fixture_handler::get_bulk_sub_fixture_stats),
-        )
-        .route(
-            "/stats/sub-fixtures/trending",
-            get(crate::handlers::sub_fixture_handler::get_trending_sub_fixtures),
-        )
         // ========== REAL-TIME & TRENDING ROUTES ==========
         .route(
             "/realtime/:fixture_id",
@@ -231,15 +183,7 @@ pub fn vote_admin_routes() -> Router<AppState> {
             "/admin/stats/overview",
             get(crate::handlers::vote_handlers::get_overview_stats),
         )
-        // ========== SUB-FIXTURE ADMIN ROUTES ==========
-        .route(
-            "/admin/sub-fixtures",
-            post(crate::handlers::sub_fixture_handler::create_sub_fixture),
-        )
-        .route(
-            "/admin/sub-fixture/:id",
-            delete(crate::handlers::sub_fixture_handler::delete_sub_fixture),
-        )
+    // ========== SUB-FIXTURE ADMIN ROUTES ==========
 }
 
 // ========== FCM NOTIFICATION ROUTES ==========

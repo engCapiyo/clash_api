@@ -1,742 +1,727 @@
+use crate::{
+    errors::AppError,
+    models::{
+        game::Game,
+        sub_fixture::{
+            BetStatus, CreateSubFixtureBetRequest, FillSubFixtureBetRequest, SubFixtureBet,
+            SubFixtureBetResponse,
+        },
+        user::User,
+    },
+    AppState,
+};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     Json,
 };
-use futures_util::TryStreamExt;
-use mongodb::{
-    bson::{doc, DateTime as BsonDateTime},
-    Collection,
-};
+use bson::{doc, DateTime as BsonDateTime};
+use futures_util::StreamExt;
+use mongodb::Collection;
 use serde_json::json;
-use uuid::Uuid;
+use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::{
-    errors::{AppError, Result},
-    models::sub_fixture::{
-        BulkStatsRequest, CreateSubFixtureRequest, CreateSubFixtureVoteRequest, SubFixture,
-        SubFixtureQuery, SubFixtureStats, SubFixtureVote, SubFixtureVoteResponse,
-        UpdateSubFixtureRequest, VoterInfo, VotersQuery,
-    },
-    state::AppState,
-};
-
-// ========== GET SUB-FIXTURES ==========
-pub async fn get_sub_fixtures(
+// ============================================================================
+// 1. CREATE SUB-FIXTURE BET
+// ============================================================================
+pub async fn create_sub_fixture_bet_handler(
     State(state): State<AppState>,
-    Query(query): Query<SubFixtureQuery>,
-) -> Result<Json<Vec<SubFixture>>> {
-    let collection: Collection<SubFixture> = state.db.collection("sub_fixtures");
-    let mut filter = doc! {};
+    Json(payload): Json<CreateSubFixtureBetRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
+    let users_col: Collection<User> = state.db.collection("users");
+    let games_col: Collection<Game> = state.db.collection("games");
 
-    if let Some(parent_id) = &query.parent_fixture_id {
-        filter.insert("parent_fixture_id", parent_id);
-    }
-    if let Some(fixture_type) = &query.fixture_type {
-        filter.insert("fixture_type", fixture_type);
-    }
-    if let Some(is_active) = query.is_active {
-        filter.insert("is_active", is_active);
-    }
-
-    let cursor = collection.find(filter).await?;
-    let mut sub_fixtures: Vec<SubFixture> = cursor.try_collect().await?;
-    sub_fixtures.sort_by(|a, b| a.display_order.cmp(&b.display_order));
-
-    println!("✅ Fetched {} sub-fixtures", sub_fixtures.len());
-    Ok(Json(sub_fixtures))
-}
-
-// ========== GET SUB-FIXTURE BY ID ==========
-pub async fn get_sub_fixture_by_id(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<SubFixture>> {
-    let collection: Collection<SubFixture> = state.db.collection("sub_fixtures");
-    let filter = doc! { "sub_fixture_id": &id };
-
-    match collection.find_one(filter).await? {
-        Some(sub_fixture) => Ok(Json(sub_fixture)),
-        None => Err(AppError::DocumentNotFound),
-    }
-}
-
-// ========== SUBMIT SUB-FIXTURE VOTE (WITH AUTO-CREATE) ==========
-pub async fn submit_sub_fixture_vote(
-    State(state): State<AppState>,
-    Json(req): Json<CreateSubFixtureVoteRequest>,
-) -> Result<Json<SubFixtureVoteResponse>> {
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("📝 POST /api/votes/sub-fixture - Creating vote");
-    println!(
-        "📊 Voter: {}, SubFixture: {}",
-        req.voter_id, req.sub_fixture_id
-    );
-    println!("🏷️ Fixture Type from request: {:?}", req.fixture_type);
-    println!("🎯 Selection: {}", req.selection);
-    println!("📦 Question: {:?}", req.question);
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-    let sub_fixture_collection: Collection<SubFixture> = state.db.collection("sub_fixtures");
-    let sub_fixture_filter = doc! { "sub_fixture_id": &req.sub_fixture_id };
-    let existing_sub_fixture = sub_fixture_collection
-        .find_one(sub_fixture_filter.clone())
-        .await?;
-
-    // Auto-create sub-fixture if it doesn't exist
-    let sub_fixture = match existing_sub_fixture {
-        Some(sf) => {
-            println!("✅ Found existing sub-fixture: {}", req.sub_fixture_id);
-            println!("   Type: {}, Question: {}", sf.fixture_type, sf.question);
-            sf
-        }
-        None => {
-            println!(
-                "🆕 Sub-fixture not found, creating automatically: {}",
-                req.sub_fixture_id
-            );
-
-            let now = BsonDateTime::from_chrono(chrono::Utc::now());
-
-            // Use provided fields or create defaults
-            let question = req
-                .question
-                .clone()
-                .unwrap_or_else(|| "Prop Bet".to_string());
-            let option_a = req
-                .option_a
-                .clone()
-                .unwrap_or_else(|| "Option A".to_string());
-            let option_b = req
-                .option_b
-                .clone()
-                .unwrap_or_else(|| "Option B".to_string());
-            let option_c = req.option_c.clone();
-            let icon = req.icon.clone().unwrap_or_else(|| "🎲".to_string());
-
-            // ✅ Use the fixture_type from request, default to "prop_bet"
-            let fixture_type = req
-                .fixture_type
-                .clone()
-                .unwrap_or_else(|| "prop_bet".to_string());
-
-            println!("🏷️ Creating sub-fixture with type: {}", fixture_type);
-            println!("❓ Question: {}", question);
-            println!("🔘 Option A: {}", option_a);
-            println!("🔘 Option B: {}", option_b);
-            if let Some(c) = &option_c {
-                println!("🔘 Option C: {}", c);
-            }
-
-            let new_sub_fixture = SubFixture {
-                id: None,
-                sub_fixture_id: req.sub_fixture_id.clone(),
-                parent_fixture_id: req.parent_fixture_id.clone(),
-                fixture_type,
-                question,
-                option_a,
-                option_b,
-                option_c,
-                odds_a: 1.0,
-                odds_b: 1.0,
-                odds_c: None,
-                is_active: true,
-                display_order: 0,
-                icon,
-                created_at: now,
-                updated_at: now,
-            };
-
-            sub_fixture_collection.insert_one(&new_sub_fixture).await?;
-            println!("✅ Auto-created sub-fixture: {}", req.sub_fixture_id);
-            new_sub_fixture
-        }
-    };
-
-    if !sub_fixture.is_active {
-        println!("⚠️ Sub-fixture is not active: {}", req.sub_fixture_id);
-        return Ok(Json(SubFixtureVoteResponse {
-            success: false,
-            message: "This prop bet is no longer active".to_string(),
-            vote_id: None,
-            data: None,
-        }));
-    }
-
-    // Check if user has already voted
-    let votes_collection: Collection<SubFixtureVote> = state.db.collection("sub_fixture_votes");
-    let existing_filter = doc! {
-        "voter_id": &req.voter_id,
-        "sub_fixture_id": &req.sub_fixture_id,
-    };
-    let existing_vote = votes_collection.find_one(existing_filter).await?;
-
-    if existing_vote.is_some() {
-        println!(
-            "⚠️ User {} has already voted on this prop bet",
-            req.voter_id
-        );
-        return Ok(Json(SubFixtureVoteResponse {
-            success: false,
-            message: "You have already voted on this prop bet".to_string(),
-            vote_id: None,
-            data: None,
-        }));
-    }
-
-    // Validate selection
-    let valid_selections = vec![sub_fixture.option_a.clone(), sub_fixture.option_b.clone()];
-    let valid_selections = if let Some(option_c) = &sub_fixture.option_c {
-        let mut v = valid_selections;
-        v.push(option_c.clone());
-        v
-    } else {
-        valid_selections
-    };
-
-    if !valid_selections.contains(&req.selection) {
-        println!(
-            "❌ Invalid selection: {} (valid: {:?})",
-            req.selection, valid_selections
-        );
-        return Ok(Json(SubFixtureVoteResponse {
-            success: false,
-            message: format!("Invalid selection: {}", req.selection),
-            vote_id: None,
-            data: None,
-        }));
-    }
-
-    // Create and insert the vote
-    let new_vote = SubFixtureVote::new(
-        &req.voter_id,
-        &req.username,
-        &req.sub_fixture_id,
-        &req.parent_fixture_id,
-        &req.selection,
+    tracing::info!(
+        "📊 Creating sub-fixture bet: match={}, user={}, selection={}, amount={}",
+        payload.match_id,
+        payload.starter_id,
+        payload.selection,
+        payload.amount
     );
 
-    let insert_result = votes_collection.insert_one(&new_vote).await?;
-    let vote_id = insert_result
-        .inserted_id
-        .as_object_id()
-        .map(|oid| oid.to_string());
-
-    println!("✅ Sub-fixture vote created: {:?}", vote_id);
-    println!("   Selection: {}", req.selection);
-    println!("   Voted at: {:?}", new_vote.voted_at);
-    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-    Ok(Json(SubFixtureVoteResponse {
-        success: true,
-        message: "Prop bet vote submitted successfully".to_string(),
-        vote_id,
-        data: Some(json!({
-            "sub_fixture_id": req.sub_fixture_id,
-            "selection": req.selection,
-            "voted_at": new_vote.voted_at,
-        })),
-    }))
-}
-
-// ========== GET SUB-FIXTURE STATS (WITH MOCK DATA FOR NON-EXISTENT) ==========
-pub async fn get_sub_fixture_stats(
-    State(state): State<AppState>,
-    Path(sub_fixture_id): Path<String>,
-) -> Result<Json<SubFixtureStats>> {
-    let sub_fixture_collection: Collection<SubFixture> = state.db.collection("sub_fixtures");
-    let votes_collection: Collection<SubFixtureVote> = state.db.collection("sub_fixture_votes");
-
-    // Get sub-fixture details
-    let sub_fixture = sub_fixture_collection
-        .find_one(doc! { "sub_fixture_id": &sub_fixture_id })
-        .await?;
-
-    let sub_fixture = match sub_fixture {
-        Some(sf) => sf,
-        None => {
-            // Return default stats for non-existent sub-fixture
-            println!(
-                "⚠️ Sub-fixture not found, returning default stats: {}",
-                sub_fixture_id
-            );
-            return Ok(Json(SubFixtureStats {
-                sub_fixture_id: sub_fixture_id.clone(),
-                question: "Prop Bet".to_string(),
-                total_votes: 0,
-                option_a_votes: 0,
-                option_b_votes: 0,
-                option_c_votes: None,
-                option_a_percentage: 0.0,
-                option_b_percentage: 0.0,
-                option_c_percentage: None,
-                user_vote: None,
-            }));
-        }
-    };
-
-    // Get vote counts
-    let pipeline = vec![
-        doc! { "$match": { "sub_fixture_id": &sub_fixture_id } },
-        doc! { "$group": {
-            "_id": "$selection",
-            "count": { "$sum": 1 }
-        }},
-    ];
-
-    let cursor = votes_collection.aggregate(pipeline).await?;
-    let mut option_a_votes = 0i64;
-    let mut option_b_votes = 0i64;
-    let mut option_c_votes = 0i64;
-
-    use futures_util::StreamExt;
-    let mut cursor_stream = cursor;
-    while let Some(result) = cursor_stream.next().await {
-        let doc = result?;
-        let selection = doc.get_str("_id").unwrap_or("");
-        let count = doc.get_i64("count").unwrap_or(0);
-
-        if selection == sub_fixture.option_a {
-            option_a_votes = count;
-        } else if selection == sub_fixture.option_b {
-            option_b_votes = count;
-        } else if let Some(ref option_c) = sub_fixture.option_c {
-            if selection == option_c {
-                option_c_votes = count;
-            }
-        }
+    if payload.amount <= 0.0 {
+        return Err(AppError::ValidationError(
+            "Amount must be greater than 0".to_string(),
+        ));
     }
 
-    let total_votes = option_a_votes + option_b_votes + option_c_votes;
+    let starter_id = bson::oid::ObjectId::parse_str(&payload.starter_id)
+        .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
 
-    let option_a_percentage = if total_votes > 0 {
-        (option_a_votes as f64 / total_votes as f64) * 100.0
-    } else {
-        0.0
-    };
+    // Validate match exists
+    let game = games_col
+        .find_one(doc! { "matchId": &payload.match_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or_else(|| AppError::DocumentNotFound)?;
 
-    let option_b_percentage = if total_votes > 0 {
-        (option_b_votes as f64 / total_votes as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let option_c_percentage = if total_votes > 0 && sub_fixture.option_c.is_some() {
-        Some((option_c_votes as f64 / total_votes as f64) * 100.0)
-    } else {
-        None
-    };
-
-    Ok(Json(SubFixtureStats {
-        sub_fixture_id: sub_fixture.sub_fixture_id,
-        question: sub_fixture.question,
-        total_votes,
-        option_a_votes,
-        option_b_votes,
-        option_c_votes: if sub_fixture.option_c.is_some() {
-            Some(option_c_votes)
-        } else {
-            None
-        },
-        option_a_percentage,
-        option_b_percentage,
-        option_c_percentage,
-        user_vote: None,
-    }))
-}
-
-// ========== GET VOTERS FOR SUB-FIXTURE ==========
-pub async fn get_sub_fixture_voters(
-    State(state): State<AppState>,
-    Path(sub_fixture_id): Path<String>,
-    Query(query): Query<VotersQuery>,
-) -> Result<Json<Vec<VoterInfo>>> {
-    let collection: Collection<SubFixtureVote> = state.db.collection("sub_fixture_votes");
-    let mut filter = doc! { "sub_fixture_id": &sub_fixture_id };
-
-    if let Some(selection) = &query.selection {
-        filter.insert("selection", selection);
+    if game.status != "upcoming" && game.status != "not_started" {
+        return Err(AppError::ValidationError(
+            "Match is no longer accepting bets".to_string(),
+        ));
     }
 
-    let limit = query.limit.unwrap_or(50);
-    let skip = query.offset.unwrap_or(0);
-
-    let options = mongodb::options::FindOptions::builder()
-        .sort(doc! { "voted_at": -1 })
-        .limit(limit)
-        .skip(skip)
-        .build();
-
-    let cursor = collection.find(filter).with_options(options).await?;
-    let votes: Vec<SubFixtureVote> = cursor.try_collect().await?;
-
-    let voters: Vec<VoterInfo> = votes
-        .into_iter()
-        .map(|vote| VoterInfo {
-            voter_id: vote.voter_id,
-            username: vote.username,
-            selection: vote.selection,
-            voted_at: vote.voted_at,
+    // Check for duplicate active bet
+    let existing = bets_col
+        .find_one(doc! {
+            "match_id": &payload.match_id,
+            "market_id": &payload.market_id,
+            "starter_id": starter_id,
+            "status": doc! { "$in": ["open", "matched"] },
         })
-        .collect();
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
 
-    println!("✅ Fetched {} voters for sub-fixture", voters.len());
-    Ok(Json(voters))
-}
-
-// ========== GET USER'S SUB-FIXTURE VOTES FOR A FIXTURE ==========
-pub async fn get_user_sub_fixture_votes(
-    State(state): State<AppState>,
-    Path((user_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<Vec<SubFixtureVote>>> {
-    let collection: Collection<SubFixtureVote> = state.db.collection("sub_fixture_votes");
-    let filter = doc! {
-        "voter_id": &user_id,
-        "parent_fixture_id": &fixture_id,
-    };
-
-    let cursor = collection.find(filter).await?;
-    let votes: Vec<SubFixtureVote> = cursor.try_collect().await?;
-
-    println!(
-        "✅ Fetched {} sub-fixture votes for user {}",
-        votes.len(),
-        user_id
-    );
-    Ok(Json(votes))
-}
-
-// ========== GET ALL VOTES FOR A SUB-FIXTURE (ADMIN) ==========
-pub async fn get_all_sub_fixture_votes(
-    State(state): State<AppState>,
-    Path(sub_fixture_id): Path<String>,
-) -> Result<Json<Vec<SubFixtureVote>>> {
-    let collection: Collection<SubFixtureVote> = state.db.collection("sub_fixture_votes");
-    let filter = doc! { "sub_fixture_id": &sub_fixture_id };
-
-    let cursor = collection.find(filter).await?;
-    let votes: Vec<SubFixtureVote> = cursor.try_collect().await?;
-
-    Ok(Json(votes))
-}
-
-// ========== GET VOTE COUNTS FOR SUB-FIXTURE (CHART DATA) ==========
-pub async fn get_sub_fixture_vote_counts(
-    State(state): State<AppState>,
-    Path(sub_fixture_id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    let votes_collection: Collection<SubFixtureVote> = state.db.collection("sub_fixture_votes");
-
-    let pipeline = vec![
-        doc! { "$match": { "sub_fixture_id": &sub_fixture_id } },
-        doc! { "$group": {
-            "_id": "$selection",
-            "count": { "$sum": 1 }
-        }},
-    ];
-
-    let cursor = votes_collection.aggregate(pipeline).await?;
-    let mut counts = std::collections::HashMap::new();
-
-    use futures_util::StreamExt;
-    let mut cursor_stream = cursor;
-    while let Some(result) = cursor_stream.next().await {
-        let doc = result?;
-        let selection = doc.get_str("_id").unwrap_or("").to_string();
-        let count = doc.get_i64("count").unwrap_or(0);
-        counts.insert(selection, count);
+    if existing.is_some() {
+        return Err(AppError::ValidationError(
+            "You already have an active bet on this market".to_string(),
+        ));
     }
 
-    Ok(Json(json!({
-        "counts": counts,
-        "total": counts.values().sum::<i64>()
-    })))
-}
+    // Start transaction
+    let mut session = state
+        .client
+        .start_session()
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+    session
+        .start_transaction()
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
 
-// ========== CHECK IF USER HAS VOTED ==========
-pub async fn check_user_sub_fixture_vote(
-    State(state): State<AppState>,
-    Path((sub_fixture_id, user_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>> {
-    let collection: Collection<SubFixtureVote> = state.db.collection("sub_fixture_votes");
-    let filter = doc! {
-        "sub_fixture_id": &sub_fixture_id,
-        "voter_id": &user_id,
-    };
+    // Check balance and deduct
+    let user = users_col
+        .find_one(doc! { "_id": starter_id })
+        .session(&mut session)
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
 
-    let vote = collection.find_one(filter).await?;
-
-    Ok(Json(json!({
-        "has_voted": vote.is_some(),
-        "vote": vote.map(|v| json!({
-            "selection": v.selection,
-            "voted_at": v.voted_at,
-        })),
-    })))
-}
-
-// ========== GET SUB-FIXTURES WITH USER VOTES ==========
-pub async fn get_sub_fixtures_with_user_votes(
-    State(state): State<AppState>,
-    Path((fixture_id, user_id)): Path<(String, String)>,
-) -> Result<Json<Vec<serde_json::Value>>> {
-    // Get all sub-fixtures for this fixture
-    let sub_fixture_collection: Collection<SubFixture> = state.db.collection("sub_fixtures");
-    let filter = doc! { "parent_fixture_id": &fixture_id, "is_active": true };
-    let cursor = sub_fixture_collection.find(filter).await?;
-    let sub_fixtures: Vec<SubFixture> = cursor.try_collect().await?;
-
-    // Get user's votes for these sub-fixtures
-    let votes_collection: Collection<SubFixtureVote> = state.db.collection("sub_fixture_votes");
-    let sub_fixture_ids: Vec<String> = sub_fixtures
-        .iter()
-        .map(|sf| sf.sub_fixture_id.clone())
-        .collect();
-
-    let user_votes_filter = doc! {
-        "sub_fixture_id": { "$in": sub_fixture_ids },
-        "voter_id": &user_id,
-    };
-    let user_votes_cursor = votes_collection.find(user_votes_filter).await?;
-    let user_votes: Vec<SubFixtureVote> = user_votes_cursor.try_collect().await?;
-
-    // Create a map of sub_fixture_id -> user_vote
-    let user_vote_map: std::collections::HashMap<String, SubFixtureVote> = user_votes
-        .into_iter()
-        .map(|vote| (vote.sub_fixture_id.clone(), vote))
-        .collect();
-
-    // Build response
-    let mut result = Vec::new();
-    for sub_fixture in sub_fixtures {
-        let user_vote = user_vote_map.get(&sub_fixture.sub_fixture_id);
-
-        result.push(json!({
-            "sub_fixture": sub_fixture,
-            "user_vote": user_vote.map(|v| json!({
-                "selection": v.selection,
-                "voted_at": v.voted_at,
-            })),
-            "has_voted": user_vote.is_some(),
-        }));
+    if user.balance < payload.amount {
+        session
+            .abort_transaction()
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+        return Err(AppError::ValidationError(format!(
+            "Insufficient balance. You have {}, need {}",
+            user.balance, payload.amount
+        )));
     }
 
-    Ok(Json(result))
-}
+    users_col
+        .update_one(
+            doc! { "_id": starter_id },
+            doc! { "$inc": { "balance": -payload.amount } },
+        )
+        .session(&mut session)
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
 
-// ========== GET BULK SUB-FIXTURE STATS ==========
-pub async fn get_bulk_sub_fixture_stats(
-    State(state): State<AppState>,
-    Json(req): Json<BulkStatsRequest>,
-) -> Result<Json<serde_json::Value>> {
-    let mut results = std::collections::HashMap::new();
-
-    for sub_fixture_id in req.sub_fixture_ids {
-        // Get sub-fixture details
-        let sub_fixture_collection: Collection<SubFixture> = state.db.collection("sub_fixtures");
-        let sub_fixture = sub_fixture_collection
-            .find_one(doc! { "sub_fixture_id": &sub_fixture_id })
-            .await?;
-
-        if let Some(sf) = sub_fixture {
-            // Get vote counts
-            let votes_collection: Collection<SubFixtureVote> =
-                state.db.collection("sub_fixture_votes");
-            let pipeline = vec![
-                doc! { "$match": { "sub_fixture_id": &sub_fixture_id } },
-                doc! { "$group": {
-                    "_id": "$selection",
-                    "count": { "$sum": 1 }
-                }},
-            ];
-
-            let cursor = votes_collection.aggregate(pipeline).await?;
-            let mut counts = std::collections::HashMap::new();
-
-            use futures_util::StreamExt;
-            let mut cursor_stream = cursor;
-            while let Some(result) = cursor_stream.next().await {
-                let doc = result?;
-                let selection = doc.get_str("_id").unwrap_or("").to_string();
-                let count = doc.get_i64("count").unwrap_or(0);
-                counts.insert(selection, count);
-            }
-
-            let option_a_votes = *counts.get(&sf.option_a).unwrap_or(&0);
-            let option_b_votes = *counts.get(&sf.option_b).unwrap_or(&0);
-            let option_c_votes = sf
-                .option_c
-                .as_ref()
-                .map(|c| *counts.get(c).unwrap_or(&0))
-                .unwrap_or(0);
-            let total_votes = option_a_votes + option_b_votes + option_c_votes;
-
-            results.insert(sub_fixture_id, json!({
-                "sub_fixture_id": sf.sub_fixture_id,
-                "question": sf.question,
-                "total_votes": total_votes,
-                "option_a_votes": option_a_votes,
-                "option_b_votes": option_b_votes,
-                "option_c_votes": if sf.option_c.is_some() { Some(option_c_votes) } else { None },
-                "option_a_percentage": if total_votes > 0 { (option_a_votes as f64 / total_votes as f64) * 100.0 } else { 0.0 },
-                "option_b_percentage": if total_votes > 0 { (option_b_votes as f64 / total_votes as f64) * 100.0 } else { 0.0 },
-                "option_c_percentage": if total_votes > 0 && sf.option_c.is_some() { Some((option_c_votes as f64 / total_votes as f64) * 100.0) } else { None },
-            }));
-        }
-    }
-
-    Ok(Json(json!({ "stats": results })))
-}
-
-// ========== GET TRENDING SUB-FIXTURES ==========
-pub async fn get_trending_sub_fixtures(
-    State(state): State<AppState>,
-    limit: Option<Query<i64>>,
-) -> Result<Json<Vec<serde_json::Value>>> {
-    let limit_val = limit.unwrap_or(Query(10)).0;
-
-    let pipeline = vec![
-        doc! { "$group": {
-            "_id": "$sub_fixture_id",
-            "total_votes": { "$sum": 1 }
-        }},
-        doc! { "$sort": { "total_votes": -1 } },
-        doc! { "$limit": limit_val },
-    ];
-
-    let votes_collection: Collection<SubFixtureVote> = state.db.collection("sub_fixture_votes");
-    let cursor = votes_collection.aggregate(pipeline).await?;
-    let mut results = Vec::new();
-
-    use futures_util::StreamExt;
-    let mut cursor_stream = cursor;
-    while let Some(result) = cursor_stream.next().await {
-        let doc = result?;
-        let sub_fixture_id = doc.get_str("_id").unwrap_or("").to_string();
-        let total_votes = doc.get_i64("total_votes").unwrap_or(0);
-
-        // Get sub-fixture details
-        let sub_fixture_collection: Collection<SubFixture> = state.db.collection("sub_fixtures");
-        if let Some(sf) = sub_fixture_collection
-            .find_one(doc! { "sub_fixture_id": &sub_fixture_id })
-            .await?
-        {
-            results.push(json!({
-                "sub_fixture": sf,
-                "total_votes": total_votes,
-            }));
-        }
-    }
-
-    Ok(Json(results))
-}
-
-// ========== ADMIN: CREATE SUB-FIXTURE ==========
-pub async fn create_sub_fixture(
-    State(state): State<AppState>,
-    Json(req): Json<CreateSubFixtureRequest>,
-) -> Result<Json<SubFixture>> {
-    let collection: Collection<SubFixture> = state.db.collection("sub_fixtures");
-    let now = BsonDateTime::from_chrono(chrono::Utc::now());
-
-    let sub_fixture_id = format!("{}_{}", req.fixture_type, uuid::Uuid::new_v4());
-
-    let new_sub_fixture = SubFixture {
+    // Create bet
+    let now = BsonDateTime::now();
+    let bet = SubFixtureBet {
         id: None,
-        sub_fixture_id,
-        parent_fixture_id: req.parent_fixture_id,
-        fixture_type: req.fixture_type,
-        question: req.question,
-        option_a: req.option_a,
-        option_b: req.option_b,
-        option_c: req.option_c,
-        odds_a: req.odds_a,
-        odds_b: req.odds_b,
-        odds_c: req.odds_c,
-        is_active: true,
-        display_order: req.display_order,
-        icon: req.icon,
+        match_id: payload.match_id.clone(),
+        market_id: payload.market_id.clone(),
+        starter_id,
+        starter_name: payload.starter_name.clone(),
+        starter_selection: payload.selection.clone(),
+        starter_amount: payload.amount,
+        finisher_id: None,
+        finisher_name: None,
+        finisher_selection: None,
+        finisher_amount: None,
+        status: BetStatus::Open,
+        total_pot: payload.amount,
         created_at: now,
         updated_at: now,
+        settled_at: None,
     };
 
-    collection.insert_one(&new_sub_fixture).await?;
-    Ok(Json(new_sub_fixture))
-}
+    let insert_result = bets_col
+        .insert_one(&bet)
+        .session(&mut session)
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
 
-// ========== ADMIN: UPDATE SUB-FIXTURE ==========
-pub async fn update_sub_fixture(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<UpdateSubFixtureRequest>,
-) -> Result<Json<SubFixture>> {
-    let collection: Collection<SubFixture> = state.db.collection("sub_fixtures");
-    let mut update_doc = doc! {};
+    let bet_id = insert_result
+        .inserted_id
+        .as_object_id()
+        .map(|oid| oid.to_hex())
+        .ok_or_else(|| AppError::InternalServerError("Failed to get bet ID".to_string()))?;
 
-    if let Some(question) = req.question {
-        update_doc.insert("question", question);
-    }
-    if let Some(option_a) = req.option_a {
-        update_doc.insert("option_a", option_a);
-    }
-    if let Some(option_b) = req.option_b {
-        update_doc.insert("option_b", option_b);
-    }
-    if let Some(option_c) = req.option_c {
-        update_doc.insert("option_c", option_c);
-    }
-    if let Some(odds_a) = req.odds_a {
-        update_doc.insert("odds_a", odds_a);
-    }
-    if let Some(odds_b) = req.odds_b {
-        update_doc.insert("odds_b", odds_b);
-    }
-    if let Some(odds_c) = req.odds_c {
-        update_doc.insert("odds_c", odds_c);
-    }
-    if let Some(is_active) = req.is_active {
-        update_doc.insert("is_active", is_active);
-    }
-    if let Some(display_order) = req.display_order {
-        update_doc.insert("display_order", display_order);
-    }
-
-    update_doc.insert("updated_at", BsonDateTime::from_chrono(chrono::Utc::now()));
-
-    let filter = doc! { "sub_fixture_id": &id };
-    let update = doc! { "$set": update_doc };
-
-    let result = collection.update_one(filter.clone(), update).await?;
-    if result.matched_count == 0 {
-        return Err(AppError::DocumentNotFound);
-    }
-
-    match collection.find_one(filter).await? {
-        Some(sub_fixture) => Ok(Json(sub_fixture)),
-        None => Err(AppError::DocumentNotFound),
-    }
-}
-
-// ========== ADMIN: DELETE SUB-FIXTURE ==========
-pub async fn delete_sub_fixture(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    let collection: Collection<SubFixture> = state.db.collection("sub_fixtures");
-    let filter = doc! { "sub_fixture_id": &id };
-
-    let result = collection.delete_one(filter).await?;
-    if result.deleted_count == 0 {
-        return Err(AppError::DocumentNotFound);
-    }
-
-    // Also delete all votes for this sub-fixture
-    let votes_collection: Collection<SubFixtureVote> = state.db.collection("sub_fixture_votes");
-    let _ = votes_collection
-        .delete_many(doc! { "sub_fixture_id": &id })
-        .await?;
+    session
+        .commit_transaction()
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
 
     Ok(Json(json!({
         "success": true,
-        "message": "Sub-fixture deleted successfully",
+        "message": "Sub-fixture bet created successfully",
+        "bet_id": bet_id,
+        "match_id": payload.match_id,
+        "market_id": payload.market_id,
+        "status": "open",
+        "amount": payload.amount,
+        "new_balance": user.balance - payload.amount,
+    })))
+}
+
+// ============================================================================
+// 2. FILL SUB-FIXTURE BET
+// ============================================================================
+pub async fn fill_sub_fixture_bet_handler(
+    State(state): State<AppState>,
+    Path(bet_id): Path<String>,
+    Json(payload): Json<FillSubFixtureBetRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
+    let users_col: Collection<User> = state.db.collection("users");
+    let games_col: Collection<Game> = state.db.collection("games");
+
+    tracing::info!(
+        "📊 Filling sub-fixture bet: bet_id={}, user={}, selection={}, amount={}",
+        bet_id,
+        payload.finisher_id,
+        payload.selection,
+        payload.amount
+    );
+
+    if payload.amount <= 0.0 {
+        return Err(AppError::ValidationError(
+            "Amount must be greater than 0".to_string(),
+        ));
+    }
+
+    let bet_oid = bson::oid::ObjectId::parse_str(&bet_id)
+        .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+    let finisher_id = bson::oid::ObjectId::parse_str(&payload.finisher_id)
+        .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+
+    // Find open bet
+    let bet = bets_col
+        .find_one(doc! {
+            "_id": bet_oid,
+            "status": "open",
+            "match_id": &payload.match_id,
+            "market_id": &payload.market_id,
+        })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or_else(|| AppError::ValidationError("Open bet not found".to_string()))?;
+
+    // Validate match
+    let game = games_col
+        .find_one(doc! { "matchId": &bet.match_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or_else(|| AppError::DocumentNotFound)?;
+
+    if game.status != "upcoming" && game.status != "not_started" {
+        return Err(AppError::ValidationError(
+            "Match is no longer accepting bets".to_string(),
+        ));
+    }
+
+    // Validate selection is different
+    if payload.selection == bet.starter_selection {
+        return Err(AppError::ValidationError(
+            "Cannot pick the same side as the starter".to_string(),
+        ));
+    }
+
+    // Validate amount matches
+    if (payload.amount - bet.starter_amount).abs() > 0.001 {
+        return Err(AppError::ValidationError(format!(
+            "Amount must exactly match starter's stake of {}",
+            bet.starter_amount
+        )));
+    }
+
+    // Can't fill your own bet
+    if bet.starter_id == finisher_id {
+        return Err(AppError::ValidationError(
+            "Cannot fill your own bet".to_string(),
+        ));
+    }
+
+    // Check user hasn't already bet on this market
+    let existing = bets_col
+        .find_one(doc! {
+            "match_id": &bet.match_id,
+            "market_id": &bet.market_id,
+            "$or": [
+                doc! { "starter_id": finisher_id },
+                doc! { "finisher_id": finisher_id }
+            ],
+            "status": doc! { "$in": ["open", "matched"] }
+        })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    if existing.is_some() {
+        return Err(AppError::ValidationError(
+            "You already have an active bet on this market".to_string(),
+        ));
+    }
+
+    // Start transaction
+    let mut session = state
+        .client
+        .start_session()
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+    session
+        .start_transaction()
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    // Check balance and deduct
+    let finisher = users_col
+        .find_one(doc! { "_id": finisher_id })
+        .session(&mut session)
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    if finisher.balance < payload.amount {
+        session
+            .abort_transaction()
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+        return Err(AppError::ValidationError(format!(
+            "Insufficient balance. You have {}, need {}",
+            finisher.balance, payload.amount
+        )));
+    }
+
+    users_col
+        .update_one(
+            doc! { "_id": finisher_id },
+            doc! { "$inc": { "balance": -payload.amount } },
+        )
+        .session(&mut session)
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    // Update bet
+    let now = BsonDateTime::now();
+    let update_result = bets_col
+        .update_one(
+            doc! { "_id": bet_oid, "status": "open" },
+            doc! {
+                "$set": {
+                    "finisher_id": finisher_id,
+                    "finisher_name": &payload.finisher_name,
+                    "finisher_selection": &payload.selection,
+                    "finisher_amount": payload.amount,
+                    "status": "matched",
+                    "total_pot": bet.starter_amount + payload.amount,
+                    "updated_at": now,
+                }
+            },
+        )
+        .session(&mut session)
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    if update_result.modified_count == 0 {
+        session
+            .abort_transaction()
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+        return Err(AppError::ValidationError(
+            "Bet was already filled by someone else".to_string(),
+        ));
+    }
+
+    session
+        .commit_transaction()
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Sub-fixture bet filled successfully",
+        "bet_id": bet_id,
+        "status": "matched",
+        "total_pot": bet.starter_amount + payload.amount,
+        "new_balance": finisher.balance - payload.amount,
+    })))
+}
+
+// ============================================================================
+// 3. GET OPEN SUB-FIXTURE BETS
+// ============================================================================
+pub async fn get_open_sub_fixture_bets_handler(
+    State(state): State<AppState>,
+    Path(match_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
+
+    let mut cursor = bets_col
+        .find(doc! {
+            "match_id": &match_id,
+            "status": "open",
+        })
+        .sort(doc! { "created_at": -1 })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut bets = Vec::new();
+    while let Some(bet) = cursor.next().await {
+        let bet: SubFixtureBet = bet.map_err(|e| AppError::MongoDB(e))?;
+        bets.push(SubFixtureBetResponse::from(bet));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "match_id": match_id,
+        "bets": bets,
+        "count": bets.len(),
+    })))
+}
+
+// ============================================================================
+// 4. GET USER'S SUB-FIXTURE BETS
+// ============================================================================
+pub async fn get_user_sub_fixture_bets_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
+
+    let user_oid = bson::oid::ObjectId::parse_str(&user_id)
+        .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+
+    let mut cursor = bets_col
+        .find(doc! {
+            "$or": [
+                { "starter_id": user_oid },
+                { "finisher_id": user_oid }
+            ]
+        })
+        .sort(doc! { "created_at": -1 })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut bets = Vec::new();
+    while let Some(bet) = cursor.next().await {
+        let bet: SubFixtureBet = bet.map_err(|e| AppError::MongoDB(e))?;
+        bets.push(SubFixtureBetResponse::from(bet));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "user_id": user_id,
+        "bets": bets,
+        "count": bets.len(),
+    })))
+}
+
+// ============================================================================
+// 5. GET MATCHED SUB-FIXTURE BETS FOR A MARKET
+// ============================================================================
+pub async fn get_market_sub_fixture_bets_handler(
+    State(state): State<AppState>,
+    Path((match_id, market_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
+
+    let mut cursor = bets_col
+        .find(doc! {
+            "match_id": &match_id,
+            "market_id": &market_id,
+            "status": "matched",
+        })
+        .sort(doc! { "created_at": -1 })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut bets = Vec::new();
+    while let Some(bet) = cursor.next().await {
+        let bet: SubFixtureBet = bet.map_err(|e| AppError::MongoDB(e))?;
+        bets.push(SubFixtureBetResponse::from(bet));
+    }
+
+    let total_pot: f64 = bets.iter().map(|b| b.total_pot).sum();
+
+    Ok(Json(json!({
+        "success": true,
+        "match_id": match_id,
+        "market_id": market_id,
+        "bets": bets,
+        "count": bets.len(),
+        "total_pot": total_pot,
+    })))
+}
+
+// ============================================================================
+// 6. SETTLE SUB-FIXTURE BETS FOR A MARKET
+// ============================================================================
+pub async fn settle_sub_fixture_bets_for_market(
+    state: &Arc<AppState>,
+    match_id: &str,
+    market_id: &str,
+    winning_team: Option<&str>,
+) -> Result<Vec<String>, AppError> {
+    let bets_collection: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
+    let users_collection: Collection<User> = state.db.collection("users");
+
+    let mut settled_count = 0;
+    let mut refund_count = 0;
+
+    // ========================================================================
+    // PART 1: SETTLE MATCHED BETS
+    // ========================================================================
+    let mut session = state
+        .client
+        .start_session()
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+    session
+        .start_transaction()
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    // Find all MATCHED bets for this market
+    let filter = doc! {
+        "match_id": match_id,
+        "market_id": market_id,
+        "status": "matched",
+    };
+
+    let mut cursor = bets_collection
+        .find(filter)
+        .session(&mut session)
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    while let Some(bet) = cursor.next(&mut session).await {
+        let bet: SubFixtureBet = bet.map_err(|e| AppError::MongoDB(e))?;
+        let bet_id = bet.id.unwrap();
+
+        match winning_team {
+            Some(winner) if winner == bet.starter_selection => {
+                // ✅ CASE 1: STARTER WINS - gets full pot
+                users_collection
+                    .update_one(
+                        doc! { "_id": bet.starter_id },
+                        doc! { "$inc": { "balance": bet.total_pot } },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(|e| AppError::MongoDB(e))?;
+
+                bets_collection
+                    .update_one(
+                        doc! { "_id": bet_id },
+                        doc! {
+                            "$set": {
+                                "status": "settled",
+                                "settled_at": BsonDateTime::now(),
+                            }
+                        },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(|e| AppError::MongoDB(e))?;
+
+                tracing::info!(
+                    "✅ Sub-fixture bet {}: Starter {} won {} (total pot)",
+                    bet_id.to_hex(),
+                    bet.starter_id.to_hex(),
+                    bet.total_pot
+                );
+            }
+            Some(winner) if Some(winner) == bet.finisher_selection.as_deref() => {
+                // ✅ CASE 2: FINISHER WINS - gets full pot
+                if let Some(finisher_id) = bet.finisher_id {
+                    users_collection
+                        .update_one(
+                            doc! { "_id": finisher_id },
+                            doc! { "$inc": { "balance": bet.total_pot } },
+                        )
+                        .session(&mut session)
+                        .await
+                        .map_err(|e| AppError::MongoDB(e))?;
+                }
+
+                bets_collection
+                    .update_one(
+                        doc! { "_id": bet_id },
+                        doc! {
+                            "$set": {
+                                "status": "settled",
+                                "settled_at": BsonDateTime::now(),
+                            }
+                        },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(|e| AppError::MongoDB(e))?;
+
+                tracing::info!(
+                    "✅ Sub-fixture bet {}: Finisher {} won {} (total pot)",
+                    bet_id.to_hex(),
+                    bet.finisher_id
+                        .map(|id| id.to_hex())
+                        .unwrap_or("unknown".to_string()),
+                    bet.total_pot
+                );
+            }
+            _ => {
+                // ✅ CASE 3: DRAW / NO WINNER - REFUND BOTH
+                // Refund starter
+                users_collection
+                    .update_one(
+                        doc! { "_id": bet.starter_id },
+                        doc! { "$inc": { "balance": bet.starter_amount } },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(|e| AppError::MongoDB(e))?;
+
+                // Refund finisher
+                if let Some(finisher_id) = bet.finisher_id {
+                    if let Some(finisher_amount) = bet.finisher_amount {
+                        users_collection
+                            .update_one(
+                                doc! { "_id": finisher_id },
+                                doc! { "$inc": { "balance": finisher_amount } },
+                            )
+                            .session(&mut session)
+                            .await
+                            .map_err(|e| AppError::MongoDB(e))?;
+                    }
+                }
+
+                bets_collection
+                    .update_one(
+                        doc! { "_id": bet_id },
+                        doc! {
+                            "$set": {
+                                "status": "refunded",
+                                "settled_at": BsonDateTime::now(),
+                            }
+                        },
+                    )
+                    .session(&mut session)
+                    .await
+                    .map_err(|e| AppError::MongoDB(e))?;
+
+                tracing::info!(
+                    "🔄 Sub-fixture bet {}: Draw/No winner - refunded both parties",
+                    bet_id.to_hex()
+                );
+            }
+        }
+        settled_count += 1;
+    }
+
+    // ========================================================================
+    // PART 2: REFUND UNMATCHED BETS
+    // ========================================================================
+    let open_filter = doc! {
+        "match_id": match_id,
+        "market_id": market_id,
+        "status": "open",
+    };
+
+    let mut open_cursor = bets_collection
+        .find(open_filter)
+        .session(&mut session)
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    while let Some(bet) = open_cursor.next(&mut session).await {
+        let bet: SubFixtureBet = bet.map_err(|e| AppError::MongoDB(e))?;
+        let bet_id = bet.id.unwrap();
+
+        // ✅ REFUND STARTER - no one filled their bet
+        users_collection
+            .update_one(
+                doc! { "_id": bet.starter_id },
+                doc! { "$inc": { "balance": bet.starter_amount } },
+            )
+            .session(&mut session)
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+
+        bets_collection
+            .update_one(
+                doc! { "_id": bet_id },
+                doc! {
+                    "$set": {
+                        "status": "refunded",
+                        "settled_at": BsonDateTime::now(),
+                    }
+                },
+            )
+            .session(&mut session)
+            .await
+            .map_err(|e| AppError::MongoDB(e))?;
+
+        refund_count += 1;
+
+        tracing::info!(
+            "🔄 Sub-fixture bet {}: Unmatched - refunded starter {} ({} KES)",
+            bet_id.to_hex(),
+            bet.starter_id.to_hex(),
+            bet.starter_amount
+        );
+    }
+
+    session
+        .commit_transaction()
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    Ok(vec![format!(
+        "Settled {} matched bets, refunded {} unmatched bets",
+        settled_count, refund_count
+    )])
+}
+
+// ============================================================================
+// 7. GET MARKETS FOR MATCH
+// ============================================================================
+pub async fn get_markets_for_match_handler(
+    State(state): State<AppState>,
+    Path(match_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // This is a placeholder - you'll need to define SubFixtureMarket in your models
+    // For now, return empty array
+    Ok(Json(json!({
+        "success": true,
+        "match_id": match_id,
+        "markets": [],
+        "count": 0,
+    })))
+}
+
+// ============================================================================
+// 8. GET MARKET DETAILS
+// ============================================================================
+pub async fn get_market_details_handler(
+    State(state): State<AppState>,
+    Path((match_id, market_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // This is a placeholder - you'll need to define SubFixtureMarket in your models
+    Ok(Json(json!({
+        "success": true,
+        "match_id": match_id,
+        "market_id": market_id,
+        "market": null,
+        "stats": {
+            "total_bets": 0,
+            "open_bets": 0,
+            "matched_bets": 0,
+            "settled_bets": 0,
+            "refunded_bets": 0,
+            "total_pot": 0.0,
+        },
+        "bets": [],
     })))
 }
