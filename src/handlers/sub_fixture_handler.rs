@@ -3,8 +3,8 @@ use crate::{
     models::{
         game::Game,
         sub_fixture::{
-            BetStatus, CreateSubFixtureBetRequest, FillSubFixtureBetRequest, SubFixtureBet,
-            SubFixtureBetResponse,
+            BetStatus, CreateSubFixtureBetRequest, FillSubFixtureBetRequest,
+            SettleSubFixtureMarketRequest, SubFixtureBet, SubFixtureBetResponse,
         },
         user::User,
     },
@@ -458,7 +458,7 @@ pub async fn get_market_sub_fixture_bets_handler(
 }
 
 // ============================================================================
-// 6. SETTLE SUB-FIXTURE BETS FOR A MARKET
+// 6. SETTLE SUB-FIXTURE BETS FOR A MARKET (internal, reusable logic)
 // ============================================================================
 pub async fn settle_sub_fixture_bets_for_market(
     state: &Arc<AppState>,
@@ -682,6 +682,47 @@ pub async fn settle_sub_fixture_bets_for_market(
         "Settled {} matched bets, refunded {} unmatched bets",
         settled_count, refund_count
     )])
+}
+
+// ============================================================================
+// 6b. SETTLE SUB-FIXTURE MARKET (HTTP-exposed wrapper) -- NEW
+// ============================================================================
+// The function above (settle_sub_fixture_bets_for_market) existed but was
+// never reachable over HTTP -- no route called it. This handler exposes it
+// so the Python poller can call it directly once it detects a first_goal/
+// first_card/first_corner event or a final over/under 2.5 result.
+//
+// Wrapped in Arc::new(state.clone()) purely to satisfy the &Arc<AppState>
+// signature the internal function already has -- if AppState is cheaply
+// Clone (typical axum pattern: mongodb::Client + config, all internally
+// Arc'd), this is a no-op allocation, not a real state duplication.
+pub async fn settle_sub_fixture_market_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<SettleSubFixtureMarketRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    tracing::info!(
+        "🏁 Settlement request: match={}, market={}, winner={:?}",
+        payload.match_id,
+        payload.market_id,
+        payload.winning_team
+    );
+
+    let state_arc = Arc::new(state);
+    let messages = settle_sub_fixture_bets_for_market(
+        &state_arc,
+        &payload.match_id,
+        &payload.market_id,
+        payload.winning_team.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "match_id": payload.match_id,
+        "market_id": payload.market_id,
+        "winning_team": payload.winning_team,
+        "messages": messages,
+    })))
 }
 
 // ============================================================================

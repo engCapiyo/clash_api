@@ -92,6 +92,17 @@ pub struct SubFixtureMarket {
     pub settled_at: Option<DateTime>,
 }
 
+// Request body for the new HTTP-exposed settlement route
+// (settle_sub_fixture_market_handler in sub_fixture_handler.rs).
+// winning_team is "home" / "away" / "over" / "under", or omitted/None
+// for a draw / no-winner outcome (both sides get refunded).
+#[derive(Debug, Deserialize)]
+pub struct SettleSubFixtureMarketRequest {
+    pub match_id: String,
+    pub market_id: String,
+    pub winning_team: Option<String>,
+}
+
 impl From<SubFixtureBet> for SubFixtureBetResponse {
     fn from(bet: SubFixtureBet) -> Self {
         Self {
