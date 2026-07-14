@@ -4,7 +4,8 @@ use crate::{
         game::Game,
         sub_fixture::{
             BetStatus, CreateSubFixtureBetRequest, FillSubFixtureBetRequest,
-            SettleSubFixtureMarketRequest, SubFixtureBet, SubFixtureBetResponse,
+            SettleSubFixtureMarketRequest, SubFixtureBet, SubFixtureBetResponse, SubFixtureMarket,
+            SubFixtureMarketResponse,
         },
         user::User,
     },
@@ -728,17 +729,66 @@ pub async fn settle_sub_fixture_market_handler(
 // ============================================================================
 // 7. GET MARKETS FOR MATCH
 // ============================================================================
+// Was a stub returning "markets": [] unconditionally -- the Flutter client's
+// Sub-Fixtures tab (SwipeableVotePledgeModal._loadSubFixtures) hits
+// GET /sub_fixtures/markets/:match_id expecting real data, so it always
+// rendered "No sub-fixtures available" regardless of what existed in Mongo.
 pub async fn get_markets_for_match_handler(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // This is a placeholder - you'll need to define SubFixtureMarket in your models
-    // For now, return empty array
+    let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
+
+    let mut cursor = markets_col
+        .find(doc! {
+            "match_id": &match_id,
+            "is_visible": true,
+        })
+        .sort(doc! { "created_at": 1 })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut markets = Vec::new();
+    while let Some(market) = cursor.next().await {
+        let market: SubFixtureMarket = market.map_err(|e| AppError::MongoDB(e))?;
+        markets.push(SubFixtureMarketResponse::from(market));
+    }
+
     Ok(Json(json!({
         "success": true,
         "match_id": match_id,
-        "markets": [],
-        "count": 0,
+        "markets": markets,
+        "count": markets.len(),
+    })))
+}
+
+// ============================================================================
+// 7b. GET SUB-FIXTURE VISIBILITY FOR MATCH -- NEW
+// ============================================================================
+// The Flutter client calls GET /sub_fixtures/visibility/:match_id before
+// ever showing the Sub-Fixtures tab (_checkSubFixtureVisibility). That
+// route didn't exist anywhere, so the request 404'd, the catch block set
+// _subFixturesVisible = false, and the whole tab silently disappeared --
+// _loadSubFixtures() never even ran. Visible := at least one visible
+// market currently exists for this match.
+pub async fn get_sub_fixture_visibility_handler(
+    State(state): State<AppState>,
+    Path(match_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
+
+    let visible_count = markets_col
+        .count_documents(doc! {
+            "match_id": &match_id,
+            "is_visible": true,
+        })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    Ok(Json(json!({
+        "success": true,
+        "match_id": match_id,
+        "is_visible": visible_count > 0,
     })))
 }
 
@@ -749,20 +799,55 @@ pub async fn get_market_details_handler(
     State(state): State<AppState>,
     Path((match_id, market_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // This is a placeholder - you'll need to define SubFixtureMarket in your models
+    let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
+    let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
+
+    let market = markets_col
+        .find_one(doc! { "match_id": &match_id, "market_id": &market_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut cursor = bets_col
+        .find(doc! { "match_id": &match_id, "market_id": &market_id })
+        .sort(doc! { "created_at": -1 })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut bets = Vec::new();
+    let mut open_bets = 0;
+    let mut matched_bets = 0;
+    let mut settled_bets = 0;
+    let mut refunded_bets = 0;
+    let mut total_pot = 0.0;
+
+    while let Some(bet) = cursor.next().await {
+        let bet: SubFixtureBet = bet.map_err(|e| AppError::MongoDB(e))?;
+        match bet.status {
+            BetStatus::Open => open_bets += 1,
+            BetStatus::Matched => {
+                matched_bets += 1;
+                total_pot += bet.total_pot;
+            }
+            BetStatus::Settled => settled_bets += 1,
+            BetStatus::Refunded => refunded_bets += 1,
+            BetStatus::Cancelled => {}
+        }
+        bets.push(SubFixtureBetResponse::from(bet));
+    }
+
     Ok(Json(json!({
         "success": true,
         "match_id": match_id,
         "market_id": market_id,
-        "market": null,
+        "market": market.map(SubFixtureMarketResponse::from),
         "stats": {
-            "total_bets": 0,
-            "open_bets": 0,
-            "matched_bets": 0,
-            "settled_bets": 0,
-            "refunded_bets": 0,
-            "total_pot": 0.0,
+            "total_bets": bets.len(),
+            "open_bets": open_bets,
+            "matched_bets": matched_bets,
+            "settled_bets": settled_bets,
+            "refunded_bets": refunded_bets,
+            "total_pot": total_pot,
         },
-        "bets": [],
+        "bets": bets,
     })))
 }

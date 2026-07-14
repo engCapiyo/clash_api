@@ -73,6 +73,7 @@ pub struct SubFixtureBetResponse {
     pub settled_at: Option<DateTime>,
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct SubFixtureMarket {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
@@ -90,6 +91,59 @@ pub struct SubFixtureMarket {
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub settled_at: Option<DateTime>,
+}
+
+// Response shape for GET /sub_fixtures/markets/:match_id.
+//
+// Deliberately separates the Mongo document id ("id", a hex ObjectId)
+// from market_id ("marketId", the business key bets reference via
+// SubFixtureBet.market_id). The old handler was a stub that returned
+// nothing, so this distinction was never surfaced -- the Dart client's
+// SubFixtureMarket.fromJson currently collapses both into one `id`
+// field and reuses it as market_id when placing a bet. That must be
+// fixed client-side to read `marketId` for betting and `id` only as a
+// Mongo doc reference, or bets will be created against the wrong key
+// the moment market_id and the Mongo _id hex ever diverge.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubFixtureMarketResponse {
+    pub id: String,
+    pub match_id: String,
+    pub market_id: String,
+    pub market_type: String,
+    pub options: Vec<String>,
+    pub line: Option<f64>,
+    pub status: String,
+    pub lock_at: Option<DateTime>,
+    pub pledge_counts: HashMap<String, i32>,
+    pub pledge_totals: HashMap<String, i32>,
+    pub result: Option<String>,
+    pub is_visible: bool,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    pub settled_at: Option<DateTime>,
+}
+
+impl From<SubFixtureMarket> for SubFixtureMarketResponse {
+    fn from(m: SubFixtureMarket) -> Self {
+        Self {
+            id: m.id.map(|oid| oid.to_hex()).unwrap_or_default(),
+            match_id: m.match_id,
+            market_id: m.market_id,
+            market_type: m.market_type,
+            options: m.options,
+            line: m.line,
+            status: m.status,
+            lock_at: m.lock_at,
+            pledge_counts: m.pledge_counts,
+            pledge_totals: m.pledge_totals,
+            result: m.result,
+            is_visible: m.is_visible,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+            settled_at: m.settled_at,
+        }
+    }
 }
 
 // Request body for the new HTTP-exposed settlement route
