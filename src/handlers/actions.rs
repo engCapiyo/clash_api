@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use bson::{doc, DateTime as BsonDateTime};
+use bson::{doc, to_bson, DateTime as BsonDateTime};
 use futures_util::StreamExt;
 use mongodb::Collection;
 use serde::Deserialize;
@@ -45,9 +45,6 @@ async fn get_user_channel_ids(
 // ============================================================================
 // HELPER: Create or update ChannelFixture for a channel
 // ============================================================================
-// ============================================================================
-// HELPER: Create or update ChannelFixture for a channel
-// ============================================================================
 async fn upsert_channel_fixture(
     channel_fixtures_col: &Collection<ChannelFixture>,
     channel_id: &str,
@@ -56,17 +53,18 @@ async fn upsert_channel_fixture(
     increment_value: i32,
     set_on_insert_status: &str,
 ) -> Result<(), AppError> {
+    // Create VoteCounts and convert to BSON
     let vote_counts = VoteCounts {
         home: 0,
         away: 0,
         draw: 0,
     };
 
-    // Convert VoteCounts to BSON
-    let vote_counts_bson = bson::to_bson(&vote_counts).map_err(|e| {
+    let vote_counts_bson = to_bson(&vote_counts).map_err(|e| {
         AppError::InternalServerError(format!("Failed to serialize VoteCounts: {}", e))
     })?;
 
+    // Build the setOnInsert document
     let mut set_on_insert = doc! {
         "channel_id": channel_id,
         "fixture_id": fixture_id,
@@ -105,6 +103,7 @@ async fn upsert_channel_fixture(
 
     Ok(())
 }
+
 // ============================================================================
 // 1. CAST VOTE — Creates/Updates channel_fixtures for ALL user's channels
 // ============================================================================
@@ -162,7 +161,7 @@ pub async fn cast_vote_handler(
         }
     };
 
-    // ✅ Get ALL channels the user belongs to
+    // Get ALL channels the user belongs to
     let channel_ids = get_user_channel_ids(&channels_col, &payload.user_id).await?;
 
     tracing::info!(
@@ -171,7 +170,7 @@ pub async fn cast_vote_handler(
         payload.fixture_id
     );
 
-    // ✅ Create/Update ChannelFixture for EACH channel
+    // Create/Update ChannelFixture for EACH channel
     for channel_id in &channel_ids {
         upsert_channel_fixture(
             &channel_fixtures_col,
@@ -406,10 +405,10 @@ pub async fn rollback_vote_handler(
         }
     };
 
-    // ✅ Get ALL channels the user belongs to
+    // Get ALL channels the user belongs to
     let channel_ids = get_user_channel_ids(&channels_col, &payload.user_id).await?;
 
-    // ✅ Decrement channel_fixtures for EACH channel
+    // Decrement channel_fixtures for EACH channel
     for channel_id in &channel_ids {
         channel_fixtures_col
             .update_one(
@@ -599,7 +598,7 @@ pub async fn fill_bet_handler(
         }
     }
 
-    // ✅ Get BOTH starter and finisher channel IDs
+    // Get BOTH starter and finisher channel IDs
     let starter_channel_ids = get_user_channel_ids(&channels_col, &bet.starter_id).await?;
     let finisher_channel_ids = get_user_channel_ids(&channels_col, &payload.finisher_id).await?;
     let all_channel_ids: HashSet<String> = starter_channel_ids
@@ -607,7 +606,7 @@ pub async fn fill_bet_handler(
         .chain(finisher_channel_ids.into_iter())
         .collect();
 
-    // ✅ Update bet_count for ALL channels where either user is a member
+    // Update bet_count for ALL channels where either user is a member
     for channel_id in &all_channel_ids {
         upsert_channel_fixture(
             &channel_fixtures_col,
@@ -706,7 +705,7 @@ pub async fn settle_bets_handler(
 
         let bet_id = bet.id.ok_or(AppError::DocumentNotFound)?;
 
-        // ✅ CASE 1: STARTER WINS
+        // CASE 1: STARTER WINS
         if starter_won && !finisher_won {
             let starter_oid = bson::oid::ObjectId::parse_str(&bet.starter_id)
                 .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
@@ -744,7 +743,7 @@ pub async fn settle_bets_handler(
                 total_pot
             );
         }
-        // ✅ CASE 2: FINISHER WINS
+        // CASE 2: FINISHER WINS
         else if finisher_won && !starter_won {
             if let Some(finisher_id) = &bet.finisher_id {
                 let finisher_oid = bson::oid::ObjectId::parse_str(finisher_id)
@@ -784,7 +783,7 @@ pub async fn settle_bets_handler(
                 total_pot
             );
         }
-        // ✅ CASE 3: DRAW / NO WINNER - REFUND BOTH
+        // CASE 3: DRAW / NO WINNER - REFUND BOTH
         else {
             let starter_oid = bson::oid::ObjectId::parse_str(&bet.starter_id)
                 .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
@@ -922,7 +921,7 @@ pub async fn settle_bets_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // ✅ Update ALL channel_fixtures with this fixture_id
+    // Update ALL channel_fixtures with this fixture_id
     channel_fixtures_col
         .update_many(
             doc! { "fixture_id": &payload.fixture_id },
