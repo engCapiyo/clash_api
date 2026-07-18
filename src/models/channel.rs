@@ -114,20 +114,25 @@ pub struct ChannelFixture {
     pub id: Option<ObjectId>,
     pub channel_id: String,
     pub fixture_id: String,
+    #[serde(default)]
     pub match_name: String,
+    #[serde(default)]
     pub kickoff_time: String,
     pub status: String,
 
-    // ✅ ALL COUNTS LIVE HERE
     pub vote_counts: VoteCounts,
     pub comment_count: i32,
-    pub pledge_count: i32, // ✅ NEW
-    pub bet_count: i32,    // ✅ NEW
+    pub pledge_count: i32,
+    pub bet_count: i32,
     pub likes_count: i32,
 
+    #[serde(default)]
     pub unread_counts: HashMap<String, i32>,
+    #[serde(default)]
     pub last_message: Option<String>,
+    #[serde(default)]
     pub last_message_at: Option<DateTime>,
+    #[serde(default)]
     pub last_sender: Option<String>,
     pub added_at: DateTime,
 }

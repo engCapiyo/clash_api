@@ -77,39 +77,44 @@ async fn upsert_channel_fixture(
         increment_value
     );
 
-    // Build the filter
     let filter = doc! {
         "channel_id": channel_id,
         "fixture_id": fixture_id,
     };
 
-    // Build the update document
     let mut update = doc! {};
 
-    // Add $setOnInsert for new documents
+    // Base defaults — always safe, never targeted by $inc in this function.
     let mut set_on_insert = doc! {
         "channel_id": channel_id,
         "fixture_id": fixture_id,
         "status": set_on_insert_status,
         "comment_count": 0,
-        "pledge_count": 0,
-        "bet_count": 0,
         "likes_count": 0,
         "unread_counts": doc! {},
         "added_at": BsonDateTime::now(),
     };
 
-    // Add vote_counts as a nested document
-    let vote_counts_doc = doc! {
-        "home": 0,
-        "away": 0,
-        "draw": 0,
-    };
-    set_on_insert.insert("vote_counts", vote_counts_doc);
+    // Fields that MIGHT be the target of $inc. Use dotted paths (not a
+    // nested subdocument) so each is its own leaf path, and skip whichever
+    // one matches increment_field — otherwise $setOnInsert and $inc collide
+    // on the same path and Mongo throws error 40 on insert.
+    let defaultable_fields: [(&str, i32); 5] = [
+        ("vote_counts.home", 0),
+        ("vote_counts.away", 0),
+        ("vote_counts.draw", 0),
+        ("pledge_count", 0),
+        ("bet_count", 0),
+    ];
+
+    for (field, default) in defaultable_fields {
+        if increment_field != Some(field) {
+            set_on_insert.insert(field, default);
+        }
+    }
 
     update.insert("$setOnInsert", set_on_insert);
 
-    // Add $inc if there's an increment field
     if let Some(field) = increment_field {
         let mut inc = doc! {};
         inc.insert(field, increment_value);
@@ -118,7 +123,6 @@ async fn upsert_channel_fixture(
 
     tracing::debug!("📤 Update document: {:?}", update);
 
-    // Execute the update with upsert
     let result = channel_fixtures_col
         .update_one(filter, update)
         .upsert(true)
@@ -137,7 +141,6 @@ async fn upsert_channel_fixture(
 
     Ok(())
 }
-
 // ============================================================================
 // 1. CAST VOTE — Creates/Updates channel_fixtures for ALL user's channels
 // ============================================================================
