@@ -34,7 +34,7 @@ impl Vote {
 }
 
 // ============================================================================
-// BET (Single collection for all bets)
+// BET (Single collection for all bets — NO channel_id)
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,9 +58,6 @@ pub struct Bet {
     // === VOTE REFERENCE ===
     pub vote_id: Option<String>,
 
-    // === CHANNEL ===
-    pub channel_id: String,
-
     // === STATUS ===
     pub status: String, // "open", "matched", "settled", "refunded"
 
@@ -82,7 +79,6 @@ impl Bet {
         starter_name: String,
         starter_selection: String,
         amount: f64,
-        channel_id: String,
         vote_id: String,
     ) -> Self {
         let now = BsonDateTime::now();
@@ -98,7 +94,6 @@ impl Bet {
             finisher_selection: None,
             finisher_amount: None,
             vote_id: Some(vote_id),
-            channel_id,
             status: "open".to_string(),
             winner_id: None,
             starter_result: None,
@@ -127,7 +122,7 @@ impl Bet {
 }
 
 // ============================================================================
-// REQUESTS
+// REQUESTS — NO channel_id on universal actions
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -145,7 +140,6 @@ pub struct CreateBetRequest {
     pub starter_selection: String,
     pub amount: f64,
     pub fixture_id: String,
-    pub channel_id: Option<String>,
     pub vote_id: String,
 }
 
@@ -156,7 +150,6 @@ pub struct FillBetRequest {
     pub finisher_name: String,
     pub finisher_selection: String,
     pub amount: f64,
-    pub channel_id: String,
 }
 
 #[derive(Debug, Deserialize)]

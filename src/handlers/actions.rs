@@ -15,9 +15,8 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use bson::{doc, to_bson, DateTime as BsonDateTime};
+use bson::{doc, DateTime as BsonDateTime};
 use futures_util::StreamExt;
-use mongodb::options::UpdateOptions;
 use mongodb::Collection;
 use serde::Deserialize;
 use serde_json::json;
@@ -68,7 +67,7 @@ pub async fn cast_vote_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // ✅ UPDATE channel_fixtures.vote_counts (NOT fixtures)
+    // ✅ UPDATE channel_fixtures.vote_counts
     let increment_field = match payload.selection.as_str() {
         "home" => "vote_counts.home",
         "away" => "vote_counts.away",
@@ -211,14 +210,13 @@ pub async fn create_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // Create bet
+    // Create bet - using the correct new_open signature (NO channel_id)
     let bet = Bet::new_open(
         fixture_id.clone(),
         payload.starter_id.clone(),
         payload.starter_name.clone(),
         payload.starter_selection.clone(),
         payload.amount,
-        payload.channel_id.clone().unwrap_or_default(),
         payload.vote_id.clone(),
     );
 
@@ -234,7 +232,7 @@ pub async fn create_bet_handler(
         .map(|oid| oid.to_hex())
         .ok_or_else(|| AppError::InternalServerError("Failed to get bet ID".to_string()))?;
 
-    // ✅ UPDATE channel_fixtures.pledge_count (NOT fixtures.pledges)
+    // ✅ UPDATE channel_fixtures.pledge_count
     channel_fixtures_col
         .update_many(
             doc! { "fixture_id": &fixture_id },
@@ -419,16 +417,20 @@ pub async fn fill_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // 6. Update bet to MATCHED
+    // 6. Update bet to MATCHED - clone to avoid move issues
+    let finisher_id_clone = payload.finisher_id.clone();
+    let finisher_name_clone = payload.finisher_name.clone();
+    let finisher_selection_clone = payload.finisher_selection.clone();
+
     bets_col
         .update_one(
             doc! { "_id": bet_id },
             doc! {
                 "$set": {
                     "status": "matched",
-                    "finisher_id": &payload.finisher_id,
-                    "finisher_name": &payload.finisher_name,
-                    "finisher_selection": &payload.finisher_selection,
+                    "finisher_id": finisher_id_clone,
+                    "finisher_name": finisher_name_clone,
+                    "finisher_selection": finisher_selection_clone,
                     "finisher_amount": payload.amount,
                     "matched_at": now,
                 }
@@ -474,7 +476,7 @@ pub async fn fill_bet_handler(
             .map_err(|e| AppError::MongoDB(e))?;
     }
 
-    // ✅ UPDATE channel_fixtures.bet_count (NOT fixtures.bets)
+    // ✅ UPDATE channel_fixtures.bet_count
     channel_fixtures_col
         .update_many(
             doc! { "fixture_id": &bet.fixture_id },
@@ -515,7 +517,7 @@ pub async fn settle_bets_handler(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let bets_col: Collection<Bet> = state.db.collection("bets");
     let users_col: Collection<User> = state.db.collection("users");
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
     let votes_col: Collection<Vote> = state.db.collection("votes");
     let channels_col: Collection<Channel> = state.db.collection("channels");
     let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
@@ -977,195 +979,9 @@ pub async fn check_user_vote_handler(
 }
 
 // ============================================================================
-// 9. GET CHANNEL VOTE COUNT (Filtered by channel membership)
+// 9. GET CHANNEL VOTE COUNT
 // ============================================================================
 pub async fn get_channel_vote_count_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let votes_col: Collection<Vote> = state.db.collection("votes");
-    let channels_col: Collection<Channel> = state.db.collection("channels");
-
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &channel_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
-
-    let mut cursor = votes_col
-        .find(doc! { "fixture_id": &fixture_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?;
-
-    let mut count = 0;
-    while let Some(vote) = cursor.next().await {
-        let vote: Vote = vote.map_err(|e| AppError::MongoDB(e))?;
-        if member_ids.contains(&vote.user_id) {
-            count += 1;
-        }
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "fixture_id": fixture_id,
-        "channel_id": channel_id,
-        "vote_count": count,
-    })))
-}
-
-// ============================================================================
-// 10. GET CHANNEL PLEDGES
-// ============================================================================
-pub async fn get_channel_pledges_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let bets_col: Collection<Bet> = state.db.collection("bets");
-    let channels_col: Collection<Channel> = state.db.collection("channels");
-
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &channel_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
-
-    let mut cursor = bets_col
-        .find(doc! {
-            "fixture_id": &fixture_id,
-            "status": "open",
-        })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?;
-
-    let mut open_bets = Vec::new();
-    while let Some(bet) = cursor.next().await {
-        let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
-        if member_ids.contains(&bet.starter_id) {
-            open_bets.push(bet);
-        }
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "fixture_id": fixture_id,
-        "channel_id": channel_id,
-        "pledges": open_bets,
-        "count": open_bets.len(),
-    })))
-}
-
-// ============================================================================
-// 11. GET CHANNEL BETTORS (Matched bets)
-// ============================================================================
-pub async fn get_channel_bettors_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let bets_col: Collection<Bet> = state.db.collection("bets");
-    let channels_col: Collection<Channel> = state.db.collection("channels");
-
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &channel_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
-
-    let mut cursor = bets_col
-        .find(doc! {
-            "fixture_id": &fixture_id,
-            "status": { "$ne": "open" },
-        })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?;
-
-    let mut matched_bets = Vec::new();
-    while let Some(bet) = cursor.next().await {
-        let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
-        if let Some(finisher_id) = &bet.finisher_id {
-            if member_ids.contains(&bet.starter_id) && member_ids.contains(finisher_id) {
-                matched_bets.push(bet);
-            }
-        }
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "fixture_id": fixture_id,
-        "channel_id": channel_id,
-        "bettors": matched_bets,
-        "count": matched_bets.len(),
-    })))
-}
-
-// ============================================================================
-// 12. GET CHANNEL MEMBERS
-// ============================================================================
-pub async fn get_channel_members_handler(
-    State(state): State<AppState>,
-    Path(channel_id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let channels_col: Collection<Channel> = state.db.collection("channels");
-
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &channel_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    let member_ids: Vec<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
-
-    Ok(Json(json!({
-        "success": true,
-        "channel_id": channel_id,
-        "member_ids": member_ids,
-        "count": member_ids.len(),
-    })))
-}
-
-// ============================================================================
-// 13. GET USER'S BETS
-// ============================================================================
-pub async fn get_user_bets_handler(
-    State(state): State<AppState>,
-    Path(user_id): Path<String>,
-) -> Result<Json<serde_json::Value>, AppError> {
-    let bets_col: Collection<Bet> = state.db.collection("bets");
-
-    let mut cursor = bets_col
-        .find(doc! {
-            "$or": [
-                { "starter_id": &user_id },
-                { "finisher_id": &user_id },
-            ]
-        })
-        .sort(doc! { "created_at": -1 })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?;
-
-    let mut bets = Vec::new();
-    while let Some(bet) = cursor.next().await {
-        let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
-        bets.push(bet);
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "user_id": user_id,
-        "bets": bets,
-        "count": bets.len(),
-    })))
-}
-
-// ============================================================================
-// 14. GET VOTE COUNT — DEPRECATED (reads from fixtures, will be removed)
-// ============================================================================
-pub async fn get_vote_count_handler(
     State(state): State<AppState>,
     Path((channel_id, fixture_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1196,7 +1012,7 @@ pub async fn get_vote_count_handler(
 }
 
 // ============================================================================
-// 15. GET VOTE BREAKDOWN (from votes collection)
+// 10. GET VOTE BREAKDOWN (from votes collection)
 // ============================================================================
 pub async fn get_vote_breakdown_handler(
     State(state): State<AppState>,
@@ -1245,7 +1061,7 @@ pub async fn get_vote_breakdown_handler(
 }
 
 // ============================================================================
-// 16. GET CHANNEL VOTES (Same pattern as pledges and bets)
+// 11. GET CHANNEL VOTES
 // ============================================================================
 pub async fn get_channel_votes_handler(
     State(state): State<AppState>,
@@ -1294,5 +1110,194 @@ pub async fn get_channel_votes_handler(
         "votes": channel_votes,
         "count": vote_count,
         "vote_count": vote_count,
+    })))
+}
+
+// ============================================================================
+// 12. GET CHANNEL PLEDGES
+// ============================================================================
+pub async fn get_channel_pledges_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let bets_col: Collection<Bet> = state.db.collection("bets");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
+
+    let mut cursor = bets_col
+        .find(doc! {
+            "fixture_id": &fixture_id,
+            "status": "open",
+        })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut open_bets = Vec::new();
+    while let Some(bet) = cursor.next().await {
+        let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
+        if member_ids.contains(&bet.starter_id) {
+            open_bets.push(json!({
+                "id": bet.id.map(|oid| oid.to_hex()),
+                "starter_id": bet.starter_id,
+                "starter_name": bet.starter_name,
+                "starter_selection": bet.starter_selection,
+                "starter_amount": bet.starter_amount,
+                "status": bet.status,
+                "created_at": bet.created_at,
+            }));
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "channel_id": channel_id,
+        "pledges": open_bets,
+        "count": open_bets.len(),
+    })))
+}
+
+// ============================================================================
+// 13. GET CHANNEL BETTORS (Matched bets)
+// ============================================================================
+pub async fn get_channel_bettors_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let bets_col: Collection<Bet> = state.db.collection("bets");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
+
+    let mut cursor = bets_col
+        .find(doc! {
+            "fixture_id": &fixture_id,
+            "status": { "$in": vec!["matched", "settled"] },
+        })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut matched_bets = Vec::new();
+    while let Some(bet) = cursor.next().await {
+        let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
+        if let Some(finisher_id) = &bet.finisher_id {
+            if member_ids.contains(&bet.starter_id) && member_ids.contains(finisher_id) {
+                matched_bets.push(json!({
+                    "id": bet.id.map(|oid| oid.to_hex()),
+                    "starter_id": bet.starter_id,
+                    "starter_name": bet.starter_name,
+                    "starter_selection": bet.starter_selection,
+                    "starter_amount": bet.starter_amount,
+                    "finisher_id": bet.finisher_id,
+                    "finisher_name": bet.finisher_name,
+                    "finisher_selection": bet.finisher_selection,
+                    "finisher_amount": bet.finisher_amount,
+                    "status": bet.status,
+                    "total_pot": bet.total_pot(),
+                    "created_at": bet.created_at,
+                    "matched_at": bet.matched_at,
+                }));
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "channel_id": channel_id,
+        "bettors": matched_bets,
+        "count": matched_bets.len(),
+    })))
+}
+
+// ============================================================================
+// 14. GET CHANNEL MEMBERS
+// ============================================================================
+pub async fn get_channel_members_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_ids: Vec<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel_id,
+        "member_ids": member_ids,
+        "count": member_ids.len(),
+    })))
+}
+
+// ============================================================================
+// 15. GET USER'S BETS
+// ============================================================================
+pub async fn get_user_bets_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let bets_col: Collection<Bet> = state.db.collection("bets");
+
+    let mut cursor = bets_col
+        .find(doc! {
+            "$or": [
+                { "starter_id": &user_id },
+                { "finisher_id": &user_id },
+            ]
+        })
+        .sort(doc! { "created_at": -1 })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut bets = Vec::new();
+    while let Some(bet) = cursor.next().await {
+        let bet: Bet = bet.map_err(|e| AppError::MongoDB(e))?;
+        bets.push(json!({
+            "id": bet.id.map(|oid| oid.to_hex()),
+            "fixture_id": bet.fixture_id,
+            "starter_id": bet.starter_id,
+            "starter_name": bet.starter_name,
+            "starter_selection": bet.starter_selection,
+            "starter_amount": bet.starter_amount,
+            "finisher_id": bet.finisher_id,
+            "finisher_name": bet.finisher_name,
+            "finisher_selection": bet.finisher_selection,
+            "finisher_amount": bet.finisher_amount,
+            "vote_id": bet.vote_id,
+            "status": bet.status,
+            "winner_id": bet.winner_id,
+            "starter_result": bet.starter_result,
+            "finisher_result": bet.finisher_result,
+            "created_at": bet.created_at,
+            "matched_at": bet.matched_at,
+            "settled_at": bet.settled_at,
+            "total_pot": bet.total_pot(),
+        }));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "user_id": user_id,
+        "bets": bets,
+        "count": bets.len(),
     })))
 }

@@ -24,6 +24,7 @@ pub struct StkPushRequest {
     pub amount: String,
     pub account_reference: Option<String>,
     pub transaction_desc: Option<String>,
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +129,11 @@ pub async fn initiate_stk_push(
         return Json(json!({ "success": false, "error": "Phone number and amount are required" }));
     }
 
+    // ✅ Validate user_id
+    if request.user_id.is_none() || request.user_id.as_ref().unwrap().is_empty() {
+        return Json(json!({ "success": false, "error": "User ID is required" }));
+    }
+
     let amount: f64 = match request.amount.parse() {
         Ok(a) if a > 0.0 => a,
         _ => {
@@ -158,12 +164,11 @@ pub async fn initiate_stk_push(
     };
 
     let now = now_str();
+
+    // ✅ STORE user_id in transaction
     let transaction = Transaction {
         id: None,
-        user_id: request
-            .account_reference
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string()),
+        user_id: request.user_id.clone().unwrap(), // ✅ Store user_id
         phone_number: request.phone_number.clone(),
         amount,
         merchant_request_id: response.merchant_request_id.clone(),
@@ -195,7 +200,6 @@ pub async fn initiate_stk_push(
         "customer_message": response.customer_message,
     }))
 }
-
 pub async fn mpesa_confirmation(
     State(state): State<AppState>,
     Json(payload): Json<MpesaCallback>,
@@ -303,36 +307,46 @@ pub async fn mpesa_confirmation(
                 }
             }
 
+            // ✅ UPDATE USER BALANCE BY user_id (from transaction)
             if callback.result_code == 0 {
                 let amount_to_add = paid_amount.unwrap_or(transaction.amount);
-                let phone_for_update = paying_phone
-                    .clone()
-                    .unwrap_or_else(|| transaction.phone_number.clone());
+                let user_id = transaction.user_id.clone(); // ✅ Get user_id from transaction
 
                 println!(
-                    "💰 Adding {} to user balance for phone: {}",
-                    amount_to_add, phone_for_update
+                    "💰 Adding {} to user balance for user_id: {}",
+                    amount_to_add, user_id
                 );
 
                 let users: Collection<User> = state.db.collection("users");
-                let normalized = normalize_phone(&phone_for_update);
-                let filter = doc! { "phone": { "$regex": format!("{}$", normalized) } };
+
+                // ✅ Parse user_id to ObjectId
+                let user_oid = match bson::oid::ObjectId::parse_str(&user_id) {
+                    Ok(oid) => oid,
+                    Err(e) => {
+                        error!("❌ Invalid user_id format: {} - {}", user_id, e);
+                        return Json(json!({ "ResultCode": 1, "ResultDesc": "Invalid user_id" }));
+                    }
+                };
+
                 let now_bson = BsonDateTime::now();
 
+                // ✅ Update balance by user_id
                 let update_balance = doc! {
                     "$inc": { "balance": amount_to_add },
                     "$set": { "updated_at": now_bson }
                 };
 
-                match users.update_one(filter, update_balance).await {
+                match users
+                    .update_one(doc! { "_id": user_oid }, update_balance)
+                    .await
+                {
                     Ok(result) => {
                         if result.matched_count > 0 {
-                            println!(
-                                "✅ User balance updated successfully for: {}",
-                                phone_for_update
-                            );
+                            println!("✅ User balance updated successfully for user: {}", user_id);
+                            info!("💰 Added {} to user {} balance", amount_to_add, user_id);
                         } else {
-                            println!("⚠️ User not found for phone: {}", phone_for_update);
+                            println!("⚠️ User not found: {}", user_id);
+                            error!("User not found: {}", user_id);
                         }
                     }
                     Err(e) => {
@@ -340,6 +354,7 @@ pub async fn mpesa_confirmation(
                     }
                 }
 
+                // ✅ Save MpesaTransaction record
                 if let Some(receipt) = mpesa_receipt_number {
                     let mpesa_tx = MpesaTransaction {
                         id: None,

@@ -10,8 +10,8 @@ use crate::{
         cast_vote_handler, check_user_vote_handler, create_bet_handler, fill_bet_handler,
         get_channel_bettors_handler, get_channel_members_handler, get_channel_pledges_handler,
         get_channel_vote_count_handler, get_fixture_voters_handler, get_user_bets_handler,
-        get_user_votes_handler, get_vote_breakdown_handler, get_vote_count_handler,
-        rollback_vote_handler, settle_bets_handler,
+        get_user_votes_handler, get_vote_breakdown_handler, rollback_vote_handler,
+        settle_bets_handler,
     },
     AppState,
 };
@@ -32,7 +32,6 @@ pub fn actions_routes() -> Router<AppState> {
         )
         .route("/vote/user/:user_id", get(get_user_votes_handler))
         .route("/vote/rollback", post(rollback_vote_handler))
-        .route("/vote/count/:fixture_id", get(get_vote_count_handler))
         .route(
             "/vote/breakdown/:fixture_id",
             get(get_vote_breakdown_handler),

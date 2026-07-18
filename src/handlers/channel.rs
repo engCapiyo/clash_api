@@ -4,13 +4,14 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use bson::{doc, oid::ObjectId, Bson, DateTime};
+use bson::{doc, oid::ObjectId, Bson, DateTime as BsonDateTime};
 use futures_util::StreamExt;
 use mongodb::Collection;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::models::actions::Bet;
 use crate::models::game::Game;
 use crate::services::fcm_service::FCMService;
 use serde::Deserialize;
@@ -23,6 +24,137 @@ use crate::models::channel::{
 };
 use crate::models::pledges::{CreatePledge, Pledge};
 use crate::AppState;
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+fn calculate_points(selection: &str, result: &str) -> i32 {
+    if selection == result {
+        3
+    } else if selection == "draw" && result != "draw" {
+        -1
+    } else if selection != "draw" && result == "draw" {
+        -1
+    } else {
+        -3
+    }
+}
+
+// Helper to find a fixture in either collection
+async fn find_fixture_in_both(
+    fixtures_col: &Collection<Fixture>,
+    games_col: &Collection<Game>,
+    fixture_id: &str,
+) -> Result<Option<(String, serde_json::Value)>> {
+    // Try fixtures collection first (nationals)
+    let fixture_filter = doc! {
+        "$or": [
+            { "fixture_id": fixture_id },
+            { "match_id": fixture_id }
+        ]
+    };
+
+    if let Some(fixture) = fixtures_col.find_one(fixture_filter.clone()).await? {
+        let json = serde_json::to_value(&fixture)?;
+        return Ok(Some(("fixtures".to_string(), json)));
+    }
+
+    // Try games collection (leagues)
+    let mut game_or_clauses = vec![
+        doc! { "game_id": fixture_id },
+        doc! { "match_id": fixture_id },
+    ];
+    if let Ok(oid) = ObjectId::parse_str(fixture_id) {
+        game_or_clauses.push(doc! { "_id": oid });
+    }
+    let game_filter = doc! { "$or": game_or_clauses };
+
+    if let Some(game) = games_col.find_one(game_filter).await? {
+        let json = serde_json::to_value(&game)?;
+        return Ok(Some(("games".to_string(), json)));
+    }
+
+    Ok(None)
+}
+
+async fn update_fixture_in_both(
+    fixtures_col: &Collection<Fixture>,
+    games_col: &Collection<Game>,
+    fixture_id: &str,
+    result: &str,
+) -> Result<(bool, bool)> {
+    let mut updated_fixtures = false;
+    let mut updated_games = false;
+
+    // Update fixtures collection (nationals)
+    let fixture_filter = doc! {
+        "$or": [
+            { "fixture_id": fixture_id },
+            { "match_id": fixture_id }
+        ]
+    };
+
+    let fixture_result = fixtures_col
+        .update_one(
+            fixture_filter,
+            doc! {
+                "$set": {
+                    "result": result,
+                    "status": "completed",
+                }
+            },
+        )
+        .await?;
+
+    if fixture_result.matched_count > 0 {
+        updated_fixtures = true;
+    }
+
+    // Update games collection (leagues)
+    let game_filter = doc! {
+        "$or": [
+            { "game_id": fixture_id },
+            { "match_id": fixture_id }
+        ]
+    };
+
+    let game_result = games_col
+        .update_one(
+            game_filter,
+            doc! {
+                "$set": {
+                    "result": result,
+                    "status": "completed",
+                }
+            },
+        )
+        .await?;
+
+    if game_result.matched_count > 0 {
+        updated_games = true;
+    }
+
+    Ok((updated_fixtures, updated_games))
+}
+
+async fn log_membership_event(state: &AppState, channel_id: &str, user_id: &str, event_type: &str) {
+    let events_col = state
+        .db
+        .collection::<ChannelMembershipEvent>("channel_membership_events");
+
+    let event = ChannelMembershipEvent {
+        id: None,
+        channel_id: channel_id.to_string(),
+        user_id: user_id.to_string(),
+        event_type: event_type.to_string(),
+        occurred_at: BsonDateTime::now(),
+    };
+
+    if let Err(e) = events_col.insert_one(event).await {
+        eprintln!("⚠️ Failed to log membership event: {}", e);
+    }
+}
 
 // ============================================================================
 // CREATE CHANNEL
@@ -43,175 +175,13 @@ pub struct NewMember {
     pub username: String,
 }
 
-// ============================================================================
-// FINALIZE FIXTURE RESULT
-// ============================================================================
-
-#[derive(Debug, serde::Deserialize)]
-pub struct FinalizeFixtureRequest {
-    pub fixture_id: String,
-    pub result: String,
-}
-
-// ============================================================================
-// LOG MEMBERSHIP EVENT
-// ============================================================================
-
-async fn log_membership_event(state: &AppState, channel_id: &str, user_id: &str, event_type: &str) {
-    let events_col = state
-        .db
-        .collection::<ChannelMembershipEvent>("channel_membership_events");
-
-    let event = ChannelMembershipEvent {
-        id: None,
-        channel_id: channel_id.to_string(),
-        user_id: user_id.to_string(),
-        event_type: event_type.to_string(),
-        occurred_at: DateTime::now(),
-    };
-
-    if let Err(e) = events_col.insert_one(event).await {
-        eprintln!("⚠️ Failed to log membership event: {}", e);
-    }
-}
-
-// ============================================================================
-// FINALIZE FIXTURE RESULT HANDLER
-// ============================================================================
-
-pub async fn finalize_fixture_result_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<FinalizeFixtureRequest>,
-) -> Result<Json<serde_json::Value>> {
-    let votes_col = state.db.collection::<Vote>("votes");
-    let channels_col = state.db.collection::<Channel>("channels");
-    let users_col = state.db.collection::<User>("users");
-    let fixtures_col = state.db.collection::<Fixture>("fixtures");
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
-
-    // ✅ Update fixture status (match data — still in fixtures)
-    fixtures_col
-        .update_one(
-            doc! { "fixture_id": &payload.fixture_id },
-            doc! {
-                "$set": {
-                    "result": &payload.result,
-                    "status": "completed",
-                }
-            },
-        )
-        .await?;
-
-    // ✅ Update channel_fixtures status
-    channel_fixtures_col
-        .update_many(
-            doc! { "fixture_id": &payload.fixture_id },
-            doc! { "$set": { "status": "completed" } },
-        )
-        .await?;
-
-    let mut cursor = votes_col
-        .find(doc! {
-            "fixture_id": &payload.fixture_id,
-            "is_correct": Bson::Null
-        })
-        .await?;
-
-    let mut updates = Vec::new();
-
-    while cursor.advance().await? {
-        let vote: Vote = cursor.deserialize_current()?;
-
-        let is_correct = vote.selection == payload.result;
-        let points = if is_correct {
-            3
-        } else if vote.selection == "draw" && payload.result != "draw" {
-            -1
-        } else if vote.selection != "draw" && payload.result == "draw" {
-            -1
-        } else {
-            -3
-        };
-
-        votes_col
-            .update_one(
-                doc! { "_id": vote.id },
-                doc! {
-                    "$set": {
-                        "is_correct": is_correct,
-                        "points_awarded": points,
-                    }
-                },
-            )
-            .await?;
-
-        let user_result = users_col
-            .update_one(
-                doc! { "_id": ObjectId::parse_str(&vote.user_id)? },
-                doc! {
-                    "$inc": {
-                        "season_points": points,
-                        "correct_votes": if is_correct { 1 } else { 0 },
-                    }
-                },
-            )
-            .await?;
-
-        if user_result.matched_count > 0 {
-            updates.push(vote.user_id);
-        }
-    }
-
-    for user_id in &updates {
-        let user = users_col
-            .find_one(doc! { "_id": ObjectId::parse_str(user_id)? })
-            .await?;
-
-        if let Some(user) = user {
-            let mut channel_cursor = channels_col
-                .find(doc! { "members.user_id": user_id })
-                .await?;
-
-            while channel_cursor.advance().await? {
-                let channel: Channel = channel_cursor.deserialize_current()?;
-
-                channels_col
-                    .update_one(
-                        doc! {
-                            "channel_id": &channel.channel_id,
-                            "members.user_id": user_id,
-                        },
-                        doc! {
-                            "$set": {
-                                "members.$.season_points": user.season_points,
-                                "members.$.correct_votes": user.correct_votes,
-                                "members.$.total_votes": user.total_votes,
-                            }
-                        },
-                    )
-                    .await?;
-            }
-        }
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "processed": true,
-        "users_updated": updates.len()
-    })))
-}
-
-// ============================================================================
-// CREATE CHANNEL HANDLER
-// ============================================================================
-
 pub async fn create_channel_handler(
     State(state): State<AppState>,
     Json(payload): Json<CreateChannelRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
     let users_col = state.db.collection::<User>("users");
-    let now = DateTime::now();
+    let now = BsonDateTime::now();
     let channel_id = Uuid::new_v4().to_string();
     let invite_code = Uuid::new_v4().to_string().to_uppercase()[0..6].to_string();
 
@@ -305,66 +275,277 @@ pub async fn create_channel_handler(
 }
 
 // ============================================================================
-// CHECK USER VOTE IN CHANNEL
+// FINALIZE FIXTURE RESULT
 // ============================================================================
 
-pub async fn check_user_vote_in_channel_handler(
+#[derive(Debug, serde::Deserialize)]
+pub struct FinalizeFixtureRequest {
+    pub fixture_id: String,
+    pub result: String,
+}
+
+pub async fn finalize_fixture_result_handler(
     State(state): State<AppState>,
-    Path((_channel_id, fixture_id, user_id)): Path<(String, String, String)>,
+    Json(payload): Json<FinalizeFixtureRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let votes_col = state.db.collection::<Vote>("votes");
+    let channels_col = state.db.collection::<Channel>("channels");
+    let users_col = state.db.collection::<User>("users");
+    let fixtures_col = state.db.collection::<Fixture>("fixtures");
+    let games_col = state.db.collection::<Game>("games");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
-    let vote = votes_col
-        .find_one(doc! {
-            "fixture_id": &fixture_id,
-            "user_id": &user_id,
+    // Update BOTH collections
+    let (fixtures_updated, games_updated) = update_fixture_in_both(
+        &fixtures_col,
+        &games_col,
+        &payload.fixture_id,
+        &payload.result,
+    )
+    .await?;
+
+    // Update all channel_fixtures with this fixture_id
+    channel_fixtures_col
+        .update_many(
+            doc! { "fixture_id": &payload.fixture_id },
+            doc! { "$set": { "status": "completed" } },
+        )
+        .await?;
+
+    // Process all votes for this fixture
+    let mut cursor = votes_col
+        .find(doc! {
+            "fixture_id": &payload.fixture_id,
+            "is_correct": Bson::Null
         })
         .await?;
 
+    let mut updates = Vec::new();
+
+    while cursor.advance().await? {
+        let vote: Vote = cursor.deserialize_current()?;
+
+        let is_correct = vote.selection == payload.result;
+        let points = calculate_points(&vote.selection, &payload.result);
+
+        votes_col
+            .update_one(
+                doc! { "_id": vote.id },
+                doc! {
+                    "$set": {
+                        "is_correct": is_correct,
+                        "points_awarded": points,
+                    }
+                },
+            )
+            .await?;
+
+        let user_result = users_col
+            .update_one(
+                doc! { "_id": ObjectId::parse_str(&vote.user_id)? },
+                doc! {
+                    "$inc": {
+                        "season_points": points,
+                        "correct_votes": if is_correct { 1 } else { 0 },
+                    }
+                },
+            )
+            .await?;
+
+        if user_result.matched_count > 0 {
+            updates.push(vote.user_id);
+        }
+    }
+
+    for user_id in &updates {
+        let user = users_col
+            .find_one(doc! { "_id": ObjectId::parse_str(user_id)? })
+            .await?;
+
+        if let Some(user) = user {
+            let mut channel_cursor = channels_col
+                .find(doc! { "members.user_id": user_id })
+                .await?;
+
+            while channel_cursor.advance().await? {
+                let channel: Channel = channel_cursor.deserialize_current()?;
+
+                channels_col
+                    .update_one(
+                        doc! {
+                            "channel_id": &channel.channel_id,
+                            "members.user_id": user_id,
+                        },
+                        doc! {
+                            "$set": {
+                                "members.$.season_points": user.season_points,
+                                "members.$.correct_votes": user.correct_votes,
+                                "members.$.total_votes": user.total_votes,
+                            }
+                        },
+                    )
+                    .await?;
+            }
+        }
+    }
+
     Ok(Json(json!({
         "success": true,
-        "has_voted": vote.is_some(),
-        "selection": vote.as_ref().map(|v| &v.selection),
+        "processed": true,
+        "users_updated": updates.len(),
+        "fixtures_updated": fixtures_updated,
+        "games_updated": games_updated,
+        "source": if fixtures_updated && games_updated {
+            "both"
+        } else if fixtures_updated {
+            "fixtures"
+        } else if games_updated {
+            "games"
+        } else {
+            "none"
+        }
     })))
 }
 
 // ============================================================================
-// GET SINGLE FIXTURE
+// CAST VOTE
 // ============================================================================
 
-pub async fn get_single_fixture_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<Value>> {
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
-
-    let fixture = channel_fixtures_col
-        .find_one(doc! {
-            "channel_id": &channel_id,
-            "fixture_id": &fixture_id,
-        })
-        .await?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    Ok(Json(json!({
-        "success": true,
-        "fixture": fixture,
-    })))
+#[derive(Debug, serde::Deserialize)]
+pub struct CastVoteRequest {
+    pub fixture_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub selection: String,
 }
 
-// ============================================================================
-// GET USER CHANNEL VOTES (deprecated)
-// ============================================================================
-
-pub async fn get_user_channel_votes_handler(
+pub async fn cast_vote_handler(
     State(state): State<AppState>,
-    Path((_channel_id, user_id)): Path<(String, String)>,
+    Json(payload): Json<CastVoteRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    get_user_votes_handler(State(state), Path(user_id)).await
+    let votes_col = state.db.collection::<Vote>("votes");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+    let fixtures_col = state.db.collection::<Fixture>("fixtures");
+    let games_col = state.db.collection::<Game>("games");
+    let users_col = state.db.collection::<User>("users");
+    let channels_col = state.db.collection::<Channel>("channels");
+    let now = BsonDateTime::now();
+
+    // Check if already voted
+    let existing_vote = votes_col
+        .find_one(doc! {
+            "fixture_id": &payload.fixture_id,
+            "user_id": &payload.user_id,
+        })
+        .await?;
+
+    if existing_vote.is_some() {
+        return Err(AppError::ValidationError(
+            "Already voted on this fixture".to_string(),
+        ));
+    }
+
+    let user_id_obj = ObjectId::parse_str(&payload.user_id)?;
+    let user = users_col
+        .find_one(doc! { "_id": user_id_obj })
+        .await?
+        .ok_or_else(|| AppError::DocumentNotFound)?;
+
+    let display_selection = match payload.selection.as_str() {
+        "home" => "home_team",
+        "away" => "away_team",
+        "draw" => "draw",
+        _ => &payload.selection,
+    };
+
+    // Insert vote
+    let vote = Vote {
+        id: None,
+        fixture_id: payload.fixture_id.clone(),
+        user_id: payload.user_id.clone(),
+        user_name: payload.username.clone(),
+        selection: display_selection.to_string(),
+        is_correct: None,
+        points_awarded: None,
+        voted_at: now,
+    };
+
+    votes_col.insert_one(&vote).await?;
+
+    // Update channel_fixtures vote counts
+    let increment_field = match payload.selection.as_str() {
+        "home" => "vote_counts.home",
+        "away" => "vote_counts.away",
+        "draw" => "vote_counts.draw",
+        _ => return Err(AppError::ValidationError("Invalid selection".to_string())),
+    };
+
+    channel_fixtures_col
+        .update_many(
+            doc! { "fixture_id": &payload.fixture_id },
+            doc! { "$inc": { increment_field: 1 } },
+        )
+        .await?;
+
+    // Update BOTH global collections
+    let fixture_filter = doc! {
+        "$or": [
+            { "fixture_id": &payload.fixture_id },
+            { "match_id": &payload.fixture_id }
+        ]
+    };
+
+    fixtures_col
+        .update_one(fixture_filter.clone(), doc! { "$inc": { "votes": 1 } })
+        .await?;
+
+    let game_filter = doc! {
+        "$or": [
+            { "game_id": &payload.fixture_id },
+            { "match_id": &payload.fixture_id }
+        ]
+    };
+
+    games_col
+        .update_one(game_filter, doc! { "$inc": { "votes": 1 } })
+        .await?;
+
+    // Update user's total_votes
+    users_col
+        .update_one(
+            doc! { "_id": user_id_obj },
+            doc! { "$inc": { "total_votes": 1 } },
+        )
+        .await?;
+
+    // Update channel members
+    let mut channel_cursor = channels_col
+        .find(doc! { "members.user_id": &payload.user_id })
+        .await?;
+
+    while channel_cursor.advance().await? {
+        let channel: Channel = channel_cursor.deserialize_current()?;
+        channels_col
+            .update_one(
+                doc! {
+                    "channel_id": &channel.channel_id,
+                    "members.user_id": &payload.user_id,
+                },
+                doc! { "$set": { "members.$.last_active_at": now } },
+            )
+            .await?;
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Vote cast successfully",
+        "fixture_id": payload.fixture_id,
+        "selection": payload.selection,
+    })))
 }
 
 // ============================================================================
-// CHECK USER VOTE (GLOBAL)
+// CHECK USER VOTE
 // ============================================================================
 
 pub async fn check_user_vote_handler(
@@ -387,8 +568,15 @@ pub async fn check_user_vote_handler(
     })))
 }
 
+pub async fn check_user_vote_in_channel_handler(
+    State(state): State<AppState>,
+    Path((_channel_id, fixture_id, user_id)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    check_user_vote_handler(State(state), Path((fixture_id, user_id))).await
+}
+
 // ============================================================================
-// GET USER VOTES (GLOBAL)
+// GET USER VOTES
 // ============================================================================
 
 pub async fn get_user_votes_handler(
@@ -414,98 +602,746 @@ pub async fn get_user_votes_handler(
     })))
 }
 
-// ============================================================================
-// GET USER CHANNELS
-// ============================================================================
-
-pub async fn get_user_channels_handler(
+pub async fn get_user_channel_votes_handler(
     State(state): State<AppState>,
-    Path(user_id): Path<String>,
+    Path((_channel_id, user_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let channels_col = state.db.collection::<Channel>("channels");
-
-    let filter = doc! { "members.user_id": &user_id };
-    let mut cursor = channels_col.find(filter).await?;
-
-    let mut channels = Vec::new();
-    while cursor.advance().await? {
-        channels.push(cursor.deserialize_current()?);
-    }
-
-    let transformed_channels: Vec<serde_json::Value> = channels
-        .into_iter()
-        .map(|channel: Channel| {
-            let is_admin = channel
-                .members
-                .iter()
-                .any(|member| member.user_id == user_id && member.role == "admin");
-
-            let mut channel_json = serde_json::to_value(channel).unwrap_or(json!({}));
-
-            if let Some(obj) = channel_json.as_object_mut() {
-                obj.insert("is_admin".to_string(), json!(is_admin));
-            }
-
-            channel_json
-        })
-        .collect();
-
-    let count = transformed_channels.len();
-
-    Ok(Json(json!({
-        "success": true,
-        "channels": transformed_channels,
-        "count": count,
-    })))
+    get_user_votes_handler(State(state), Path(user_id)).await
 }
 
 // ============================================================================
-// GET USER CHANNEL COUNT
+// GET VOTE COUNT
 // ============================================================================
 
-pub async fn get_user_channel_count_handler(
+pub async fn get_vote_count_handler(
     State(state): State<AppState>,
-    Path(user_id): Path<String>,
+    Path(fixture_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let channels_col = state.db.collection::<Channel>("channels");
+    let votes_col = state.db.collection::<Vote>("votes");
 
-    let count = channels_col
-        .count_documents(doc! { "members.user_id": &user_id })
+    let count = votes_col
+        .count_documents(doc! { "fixture_id": &fixture_id })
         .await?;
 
     Ok(Json(json!({
         "success": true,
-        "user_id": user_id,
-        "channel_count": count,
+        "fixture_id": fixture_id,
+        "vote_count": count,
     })))
 }
 
 // ============================================================================
-// GET CHANNEL BY ID
+// GET CHANNEL VOTE COUNT
 // ============================================================================
 
-pub async fn get_channel_handler(
+pub async fn get_channel_vote_count_handler(
     State(state): State<AppState>,
-    Path(channel_id): Path<String>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let channels_col = state.db.collection::<Channel>("channels");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &channel_id })
+    let result = channel_fixtures_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "fixture_id": &fixture_id,
+        })
+        .await?;
+
+    let vote_counts = result.map(|cf| cf.vote_counts).unwrap_or(VoteCounts {
+        home: 0,
+        away: 0,
+        draw: 0,
+    });
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "channel_id": channel_id,
+        "vote_counts": vote_counts,
+        "total": vote_counts.home + vote_counts.away + vote_counts.draw,
+    })))
+}
+
+// ============================================================================
+// GET VOTE BREAKDOWN
+// ============================================================================
+
+pub async fn get_vote_breakdown_handler(
+    State(state): State<AppState>,
+    Path(fixture_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let votes_col = state.db.collection::<Vote>("votes");
+
+    let pipeline = vec![
+        doc! {
+            "$match": { "fixture_id": &fixture_id }
+        },
+        doc! {
+            "$group": {
+                "_id": "$selection",
+                "count": { "$sum": 1 }
+            }
+        },
+    ];
+
+    let mut cursor = votes_col.aggregate(pipeline).await?;
+    let mut breakdown = HashMap::new();
+    let mut total = 0;
+
+    while cursor.advance().await? {
+        let doc = cursor.deserialize_current()?;
+        let selection: String = doc.get("_id").unwrap().as_str().unwrap().to_string();
+        let count: i32 = doc.get("count").unwrap().as_i32().unwrap();
+        breakdown.insert(selection, count);
+        total += count;
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "breakdown": breakdown,
+        "total": total,
+    })))
+}
+
+// ============================================================================
+// GET FIXTURE VOTERS
+// ============================================================================
+
+pub async fn get_fixture_voters_handler(
+    State(state): State<AppState>,
+    Path(fixture_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let votes_col = state.db.collection::<Vote>("votes");
+
+    let mut cursor = votes_col.find(doc! { "fixture_id": &fixture_id }).await?;
+
+    let mut voters = Vec::new();
+    while cursor.advance().await? {
+        let vote: Vote = cursor.deserialize_current()?;
+        voters.push(json!({
+            "user_id": vote.user_id,
+            "username": vote.user_name,
+            "selection": vote.selection,
+            "voted_at": vote.voted_at,
+        }));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "voters": voters,
+        "count": voters.len(),
+    })))
+}
+
+// ============================================================================
+// ROLLBACK VOTE
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RollbackVoteRequest {
+    pub fixture_id: String,
+    pub user_id: String,
+}
+
+pub async fn rollback_vote_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<RollbackVoteRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let votes_col = state.db.collection::<Vote>("votes");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+    let fixtures_col = state.db.collection::<Fixture>("fixtures");
+    let games_col = state.db.collection::<Game>("games");
+    let users_col = state.db.collection::<User>("users");
+
+    // Find the vote
+    let vote = votes_col
+        .find_one(doc! {
+            "fixture_id": &payload.fixture_id,
+            "user_id": &payload.user_id,
+        })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    // Delete the vote
+    votes_col
+        .delete_one(doc! {
+            "fixture_id": &payload.fixture_id,
+            "user_id": &payload.user_id,
+        })
+        .await?;
+
+    // Decrement channel_fixtures vote counts
+    let decrement_field = match vote.selection.as_str() {
+        "home_team" | "home" => "vote_counts.home",
+        "away_team" | "away" => "vote_counts.away",
+        "draw" => "vote_counts.draw",
+        _ => return Err(AppError::ValidationError("Invalid selection".to_string())),
+    };
+
+    channel_fixtures_col
+        .update_many(
+            doc! { "fixture_id": &payload.fixture_id },
+            doc! { "$inc": { decrement_field: -1 } },
+        )
+        .await?;
+
+    // Decrement BOTH global collections
+    let fixture_filter = doc! {
+        "$or": [
+            { "fixture_id": &payload.fixture_id },
+            { "match_id": &payload.fixture_id }
+        ]
+    };
+
+    fixtures_col
+        .update_one(fixture_filter.clone(), doc! { "$inc": { "votes": -1 } })
+        .await?;
+
+    let game_filter = doc! {
+        "$or": [
+            { "game_id": &payload.fixture_id },
+            { "match_id": &payload.fixture_id }
+        ]
+    };
+
+    games_col
+        .update_one(game_filter, doc! { "$inc": { "votes": -1 } })
+        .await?;
+
+    // Decrement user's total_votes
+    users_col
+        .update_one(
+            doc! { "_id": ObjectId::parse_str(&payload.user_id)? },
+            doc! { "$inc": { "total_votes": -1 } },
+        )
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Vote rolled back successfully",
+        "fixture_id": payload.fixture_id,
+        "user_id": payload.user_id,
+    })))
+}
+
+// ============================================================================
+// BET HANDLERS (UPDATED WITH NEW STRUCTURE - NO bet_id field)
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateBetRequest {
+    pub starter_id: String,
+    pub starter_name: String,
+    pub starter_selection: String,
+    pub amount: f64,
+    pub fixture_id: String,
+    pub vote_id: String,
+}
+
+pub async fn create_bet_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateBetRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let bets_col = state.db.collection::<Bet>("bets");
+    let users_col = state.db.collection::<User>("users");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+    let now = BsonDateTime::now();
+
+    let user_id_obj = ObjectId::parse_str(&payload.starter_id)?;
+    let user = users_col
+        .find_one(doc! { "_id": user_id_obj })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    if user.balance < payload.amount {
+        return Err(AppError::ValidationError(format!(
+            "Insufficient balance. You have KES {:.2}, need KES {:.2}",
+            user.balance, payload.amount
+        )));
+    }
+
+    // Validate vote exists - using fixture_id and user_id
+    let votes_col = state.db.collection::<Vote>("votes");
+    let vote = votes_col
+        .find_one(doc! {
+            "fixture_id": &payload.fixture_id,
+            "user_id": &payload.starter_id,
+        })
+        .await?
+        .ok_or(AppError::ValidationError(
+            "Vote not found for this fixture".to_string(),
+        ))?;
+
+    // Create bet using the new_open constructor
+    let bet = Bet::new_open(
+        payload.fixture_id.clone(),
+        payload.starter_id.clone(),
+        payload.starter_name.clone(),
+        payload.starter_selection.clone(),
+        payload.amount,
+        vote.id.unwrap().to_hex(), // Convert ObjectId to string for vote_id
+    );
+
+    let inserted = bets_col.insert_one(&bet).await?;
+    let bet_id = inserted.inserted_id.as_object_id().unwrap();
+
+    // Deduct balance
+    users_col
+        .update_one(
+            doc! { "_id": user_id_obj },
+            doc! {
+                "$inc": { "balance": -payload.amount },
+                "$set": { "updated_at": now }
+            },
+        )
+        .await?;
+
+    // Update channel_fixtures bet_count
+    channel_fixtures_col
+        .update_many(
+            doc! { "fixture_id": &payload.fixture_id },
+            doc! { "$inc": { "bet_count": 1 } },
+        )
+        .await?;
+
+    // Fetch the created bet
+    let created_bet = bets_col
+        .find_one(doc! { "_id": bet_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
     Ok(Json(json!({
         "success": true,
-        "channel": channel,
+        "message": "Bet placed successfully",
+        "bet": {
+            "id": created_bet.id.unwrap().to_hex(),
+            "fixture_id": created_bet.fixture_id,
+            "starter_id": created_bet.starter_id,
+            "starter_name": created_bet.starter_name,
+            "starter_selection": created_bet.starter_selection,
+            "starter_amount": created_bet.starter_amount,
+            "vote_id": created_bet.vote_id,
+            "status": created_bet.status,
+            "created_at": created_bet.created_at,
+        },
+    })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct FillBetRequest {
+    pub bet_id: String, // This is the hex string of the ObjectId
+    pub finisher_id: String,
+    pub finisher_name: String,
+    pub finisher_selection: String,
+    pub amount: f64,
+}
+
+pub async fn fill_bet_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<FillBetRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let bets_col = state.db.collection::<Bet>("bets");
+    let users_col = state.db.collection::<User>("users");
+    let now = BsonDateTime::now();
+
+    // Parse the bet_id string to ObjectId - using _id not bet_id
+    let bet_oid = ObjectId::parse_str(&payload.bet_id)?;
+
+    // Find the open bet by _id
+    let bet = bets_col
+        .find_one(doc! {
+            "_id": bet_oid,
+            "status": "open"
+        })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    // Validate finisher has enough balance
+    let finisher_obj_id = ObjectId::parse_str(&payload.finisher_id)?;
+    let finisher = users_col
+        .find_one(doc! { "_id": finisher_obj_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    if finisher.balance < payload.amount {
+        return Err(AppError::ValidationError(format!(
+            "Insufficient balance. You have KES {:.2}, need KES {:.2}",
+            finisher.balance, payload.amount
+        )));
+    }
+
+    // Validate finisher has a vote for this fixture
+    let votes_col = state.db.collection::<Vote>("votes");
+    let _finisher_vote = votes_col
+        .find_one(doc! {
+            "fixture_id": &bet.fixture_id,
+            "user_id": &payload.finisher_id,
+        })
+        .await?
+        .ok_or(AppError::ValidationError(
+            "Finisher must vote on this fixture first".to_string(),
+        ))?;
+
+    // Clone values to avoid move issues
+    let finisher_id = payload.finisher_id.clone();
+    let finisher_name = payload.finisher_name.clone();
+    let finisher_selection = payload.finisher_selection.clone();
+
+    // Update bet with finisher info using _id
+    bets_col
+        .update_one(
+            doc! { "_id": bet_oid },
+            doc! {
+                "$set": {
+                    "finisher_id": finisher_id,
+                    "finisher_name": finisher_name,
+                    "finisher_selection": finisher_selection,
+                    "finisher_amount": payload.amount,
+                    "status": "matched",
+                    "matched_at": now,
+                }
+            },
+        )
+        .await?;
+
+    // Deduct finisher's balance
+    users_col
+        .update_one(
+            doc! { "_id": finisher_obj_id },
+            doc! {
+                "$inc": { "balance": -payload.amount },
+                "$set": { "updated_at": now }
+            },
+        )
+        .await?;
+
+    // Fetch the updated bet
+    let updated_bet = bets_col
+        .find_one(doc! { "_id": bet_oid })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Bet filled successfully",
+        "bet": {
+            "id": updated_bet.id.unwrap().to_hex(),
+            "fixture_id": updated_bet.fixture_id,
+            "starter_id": updated_bet.starter_id,
+            "starter_name": updated_bet.starter_name,
+            "starter_amount": updated_bet.starter_amount,
+            "starter_selection": updated_bet.starter_selection,
+            "finisher_id": updated_bet.finisher_id,
+            "finisher_name": updated_bet.finisher_name,
+            "finisher_selection": updated_bet.finisher_selection,
+            "finisher_amount": updated_bet.finisher_amount,
+            "vote_id": updated_bet.vote_id,
+            "status": updated_bet.status,
+            "total_pot": updated_bet.total_pot(),
+        },
+    })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SettleBetRequest {
+    pub fixture_id: String,
+    pub result: String,
+}
+
+pub async fn settle_bets_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<SettleBetRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let bets_col = state.db.collection::<Bet>("bets");
+    let users_col = state.db.collection::<User>("users");
+    let now = BsonDateTime::now();
+
+    // Find all matched bets for this fixture
+    let mut cursor = bets_col
+        .find(doc! {
+            "fixture_id": &payload.fixture_id,
+            "status": "matched"
+        })
+        .await?;
+
+    let mut settled_count = 0;
+    let mut results = Vec::new();
+
+    while cursor.advance().await? {
+        let bet: Bet = cursor.deserialize_current()?;
+
+        // Determine winner
+        let starter_wins = bet.starter_selection == payload.result;
+        let finisher_wins = bet
+            .finisher_selection
+            .as_ref()
+            .map(|s| s == &payload.result)
+            .unwrap_or(false);
+
+        let (winner_id, starter_result, finisher_result) = if starter_wins && finisher_wins {
+            // Both correct - draw (return each their own)
+            (None, Some("draw".to_string()), Some("draw".to_string()))
+        } else if starter_wins {
+            (
+                Some(bet.starter_id.clone()),
+                Some("won".to_string()),
+                Some("lost".to_string()),
+            )
+        } else if finisher_wins {
+            (
+                bet.finisher_id.clone(),
+                Some("lost".to_string()),
+                Some("won".to_string()),
+            )
+        } else {
+            // Both wrong - house wins (refund both)
+            (None, Some("lost".to_string()), Some("lost".to_string()))
+        };
+
+        // Update bet using _id
+        bets_col
+            .update_one(
+                doc! { "_id": bet.id },
+                doc! {
+                    "$set": {
+                        "status": "settled",
+                        "winner_id": &winner_id,
+                        "starter_result": &starter_result,
+                        "finisher_result": &finisher_result,
+                        "settled_at": now,
+                    }
+                },
+            )
+            .await?;
+
+        // Payout
+        let total_pot = bet.total_pot();
+
+        if let Some(winner) = winner_id {
+            // Winner takes all
+            let winner_obj_id = ObjectId::parse_str(&winner)?;
+            users_col
+                .update_one(
+                    doc! { "_id": winner_obj_id },
+                    doc! {
+                        "$inc": { "balance": total_pot },
+                        "$set": { "updated_at": now }
+                    },
+                )
+                .await?;
+
+            results.push(json!({
+                "bet_id": bet.id.unwrap().to_hex(),
+                "winner": winner,
+                "payout": total_pot,
+            }));
+        } else if starter_result == Some("draw".to_string())
+            && finisher_result == Some("draw".to_string())
+        {
+            // Both correct - refund both
+            let starter_obj_id = ObjectId::parse_str(&bet.starter_id)?;
+            users_col
+                .update_one(
+                    doc! { "_id": starter_obj_id },
+                    doc! {
+                        "$inc": { "balance": bet.starter_amount },
+                        "$set": { "updated_at": now }
+                    },
+                )
+                .await?;
+
+            if let Some(finisher_id) = &bet.finisher_id {
+                let finisher_obj_id = ObjectId::parse_str(finisher_id)?;
+                users_col
+                    .update_one(
+                        doc! { "_id": finisher_obj_id },
+                        doc! {
+                            "$inc": { "balance": bet.finisher_amount.unwrap_or(0.0) },
+                            "$set": { "updated_at": now }
+                        },
+                    )
+                    .await?;
+            }
+
+            results.push(json!({
+                "bet_id": bet.id.unwrap().to_hex(),
+                "result": "draw",
+                "message": "Both correct - refunded",
+            }));
+        } else {
+            // Both wrong - house keeps the pot
+            results.push(json!({
+                "bet_id": bet.id.unwrap().to_hex(),
+                "result": "house_wins",
+                "message": "Both wrong - house keeps pot",
+            }));
+        }
+
+        settled_count += 1;
+    }
+
+    // Also finalize the fixture
+    let fixtures_col = state.db.collection::<Fixture>("fixtures");
+    let games_col = state.db.collection::<Game>("games");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+
+    update_fixture_in_both(
+        &fixtures_col,
+        &games_col,
+        &payload.fixture_id,
+        &payload.result,
+    )
+    .await?;
+
+    channel_fixtures_col
+        .update_many(
+            doc! { "fixture_id": &payload.fixture_id },
+            doc! { "$set": { "status": "completed" } },
+        )
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "All bets settled successfully",
+        "fixture_id": payload.fixture_id,
+        "result": payload.result,
+        "settled_count": settled_count,
+        "results": results,
+    })))
+}
+
+pub async fn get_user_bets_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let bets_col = state.db.collection::<Bet>("bets");
+
+    let mut cursor = bets_col
+        .find(doc! {
+            "$or": [
+                { "starter_id": &user_id },
+                { "finisher_id": &user_id },
+            ]
+        })
+        .sort(doc! { "created_at": -1 })
+        .await?;
+
+    let mut bets = Vec::new();
+    while cursor.advance().await? {
+        let bet: Bet = cursor.deserialize_current()?;
+        bets.push(json!({
+            "id": bet.id.map(|oid| oid.to_hex()),
+            "fixture_id": bet.fixture_id,
+            "starter_id": bet.starter_id,
+            "starter_name": bet.starter_name,
+            "starter_selection": bet.starter_selection,
+            "starter_amount": bet.starter_amount,
+            "finisher_id": bet.finisher_id,
+            "finisher_name": bet.finisher_name,
+            "finisher_selection": bet.finisher_selection,
+            "finisher_amount": bet.finisher_amount,
+            "vote_id": bet.vote_id,
+            "status": bet.status,
+            "winner_id": bet.winner_id,
+            "starter_result": bet.starter_result,
+            "finisher_result": bet.finisher_result,
+            "created_at": bet.created_at,
+            "matched_at": bet.matched_at,
+            "settled_at": bet.settled_at,
+            "total_pot": bet.total_pot(),
+        }));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "bets": bets,
+        "count": bets.len(),
+    })))
+}
+
+pub async fn get_fixture_bets_handler(
+    State(state): State<AppState>,
+    Path(fixture_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let bets_col = state.db.collection::<Bet>("bets");
+
+    let mut cursor = bets_col
+        .find(doc! { "fixture_id": &fixture_id })
+        .sort(doc! { "created_at": -1 })
+        .await?;
+
+    let mut bets = Vec::new();
+    while cursor.advance().await? {
+        let bet: Bet = cursor.deserialize_current()?;
+        bets.push(json!({
+            "id": bet.id.map(|oid| oid.to_hex()),
+            "fixture_id": bet.fixture_id,
+            "starter_id": bet.starter_id,
+            "starter_name": bet.starter_name,
+            "starter_selection": bet.starter_selection,
+            "starter_amount": bet.starter_amount,
+            "finisher_id": bet.finisher_id,
+            "finisher_name": bet.finisher_name,
+            "finisher_selection": bet.finisher_selection,
+            "finisher_amount": bet.finisher_amount,
+            "status": bet.status,
+            "total_pot": bet.total_pot(),
+        }));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "bets": bets,
+        "count": bets.len(),
+    })))
+}
+
+pub async fn get_bet_handler(
+    State(state): State<AppState>,
+    Path(bet_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let bets_col = state.db.collection::<Bet>("bets");
+
+    let bet_oid = ObjectId::parse_str(&bet_id)?;
+
+    let bet = bets_col
+        .find_one(doc! { "_id": bet_oid })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "bet": {
+            "id": bet.id.map(|oid| oid.to_hex()),
+            "fixture_id": bet.fixture_id,
+            "starter_id": bet.starter_id,
+            "starter_name": bet.starter_name,
+            "starter_selection": bet.starter_selection,
+            "starter_amount": bet.starter_amount,
+            "finisher_id": bet.finisher_id,
+            "finisher_name": bet.finisher_name,
+            "finisher_selection": bet.finisher_selection,
+            "finisher_amount": bet.finisher_amount,
+            "vote_id": bet.vote_id,
+            "status": bet.status,
+            "winner_id": bet.winner_id,
+            "starter_result": bet.starter_result,
+            "finisher_result": bet.finisher_result,
+            "created_at": bet.created_at,
+            "matched_at": bet.matched_at,
+            "settled_at": bet.settled_at,
+        },
     })))
 }
 
 // ============================================================================
-// GET CHANNEL LEADERBOARD
+// GET CHANNEL MEMBERS
 // ============================================================================
 
-pub async fn get_channel_leaderboard_handler(
+pub async fn get_channel_members_handler(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
@@ -515,69 +1351,532 @@ pub async fn get_channel_leaderboard_handler(
         .find_one(doc! { "channel_id": &channel_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
-
-    let mut members = channel.members;
-    members.sort_by(|a, b| b.season_points.cmp(&a.season_points));
-
-    let ranked_members: Vec<serde_json::Value> = members
-        .iter()
-        .enumerate()
-        .map(|(index, m)| {
-            json!({
-                "rank": index + 1,
-                "user_id": m.user_id,
-                "username": m.username,
-                "role": m.role,
-                "season_points": m.season_points,
-                "correct_votes": m.correct_votes,
-                "total_votes": m.total_votes,
-                "accuracy": if m.total_votes > 0 {
-                    (m.correct_votes as f64 / m.total_votes as f64) * 100.0
-                } else {
-                    0.0
-                },
-                "message_count": m.msg_count,
-            })
-        })
-        .collect();
 
     Ok(Json(json!({
         "success": true,
         "channel_id": channel_id,
-        "channel_name": channel.name,
-        "leaderboard": ranked_members,
-        "total_members": channel.member_count,
+        "members": channel.members,
+        "count": channel.member_count,
     })))
 }
 
 // ============================================================================
-// GET WEEKLY TOP CHANNEL
+// GET CHANNEL PLEDGES
 // ============================================================================
 
-pub async fn get_weekly_top_channel_handler(
+pub async fn get_channel_pledges_handler(
     State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
+    let pledges_col = state.db.collection::<Pledge>("pledges");
     let channels_col = state.db.collection::<Channel>("channels");
 
-    let top_channel = channels_col
-        .find_one(doc! {})
-        .sort(doc! { "activity.messages_this_week": -1 })
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_map: HashMap<String, String> = channel
+        .members
+        .iter()
+        .map(|m| (m.user_id.clone(), m.username.clone()))
+        .collect();
+
+    let mut cursor = pledges_col.find(doc! { "fixture_id": &fixture_id }).await?;
+
+    let mut pledges = Vec::new();
+    while cursor.advance().await? {
+        let pledge: Pledge = cursor.deserialize_current()?;
+        if let Some(username) = member_map.get(&pledge.starter_id) {
+            let mut pledge_json = serde_json::to_value(&pledge)?;
+            if let Some(obj) = pledge_json.as_object_mut() {
+                obj.insert("username".to_string(), json!(username));
+            }
+            pledges.push(pledge_json);
+        }
+    }
+
+    let total_amount: f64 = pledges
+        .iter()
+        .filter_map(|p| p.get("amount").and_then(|a| a.as_f64()))
+        .sum();
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "channel_id": channel_id,
+        "pledges": pledges,
+        "count": pledges.len(),
+        "total_amount": total_amount,
+    })))
+}
+
+// ============================================================================
+// GET SINGLE FIXTURE
+// ============================================================================
+
+pub async fn get_single_fixture_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+    let fixtures_col = state.db.collection::<Fixture>("fixtures");
+    let games_col = state.db.collection::<Game>("games");
+
+    // First try to get from channel_fixtures
+    let channel_fixture = channel_fixtures_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "fixture_id": &fixture_id,
+        })
         .await?;
 
-    if let Some(channel) = top_channel {
-        Ok(Json(json!({
+    // Try to find the fixture in both collections
+    let fixture_data = find_fixture_in_both(&fixtures_col, &games_col, &fixture_id).await?;
+
+    if let Some((source, fixture_json)) = fixture_data {
+        return Ok(Json(json!({
             "success": true,
-            "channel_id": channel.channel_id,
-            "channel_name": channel.name,
-            "admin_user_id": channel.created_by,
-            "messages_this_week": channel.activity.messages_this_week,
-        })))
-    } else {
-        Ok(Json(json!({
-            "success": true,
-            "channel_id": null,
-        })))
+            "channel_fixture": channel_fixture,
+            "fixture": fixture_json,
+            "source": source,
+        })));
     }
+
+    if let Some(cf) = channel_fixture {
+        return Ok(Json(json!({
+            "success": true,
+            "channel_fixture": cf,
+            "source": "channel_fixtures_only",
+        })));
+    }
+
+    Err(AppError::DocumentNotFound)
+}
+
+// ============================================================================
+// GET CHANNEL FIXTURES
+// ============================================================================
+
+pub async fn get_channel_fixtures_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+    let fixtures_col = state.db.collection::<Fixture>("fixtures");
+    let games_col = state.db.collection::<Game>("games");
+
+    let mut cursor = channel_fixtures_col
+        .find(doc! { "channel_id": &channel_id })
+        .sort(doc! { "kickoff_time": -1 })
+        .await?;
+
+    let mut fixtures = Vec::new();
+    while cursor.advance().await? {
+        let channel_fixture: ChannelFixture = cursor.deserialize_current()?;
+
+        let fixture_data =
+            find_fixture_in_both(&fixtures_col, &games_col, &channel_fixture.fixture_id).await?;
+
+        fixtures.push(json!({
+            "channel_fixture": channel_fixture,
+            "fixture_data": fixture_data.map(|(source, data)| json!({
+                "source": source,
+                "data": data,
+            })),
+        }));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel_id,
+        "fixtures": fixtures,
+        "count": fixtures.len(),
+    })))
+}
+
+// ============================================================================
+// GET CHANNEL VOTES
+// ============================================================================
+
+pub async fn get_channel_votes_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let votes_col: Collection<Vote> = state.db.collection("votes");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_map: HashMap<String, String> = channel
+        .members
+        .iter()
+        .map(|m| (m.user_id.clone(), m.username.clone()))
+        .collect();
+
+    let mut cursor = votes_col
+        .find(doc! { "fixture_id": &fixture_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let mut channel_votes = Vec::new();
+    let mut total_votes = 0;
+    let mut home_votes = 0;
+    let mut away_votes = 0;
+    let mut draw_votes = 0;
+
+    while let Some(vote_result) = cursor.next().await {
+        let vote: Vote = vote_result.map_err(|e| AppError::MongoDB(e))?;
+
+        if let Some(username) = member_map.get(&vote.user_id) {
+            total_votes += 1;
+            match vote.selection.as_str() {
+                "home_team" | "home" => home_votes += 1,
+                "away_team" | "away" => away_votes += 1,
+                "draw" => draw_votes += 1,
+                _ => {}
+            }
+
+            channel_votes.push(json!({
+                "user_id": vote.user_id,
+                "user_name": username,
+                "selection": vote.selection,
+                "voted_at": vote.voted_at,
+                "is_correct": vote.is_correct,
+                "points_awarded": vote.points_awarded,
+            }));
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "channel_id": channel_id,
+        "votes": channel_votes,
+        "count": channel_votes.len(),
+        "vote_counts": {
+            "home": home_votes,
+            "away": away_votes,
+            "draw": draw_votes,
+            "total": total_votes,
+        },
+    })))
+}
+
+// ============================================================================
+// GET FIXTURE PLEDGERS
+// ============================================================================
+
+pub async fn get_fixture_pledgers_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    let pledges_col = state.db.collection::<Pledge>("pledges");
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let member_map: HashMap<String, String> = channel
+        .members
+        .iter()
+        .map(|m| (m.user_id.clone(), m.username.clone()))
+        .collect();
+
+    let mut cursor = pledges_col.find(doc! { "fixture_id": &fixture_id }).await?;
+
+    let mut pledges = Vec::new();
+    let mut pledgers = Vec::new();
+
+    while cursor.advance().await? {
+        let pledge: Pledge = cursor.deserialize_current()?;
+
+        if member_map.contains_key(&pledge.starter_id) {
+            let username = member_map
+                .get(&pledge.starter_id)
+                .cloned()
+                .unwrap_or(pledge.username.clone());
+
+            pledges.push(json!({
+                "username": username,
+                "phone": pledge.phone,
+                "selection": pledge.selection,
+                "amount": pledge.amount,
+                "time": pledge.time,
+                "fan": pledge.fan,
+                "starter_id": pledge.starter_id,
+                "created_at": pledge.created_at,
+            }));
+
+            pledgers.push(json!({
+                "username": username,
+                "amount": pledge.amount,
+                "selection": pledge.selection,
+                "starter_id": pledge.starter_id,
+            }));
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "channel_id": channel_id,
+        "pledges": pledges,
+        "pledgers": pledgers,
+        "count": pledges.len(),
+    })))
+}
+
+// ============================================================================
+// CREATE PLEDGE WITH VOTE
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CreatePledgeAndVoteRequest {
+    pub username: String,
+    pub phone: String,
+    pub selection: String,
+    pub amount: f64,
+    pub fan: String,
+    pub home_team: String,
+    pub away_team: String,
+    pub starter_id: String,
+    pub fixture_id: String,
+    pub channel_id: Option<String>,
+}
+
+pub async fn create_pledge_with_vote_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<CreatePledgeAndVoteRequest>,
+) -> Result<Json<serde_json::Value>> {
+    if payload.username.is_empty() {
+        return Err(AppError::MissingRequiredField("username".to_string()));
+    }
+    if payload.phone.is_empty() {
+        return Err(AppError::MissingRequiredField("phone".to_string()));
+    }
+    if payload.selection.is_empty() {
+        return Err(AppError::MissingRequiredField("selection".to_string()));
+    }
+    if payload.amount <= 0.0 {
+        return Err(AppError::ValidationError(
+            "amount must be greater than 0".to_string(),
+        ));
+    }
+    if payload.starter_id.is_empty() {
+        return Err(AppError::MissingRequiredField("starter_id".to_string()));
+    }
+    if payload.fixture_id.is_empty() {
+        return Err(AppError::MissingRequiredField("fixture_id".to_string()));
+    }
+
+    let users_col: Collection<User> = state.db.collection("users");
+    let pledges_col: Collection<Pledge> = state.db.collection("pledges");
+    let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
+    let fixtures_col: Collection<Fixture> = state.db.collection("fixtures");
+    let games_col: Collection<Game> = state.db.collection("games");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+    let votes_col: Collection<Vote> = state.db.collection("votes");
+
+    let starter_id = match ObjectId::parse_str(&payload.starter_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Err(AppError::ValidationError(
+                "Invalid starter_id format".to_string(),
+            ));
+        }
+    };
+
+    let fixture_id = payload.fixture_id.clone();
+    let channel_id = payload.channel_id.clone().unwrap_or_default();
+
+    let mut session: mongodb::ClientSession = state.client.start_session().await?;
+    session.start_transaction().await?;
+
+    // Check balance
+    let user = users_col
+        .find_one(doc! { "_id": starter_id })
+        .session(&mut session)
+        .await?
+        .ok_or_else(|| AppError::DocumentNotFound)?;
+
+    if user.balance < payload.amount {
+        session.abort_transaction().await?;
+        return Err(AppError::ValidationError(format!(
+            "Insufficient balance. You have KES {:.2}, need KES {:.2}",
+            user.balance, payload.amount
+        )));
+    }
+
+    // Check if already voted
+    let existing_vote = votes_col
+        .find_one(doc! {
+            "fixture_id": &fixture_id,
+            "user_id": &payload.starter_id,
+        })
+        .session(&mut session)
+        .await?;
+
+    let display_selection = match payload.selection.as_str() {
+        "home" => "home_team",
+        "away" => "away_team",
+        "draw" => "draw",
+        _ => {
+            session.abort_transaction().await?;
+            return Err(AppError::ValidationError("Invalid selection".to_string()));
+        }
+    };
+
+    let now = chrono::Utc::now();
+    let now_bson = BsonDateTime::from_chrono(now);
+
+    // Deduct balance
+    users_col
+        .update_one(
+            doc! { "_id": starter_id },
+            doc! {
+                "$inc": { "balance": -payload.amount },
+                "$set": { "updated_at": now_bson }
+            },
+        )
+        .session(&mut session)
+        .await?;
+
+    // Create pledge
+    let pledge = Pledge {
+        _id: Some(ObjectId::new()),
+        username: payload.username.clone(),
+        phone: payload.phone.clone(),
+        selection: display_selection.to_string(),
+        amount: payload.amount,
+        time: now,
+        fan: payload.fan.clone(),
+        home_team: payload.home_team.clone(),
+        away_team: payload.away_team.clone(),
+        starter_id: payload.starter_id.clone(),
+        fixture_id: Some(fixture_id.clone()),
+        created_at: now,
+        updated_at: now,
+    };
+
+    pledges_col
+        .insert_one(&pledge)
+        .session(&mut session)
+        .await?;
+
+    // Insert vote if not already voted
+    if existing_vote.is_none() {
+        let vote = Vote {
+            id: None,
+            fixture_id: fixture_id.clone(),
+            user_id: payload.starter_id.clone(),
+            user_name: payload.username.clone(),
+            selection: display_selection.to_string(),
+            is_correct: None,
+            points_awarded: None,
+            voted_at: now_bson,
+        };
+
+        votes_col.insert_one(&vote).session(&mut session).await?;
+
+        let increment_field = match payload.selection.as_str() {
+            "home" => "vote_counts.home",
+            "away" => "vote_counts.away",
+            "draw" => "vote_counts.draw",
+            _ => {
+                session.abort_transaction().await?;
+                return Err(AppError::ValidationError("Invalid selection".to_string()));
+            }
+        };
+
+        channel_fixtures_col
+            .update_many(
+                doc! { "fixture_id": &fixture_id },
+                doc! { "$inc": { increment_field: 1 } },
+            )
+            .session(&mut session)
+            .await?;
+
+        // Update BOTH global collections
+        let fixture_filter = doc! {
+            "$or": [
+                { "fixture_id": &fixture_id },
+                { "match_id": &fixture_id }
+            ]
+        };
+
+        fixtures_col
+            .update_one(fixture_filter.clone(), doc! { "$inc": { "votes": 1 } })
+            .session(&mut session)
+            .await?;
+
+        let game_filter = doc! {
+            "$or": [
+                { "game_id": &fixture_id },
+                { "match_id": &fixture_id }
+            ]
+        };
+
+        games_col
+            .update_one(game_filter, doc! { "$inc": { "votes": 1 } })
+            .session(&mut session)
+            .await?;
+    }
+
+    // Update channel_fixtures pledge count
+    channel_fixtures_col
+        .update_many(
+            doc! { "fixture_id": &fixture_id },
+            doc! { "$inc": { "pledge_count": 1 } },
+        )
+        .session(&mut session)
+        .await?;
+
+    // Update user's total_votes
+    users_col
+        .update_one(
+            doc! { "_id": starter_id },
+            doc! { "$inc": { "total_votes": 1 } },
+        )
+        .session(&mut session)
+        .await?;
+
+    // Update channel member's last_active_at
+    if !channel_id.is_empty() {
+        channels_col
+            .update_one(
+                doc! {
+                    "channel_id": &channel_id,
+                    "members.user_id": &payload.starter_id,
+                },
+                doc! { "$set": { "members.$.last_active_at": now_bson } },
+            )
+            .session(&mut session)
+            .await?;
+    }
+
+    session.commit_transaction().await?;
+
+    let new_balance = user.balance - payload.amount;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Pledge and vote completed successfully",
+        "pledge": {
+            "username": pledge.username,
+            "selection": pledge.selection,
+            "amount": pledge.amount,
+            "home_team": pledge.home_team,
+            "away_team": pledge.away_team,
+        },
+        "new_balance": new_balance,
+    })))
 }
 
 // ============================================================================
@@ -596,8 +1895,9 @@ pub async fn initialize_fixture_chat_handler(
 ) -> Result<Json<serde_json::Value>> {
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
     let fixtures_col = state.db.collection::<Fixture>("fixtures");
+    let games_col = state.db.collection::<Game>("games");
     let channels_col = state.db.collection::<Channel>("channels");
-    let now = DateTime::now();
+    let now = BsonDateTime::now();
 
     let existing = channel_fixtures_col
         .find_one(doc! {
@@ -607,17 +1907,48 @@ pub async fn initialize_fixture_chat_handler(
         .await?;
 
     if let Some(chat) = existing {
+        let fixture_info =
+            find_fixture_in_both(&fixtures_col, &games_col, &payload.fixture_id).await?;
+
         return Ok(Json(json!({
             "success": true,
             "already_exists": true,
             "chat": chat,
+            "fixture_info": fixture_info.map(|(source, data)| json!({
+                "source": source,
+                "data": data,
+            })),
         })));
     }
 
-    let fixture = fixtures_col
-        .find_one(doc! { "match_id": &payload.fixture_id })
-        .await?
-        .ok_or(AppError::DocumentNotFound)?;
+    let fixture_data = find_fixture_in_both(&fixtures_col, &games_col, &payload.fixture_id).await?;
+
+    let (home_team, away_team, date_iso, time, status) = match &fixture_data {
+        Some((source, json_data)) => {
+            if source == "fixtures" {
+                let fixture: Fixture = serde_json::from_value(json_data.clone())?;
+                (
+                    fixture.home_team,
+                    fixture.away_team,
+                    fixture.date_iso,
+                    fixture.time,
+                    fixture.status,
+                )
+            } else {
+                let game: Game = serde_json::from_value(json_data.clone())?;
+                (
+                    game.home_team,
+                    game.away_team,
+                    game.date_iso,
+                    game.time,
+                    game.status,
+                )
+            }
+        }
+        None => {
+            return Err(AppError::DocumentNotFound);
+        }
+    };
 
     let channel = channels_col
         .find_one(doc! { "channel_id": &payload.channel_id })
@@ -633,9 +1964,9 @@ pub async fn initialize_fixture_chat_handler(
         id: None,
         channel_id: payload.channel_id,
         fixture_id: payload.fixture_id,
-        match_name: format!("{} vs {}", fixture.home_team, fixture.away_team),
-        kickoff_time: format!("{} {}", fixture.date_iso, fixture.time),
-        status: fixture.status,
+        match_name: format!("{} vs {}", home_team, away_team),
+        kickoff_time: format!("{} {}", date_iso, time),
+        status,
         vote_counts: VoteCounts {
             home: 0,
             away: 0,
@@ -658,34 +1989,10 @@ pub async fn initialize_fixture_chat_handler(
         "success": true,
         "already_exists": false,
         "chat": new_chat,
-    })))
-}
-
-// ============================================================================
-// GET CHANNEL FIXTURES
-// ============================================================================
-
-pub async fn get_channel_fixtures_handler(
-    State(state): State<AppState>,
-    Path(channel_id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
-
-    let mut cursor = channel_fixtures_col
-        .find(doc! { "channel_id": &channel_id })
-        .sort(doc! { "kickoff_time": -1 })
-        .await?;
-
-    let mut fixtures = Vec::new();
-    while cursor.advance().await? {
-        fixtures.push(cursor.deserialize_current()?);
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "channel_id": channel_id,
-        "fixtures": fixtures,
-        "count": fixtures.len(),
+        "fixture_info": fixture_data.map(|(source, data)| json!({
+            "source": source,
+            "data": data,
+        })),
     })))
 }
 
@@ -738,7 +2045,7 @@ pub async fn get_messages_handler(
     }
 
     if let Some(before) = &params.before {
-        if let Ok(before_time) = DateTime::parse_rfc3339_str(before) {
+        if let Ok(before_time) = BsonDateTime::parse_rfc3339_str(before) {
             filter.insert("sent_at", doc! { "$lt": before_time });
         }
     }
@@ -804,364 +2111,154 @@ pub async fn get_messages_handler(
 }
 
 // ============================================================================
-// CAST VOTE — UPDATED: Only updates channel_fixtures.vote_counts
+// CHANNEL MANAGEMENT HANDLERS
 // ============================================================================
 
-#[derive(Debug, serde::Deserialize)]
-pub struct CastVoteRequest {
-    pub fixture_id: String,
-    pub user_id: String,
-    pub username: String,
-    pub selection: String,
-}
-
-pub async fn cast_vote_handler(
+pub async fn get_user_channels_handler(
     State(state): State<AppState>,
-    Json(payload): Json<CastVoteRequest>,
+    Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let votes_col = state.db.collection::<Vote>("votes");
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
-    let users_col = state.db.collection::<User>("users");
     let channels_col = state.db.collection::<Channel>("channels");
-    let now = DateTime::now();
 
-    // ✅ Check if already voted (using votes collection)
-    let existing_vote = votes_col
-        .find_one(doc! {
-            "fixture_id": &payload.fixture_id,
-            "user_id": &payload.user_id,
-        })
-        .await?;
+    let filter = doc! { "members.user_id": &user_id };
+    let mut cursor = channels_col.find(filter).await?;
 
-    if existing_vote.is_some() {
-        return Err(AppError::ValidationError(
-            "Already voted on this fixture".to_string(),
-        ));
-    }
-
-    let user_id_obj = ObjectId::parse_str(&payload.user_id)?;
-    let user = users_col
-        .find_one(doc! { "_id": user_id_obj })
-        .await?
-        .ok_or_else(|| AppError::DocumentNotFound)?;
-
-    let display_selection = match payload.selection.as_str() {
-        "home" => "home_team",
-        "away" => "away_team",
-        "draw" => "draw",
-        _ => &payload.selection,
-    };
-
-    let is_correct_placeholder: Option<bool> = None;
-    let points_awarded_placeholder: Option<i32> = None;
-
-    // ✅ Insert vote into votes collection
-    let vote = Vote {
-        id: None,
-        fixture_id: payload.fixture_id.clone(),
-        user_id: payload.user_id.clone(),
-        user_name: payload.username.clone(),
-        selection: display_selection.to_string(),
-        is_correct: is_correct_placeholder,
-        points_awarded: points_awarded_placeholder,
-        voted_at: now,
-    };
-
-    votes_col.insert_one(&vote).await?;
-
-    // ✅ ONLY update channel_fixtures.vote_counts (NOT fixtures)
-    let increment_field = match payload.selection.as_str() {
-        "home" => "vote_counts.home",
-        "away" => "vote_counts.away",
-        "draw" => "vote_counts.draw",
-        _ => return Err(AppError::ValidationError("Invalid selection".to_string())),
-    };
-
-    channel_fixtures_col
-        .update_many(
-            doc! { "fixture_id": &payload.fixture_id },
-            doc! { "$inc": { increment_field: 1 } },
-        )
-        .await?;
-
-    // ✅ Update user's total_votes
-    users_col
-        .update_one(
-            doc! { "_id": user_id_obj },
-            doc! { "$inc": { "total_votes": 1 } },
-        )
-        .await?;
-
-    // ✅ Update channel member's last_active_at
-    let mut channel_cursor = channels_col
-        .find(doc! { "members.user_id": &payload.user_id })
-        .await?;
-
-    while channel_cursor.advance().await? {
-        let channel: Channel = channel_cursor.deserialize_current()?;
-        channels_col
-            .update_one(
-                doc! {
-                    "channel_id": &channel.channel_id,
-                    "members.user_id": &payload.user_id,
-                },
-                doc! { "$set": { "members.$.last_active_at": now } },
-            )
-            .await?;
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "message": "Vote cast successfully",
-        "fixture_id": payload.fixture_id,
-        "selection": payload.selection,
-    })))
-}
-
-// ============================================================================
-// CREATE PLEDGE WITH VOTE — UPDATED: Only updates channel_fixtures
-// ============================================================================
-
-#[derive(Debug, serde::Deserialize)]
-pub struct CreatePledgeAndVoteRequest {
-    pub username: String,
-    pub phone: String,
-    pub selection: String,
-    pub amount: f64,
-    pub fan: String,
-    pub home_team: String,
-    pub away_team: String,
-    pub starter_id: String,
-    pub fixture_id: String,
-    pub channel_id: Option<String>,
-}
-
-pub async fn get_fixture_pledgers_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<Value>> {
-    let pledges_col = state.db.collection::<Pledge>("pledges");
-    let mut cursor = pledges_col.find(doc! { "fixture_id": &fixture_id }).await?;
-
-    let mut pledges = Vec::new();
+    let mut channels = Vec::new();
     while cursor.advance().await? {
-        pledges.push(cursor.deserialize_current()?);
+        channels.push(cursor.deserialize_current()?);
     }
 
-    Ok(Json(json!({
-        "success": true,
-        "fixture_id": fixture_id,
-        "channel_id": channel_id,
-        "pledges": pledges,
-        "pledgers": pledges,
-    })))
-}
+    let transformed_channels: Vec<serde_json::Value> = channels
+        .into_iter()
+        .map(|channel: Channel| {
+            let is_admin = channel
+                .members
+                .iter()
+                .any(|member| member.user_id == user_id && member.role == "admin");
 
-pub async fn create_pledge_with_vote_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<CreatePledgeAndVoteRequest>,
-) -> Result<Json<serde_json::Value>> {
-    if payload.username.is_empty() {
-        return Err(AppError::MissingRequiredField("username".to_string()));
-    }
-    if payload.phone.is_empty() {
-        return Err(AppError::MissingRequiredField("phone".to_string()));
-    }
-    if payload.selection.is_empty() {
-        return Err(AppError::MissingRequiredField("selection".to_string()));
-    }
-    if payload.amount <= 0.0 {
-        return Err(AppError::ValidationError(
-            "amount must be greater than 0".to_string(),
-        ));
-    }
-    if payload.starter_id.is_empty() {
-        return Err(AppError::MissingRequiredField("starter_id".to_string()));
-    }
-    if payload.fixture_id.is_empty() {
-        return Err(AppError::MissingRequiredField("fixture_id".to_string()));
-    }
+            let mut channel_json = serde_json::to_value(channel).unwrap_or(json!({}));
 
-    let users_col: Collection<User> = state.db.collection("users");
-    let pledges_col: Collection<Pledge> = state.db.collection("pledges");
-    let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
-    let channels_col: Collection<Channel> = state.db.collection("channels");
-    let votes_col: Collection<Vote> = state.db.collection("votes");
-
-    let starter_id = match ObjectId::parse_str(&payload.starter_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return Err(AppError::ValidationError(
-                "Invalid starter_id format".to_string(),
-            ));
-        }
-    };
-
-    let fixture_id = payload.fixture_id.clone();
-    let channel_id = payload.channel_id.clone().unwrap_or_default();
-
-    let mut session: mongodb::ClientSession = state.client.start_session().await?;
-    session.start_transaction().await?;
-
-    // Check balance
-    let user = users_col
-        .find_one(doc! { "_id": starter_id })
-        .session(&mut session)
-        .await?
-        .ok_or_else(|| AppError::DocumentNotFound)?;
-
-    if user.balance < payload.amount {
-        session.abort_transaction().await?;
-        return Err(AppError::ValidationError(format!(
-            "Insufficient balance. You have KES {:.2}, need KES {:.2}",
-            user.balance, payload.amount
-        )));
-    }
-
-    // Check if already voted
-    let existing_vote = votes_col
-        .find_one(doc! {
-            "fixture_id": &fixture_id,
-            "user_id": &payload.starter_id,
-        })
-        .session(&mut session)
-        .await?;
-
-    let display_selection = match payload.selection.as_str() {
-        "home" => "home_team",
-        "away" => "away_team",
-        "draw" => "draw",
-        _ => {
-            session.abort_transaction().await?;
-            return Err(AppError::ValidationError("Invalid selection".to_string()));
-        }
-    };
-
-    let now = chrono::Utc::now();
-    let now_bson = DateTime::from_chrono(now);
-
-    // Deduct balance
-    users_col
-        .update_one(
-            doc! { "_id": starter_id },
-            doc! {
-                "$inc": { "balance": -payload.amount },
-                "$set": { "updated_at": now_bson }
-            },
-        )
-        .session(&mut session)
-        .await?;
-
-    // Create pledge
-    let pledge = Pledge {
-        _id: Some(ObjectId::new()),
-        username: payload.username.clone(),
-        phone: payload.phone.clone(),
-        selection: display_selection.to_string(),
-        amount: payload.amount,
-        time: now,
-        fan: payload.fan.clone(),
-        home_team: payload.home_team.clone(),
-        away_team: payload.away_team.clone(),
-        starter_id: payload.starter_id.clone(),
-        fixture_id: Some(fixture_id.clone()),
-        created_at: now,
-        updated_at: now,
-    };
-
-    pledges_col
-        .insert_one(&pledge)
-        .session(&mut session)
-        .await?;
-
-    // ✅ Insert vote if not already voted
-    if existing_vote.is_none() {
-        let vote = Vote {
-            id: None,
-            fixture_id: fixture_id.clone(),
-            user_id: payload.starter_id.clone(),
-            user_name: payload.username.clone(),
-            selection: display_selection.to_string(),
-            is_correct: None,
-            points_awarded: None,
-            voted_at: now_bson,
-        };
-
-        votes_col.insert_one(&vote).session(&mut session).await?;
-
-        // ✅ UPDATE channel_fixtures.vote_counts
-        let increment_field = match payload.selection.as_str() {
-            "home" => "vote_counts.home",
-            "away" => "vote_counts.away",
-            "draw" => "vote_counts.draw",
-            _ => {
-                session.abort_transaction().await?;
-                return Err(AppError::ValidationError("Invalid selection".to_string()));
+            if let Some(obj) = channel_json.as_object_mut() {
+                obj.insert("is_admin".to_string(), json!(is_admin));
             }
-        };
 
-        channel_fixtures_col
-            .update_many(
-                doc! { "fixture_id": &fixture_id },
-                doc! { "$inc": { increment_field: 1 } },
-            )
-            .session(&mut session)
-            .await?;
-    }
+            channel_json
+        })
+        .collect();
 
-    // ✅ UPDATE channel_fixtures.pledge_count (NOT fixtures.pledges)
-    channel_fixtures_col
-        .update_many(
-            doc! { "fixture_id": &fixture_id },
-            doc! { "$inc": { "pledge_count": 1 } },
-        )
-        .session(&mut session)
-        .await?;
-
-    // Update user's total_votes
-    users_col
-        .update_one(
-            doc! { "_id": starter_id },
-            doc! { "$inc": { "total_votes": 1 } },
-        )
-        .session(&mut session)
-        .await?;
-
-    // Update channel member's last_active_at
-    if !channel_id.is_empty() {
-        channels_col
-            .update_one(
-                doc! {
-                    "channel_id": &channel_id,
-                    "members.user_id": &payload.starter_id,
-                },
-                doc! { "$set": { "members.$.last_active_at": now_bson } },
-            )
-            .session(&mut session)
-            .await?;
-    }
-
-    session.commit_transaction().await?;
-
-    let new_balance = user.balance - payload.amount;
+    let count = transformed_channels.len();
 
     Ok(Json(json!({
         "success": true,
-        "message": "Pledge and vote completed successfully",
-        "pledge": {
-            "username": pledge.username,
-            "selection": pledge.selection,
-            "amount": pledge.amount,
-            "home_team": pledge.home_team,
-            "away_team": pledge.away_team,
-        },
-        "new_balance": new_balance,
+        "channels": transformed_channels,
+        "count": count,
     })))
 }
 
-// ============================================================================
-// REQUEST TO JOIN CHANNEL
-// ============================================================================
+pub async fn get_user_channel_count_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let count = channels_col
+        .count_documents(doc! { "members.user_id": &user_id })
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "user_id": user_id,
+        "channel_count": count,
+    })))
+}
+
+pub async fn get_channel_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "channel": channel,
+    })))
+}
+
+pub async fn get_channel_leaderboard_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let mut members = channel.members;
+    members.sort_by(|a, b| b.season_points.cmp(&a.season_points));
+
+    let ranked_members: Vec<serde_json::Value> = members
+        .iter()
+        .enumerate()
+        .map(|(index, m)| {
+            json!({
+                "rank": index + 1,
+                "user_id": m.user_id,
+                "username": m.username,
+                "role": m.role,
+                "season_points": m.season_points,
+                "correct_votes": m.correct_votes,
+                "total_votes": m.total_votes,
+                "accuracy": if m.total_votes > 0 {
+                    (m.correct_votes as f64 / m.total_votes as f64) * 100.0
+                } else {
+                    0.0
+                },
+                "message_count": m.msg_count,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel_id,
+        "channel_name": channel.name,
+        "leaderboard": ranked_members,
+        "total_members": channel.member_count,
+    })))
+}
+
+pub async fn get_weekly_top_channel_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let top_channel = channels_col
+        .find_one(doc! {})
+        .sort(doc! { "activity.messages_this_week": -1 })
+        .await?;
+
+    if let Some(channel) = top_channel {
+        Ok(Json(json!({
+            "success": true,
+            "channel_id": channel.channel_id,
+            "channel_name": channel.name,
+            "admin_user_id": channel.created_by,
+            "messages_this_week": channel.activity.messages_this_week,
+        })))
+    } else {
+        Ok(Json(json!({
+            "success": true,
+            "channel_id": null,
+        })))
+    }
+}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct RequestJoinRequest {
@@ -1176,7 +2273,7 @@ pub async fn request_join_channel_handler(
     Json(payload): Json<RequestJoinRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
-    let now = DateTime::now();
+    let now = BsonDateTime::now();
 
     let channel = channels_col
         .find_one(doc! { "channel_id": &payload.channel_id })
@@ -1262,10 +2359,6 @@ pub async fn request_join_channel_handler(
     })))
 }
 
-// ============================================================================
-// GET ALL CHANNELS
-// ============================================================================
-
 pub async fn get_all_channels_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>> {
@@ -1295,10 +2388,6 @@ pub async fn get_all_channels_handler(
     })))
 }
 
-// ============================================================================
-// GET INVITE CHANNEL
-// ============================================================================
-
 pub async fn get_invite_channel_handler(
     State(state): State<AppState>,
     Path(invite_code): Path<String>,
@@ -1319,10 +2408,6 @@ pub async fn get_invite_channel_handler(
     })))
 }
 
-// ============================================================================
-// GET PENDING REQUESTS
-// ============================================================================
-
 pub async fn get_pending_requests_handler(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
@@ -1341,10 +2426,6 @@ pub async fn get_pending_requests_handler(
     })))
 }
 
-// ============================================================================
-// APPROVE JOIN REQUEST
-// ============================================================================
-
 #[derive(Debug, serde::Deserialize)]
 pub struct ApproveRequestRequest {
     pub channel_id: String,
@@ -1358,7 +2439,7 @@ pub async fn approve_join_request_handler(
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
     let users_col = state.db.collection::<User>("users");
-    let now = DateTime::now();
+    let now = BsonDateTime::now();
 
     let channel = channels_col
         .find_one(doc! { "channel_id": &payload.channel_id })
@@ -1437,10 +2518,6 @@ pub async fn approve_join_request_handler(
     })))
 }
 
-// ============================================================================
-// REJECT JOIN REQUEST
-// ============================================================================
-
 #[derive(Debug, serde::Deserialize)]
 pub struct RejectRequestRequest {
     pub channel_id: String,
@@ -1501,10 +2578,6 @@ pub async fn reject_join_request_handler(
     })))
 }
 
-// ============================================================================
-// JOIN CHANNEL BY CODE
-// ============================================================================
-
 #[derive(Debug, serde::Deserialize)]
 pub struct JoinByCodeRequest {
     pub invite_code: String,
@@ -1518,7 +2591,7 @@ pub async fn join_channel_by_code_handler(
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
     let users_col = state.db.collection::<User>("users");
-    let now = DateTime::now();
+    let now = BsonDateTime::now();
 
     let channel = channels_col
         .find_one(doc! { "invite_code": &payload.invite_code })
@@ -1577,10 +2650,6 @@ pub async fn join_channel_by_code_handler(
     })))
 }
 
-// ============================================================================
-// ADD MEMBERS TO CHANNEL
-// ============================================================================
-
 #[derive(Debug, serde::Deserialize)]
 pub struct AddMembersRequest {
     pub channel_id: String,
@@ -1593,9 +2662,9 @@ pub async fn add_members_to_channel_handler(
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
     let users_col = state.db.collection::<User>("users");
-    let now = DateTime::now();
+    let now = BsonDateTime::now();
 
-    let no_last_active: Option<DateTime> = None;
+    let no_last_active: Option<BsonDateTime> = None;
 
     let mut members_to_add = Vec::new();
     let mut added_user_ids = Vec::new();
@@ -1656,10 +2725,6 @@ pub async fn add_members_to_channel_handler(
     })))
 }
 
-// ============================================================================
-// LEAVE CHANNEL
-// ============================================================================
-
 #[derive(Debug, serde::Deserialize)]
 pub struct LeaveChannelRequest {
     pub channel_id: String,
@@ -1697,8 +2762,332 @@ pub async fn leave_channel_handler(
     Ok(Json(json!({ "success": true })))
 }
 
+pub async fn get_channel_invite_code_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "invite_code": channel.invite_code,
+    })))
+}
+
 // ============================================================================
-// COMPUTE ADMIN PAYOUT
+// LIKES HANDLERS
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ToggleLikeRequest {
+    pub fixture_id: String,
+    pub channel_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub action: String,
+}
+
+pub async fn toggle_like_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<ToggleLikeRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let likes_col = state.db.collection::<Like>("likes");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+    let channels_col = state.db.collection::<Channel>("channels");
+    let now = BsonDateTime::now();
+
+    let existing_like = likes_col
+        .find_one(doc! {
+            "fixture_id": &payload.fixture_id,
+            "channel_id": &payload.channel_id,
+            "user_id": &payload.user_id,
+        })
+        .await?;
+
+    let is_liking = payload.action == "like";
+    let is_unliking = payload.action == "unlike";
+
+    if is_liking && existing_like.is_some() {
+        return Err(AppError::ValidationError(
+            "Already liked this fixture".to_string(),
+        ));
+    }
+
+    if is_unliking && existing_like.is_none() {
+        return Err(AppError::ValidationError(
+            "Not liked this fixture".to_string(),
+        ));
+    }
+
+    let mut session = state.client.start_session().await?;
+    session.start_transaction().await?;
+
+    let like_increment = if is_liking { 1 } else { -1 };
+
+    channel_fixtures_col
+        .update_one(
+            doc! {
+                "channel_id": &payload.channel_id,
+                "fixture_id": &payload.fixture_id,
+            },
+            doc! { "$inc": { "likes_count": like_increment } },
+        )
+        .session(&mut session)
+        .await?;
+
+    if is_liking {
+        let like = Like::new(
+            payload.fixture_id.clone(),
+            payload.channel_id.clone(),
+            payload.user_id.clone(),
+            payload.username.clone(),
+        );
+        likes_col.insert_one(&like).session(&mut session).await?;
+    } else {
+        likes_col
+            .delete_one(doc! {
+                "fixture_id": &payload.fixture_id,
+                "channel_id": &payload.channel_id,
+                "user_id": &payload.user_id,
+            })
+            .session(&mut session)
+            .await?;
+    }
+
+    channels_col
+        .update_one(
+            doc! {
+                "channel_id": &payload.channel_id,
+                "members.user_id": &payload.user_id,
+            },
+            doc! { "$inc": { "members.$.likes_count": like_increment } },
+        )
+        .session(&mut session)
+        .await?;
+
+    channels_col
+        .update_one(
+            doc! {
+                "channel_id": &payload.channel_id,
+                "members.user_id": &payload.user_id,
+            },
+            doc! { "$set": { "members.$.last_active_at": now } },
+        )
+        .session(&mut session)
+        .await?;
+
+    session.commit_transaction().await?;
+
+    let updated = channel_fixtures_col
+        .find_one(doc! {
+            "channel_id": &payload.channel_id,
+            "fixture_id": &payload.fixture_id,
+        })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": payload.fixture_id,
+        "channel_id": payload.channel_id,
+        "total_likes": updated.likes_count,
+        "user_has_liked": is_liking,
+        "action": payload.action,
+    })))
+}
+
+pub async fn get_fixture_likes_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+
+    let result = channel_fixtures_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "fixture_id": &fixture_id,
+        })
+        .await?;
+
+    let likes_count = result.map(|cf| cf.likes_count).unwrap_or(0);
+
+    Ok(Json(json!({
+        "success": true,
+        "total_likes": likes_count,
+    })))
+}
+
+pub async fn check_user_liked_handler(
+    State(state): State<AppState>,
+    Path((user_id, channel_id, fixture_id)): Path<(String, String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let likes_col = state.db.collection::<Like>("likes");
+
+    let has_liked = likes_col
+        .find_one(doc! {
+            "fixture_id": &fixture_id,
+            "channel_id": &channel_id,
+            "user_id": &user_id,
+        })
+        .await?
+        .is_some();
+
+    Ok(Json(json!({
+        "success": true,
+        "has_liked": has_liked,
+    })))
+}
+
+pub async fn get_user_liked_fixtures_handler(
+    State(state): State<AppState>,
+    Path((user_id, channel_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let likes_col = state.db.collection::<Like>("likes");
+
+    let mut cursor = likes_col
+        .find(doc! {
+            "user_id": &user_id,
+            "channel_id": &channel_id,
+        })
+        .await?;
+
+    let mut fixture_ids = Vec::new();
+    while cursor.advance().await? {
+        let like: Like = cursor.deserialize_current()?;
+        fixture_ids.push(like.fixture_id);
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_ids": fixture_ids,
+        "count": fixture_ids.len(),
+    })))
+}
+
+// ============================================================================
+// MARK CHAT AS READ
+// ============================================================================
+
+pub async fn mark_chat_as_read_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id, user_id)): Path<(String, String, String)>,
+) -> Result<Json<Value>> {
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+
+    let unread_key = format!("unread_counts.{}", user_id);
+
+    channel_fixtures_col
+        .update_one(
+            doc! {
+                "channel_id": &channel_id,
+                "fixture_id": &fixture_id,
+            },
+            doc! { "$set": { unread_key: 0 } },
+        )
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Chat marked as read",
+    })))
+}
+
+pub async fn get_user_unread_count_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id, user_id)): Path<(String, String, String)>,
+) -> Result<Json<Value>> {
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+
+    let result = channel_fixtures_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "fixture_id": &fixture_id,
+        })
+        .await?;
+
+    let unread_count = result
+        .and_then(|cf| cf.unread_counts.get(&user_id).copied())
+        .unwrap_or(0);
+
+    Ok(Json(json!({
+        "success": true,
+        "unread_count": unread_count,
+    })))
+}
+
+// ============================================================================
+// GET FIXTURE COMMENT COUNT
+// ============================================================================
+
+pub async fn get_fixture_comment_count_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+
+    let result = channel_fixtures_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "fixture_id": &fixture_id,
+        })
+        .await?;
+
+    let count = result.map(|cf| cf.comment_count).unwrap_or(0);
+
+    Ok(Json(json!({
+        "success": true,
+        "count": count,
+    })))
+}
+
+// ============================================================================
+// GET FIXTURE LATEST COMMENT
+// ============================================================================
+
+pub async fn get_fixture_latest_comment_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+) -> Result<Json<Value>> {
+    let messages_col = state.db.collection::<Message>("messages");
+
+    let filter = doc! {
+        "channel_id": &channel_id,
+        "fixture_id": &fixture_id,
+    };
+
+    let mut cursor = messages_col
+        .find(filter)
+        .sort(doc! { "sent_at": -1 })
+        .limit(1)
+        .await?;
+
+    let latest_comment = if cursor.advance().await? {
+        let message: Message = cursor.deserialize_current()?;
+        Some(json!({
+            "id": message.message_id,
+            "user_id": message.sender_id,
+            "username": message.sender_name,
+            "comment": message.text,
+            "selection": message.selection,
+            "timestamp": message.sent_at,
+        }))
+    } else {
+        None
+    };
+
+    Ok(Json(json!({
+        "success": true,
+        "latest_comment": latest_comment,
+    })))
+}
+
+// ============================================================================
+// ADMIN PAYOUT
 // ============================================================================
 
 #[derive(Debug, serde::Deserialize)]
@@ -1752,16 +3141,12 @@ async fn compute_payout_for_channel(state: &AppState, channel: &Channel) -> Resu
         week: None,
         season: channel.season.clone(),
         status: "pending".to_string(),
-        created_at: DateTime::now(),
+        created_at: BsonDateTime::now(),
         paid_at: None,
         votes_at_payout: Some(current_votes),
         messages_at_payout: Some(current_messages),
     })
 }
-
-// ============================================================================
-// COMPUTE ADMIN PAYOUT HANDLER
-// ============================================================================
 
 pub async fn compute_admin_payout_handler(
     State(state): State<AppState>,
@@ -1784,10 +3169,6 @@ pub async fn compute_admin_payout_handler(
         "payout": payout,
     })))
 }
-
-// ============================================================================
-// COMPUTE ALL ADMIN PAYOUTS
-// ============================================================================
 
 pub async fn compute_all_admin_payouts_handler(
     State(state): State<AppState>,
@@ -1864,8 +3245,8 @@ async fn compute_score_for_channel(
 
     let period_end = chrono::Utc::now();
     let period_start = period_end - chrono::Duration::days(days);
-    let period_start_bson = DateTime::from_chrono(period_start);
-    let period_end_bson = DateTime::from_chrono(period_end);
+    let period_start_bson = BsonDateTime::from_chrono(period_start);
+    let period_end_bson = BsonDateTime::from_chrono(period_end);
 
     let member_count = (channel.member_count.max(1)) as f64;
 
@@ -1955,13 +3336,9 @@ async fn compute_score_for_channel(
         retention_rate,
         net_member_growth,
         score,
-        computed_at: DateTime::now(),
+        computed_at: BsonDateTime::now(),
     })
 }
-
-// ============================================================================
-// COMPUTE ADMIN REWARD SCORE HANDLER
-// ============================================================================
 
 pub async fn compute_admin_reward_score_handler(
     State(state): State<AppState>,
@@ -1988,10 +3365,6 @@ pub async fn compute_admin_reward_score_handler(
         "score": reward_score,
     })))
 }
-
-// ============================================================================
-// COMPUTE ALL ADMIN REWARD SCORES
-// ============================================================================
 
 pub async fn compute_all_admin_reward_scores_handler(
     State(state): State<AppState>,
@@ -2050,10 +3423,6 @@ pub async fn compute_all_admin_reward_scores_handler(
         "failures": failed,
     })))
 }
-
-// ============================================================================
-// GET ADMIN REWARD LEADERBOARD
-// ============================================================================
 
 pub async fn get_admin_reward_leaderboard_handler(
     State(state): State<AppState>,
@@ -2115,7 +3484,7 @@ pub async fn reset_weekly_messages_handler(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
-    let now = DateTime::now();
+    let now = BsonDateTime::now();
 
     channels_col
         .update_many(
@@ -2132,414 +3501,4 @@ pub async fn reset_weekly_messages_handler(
     Ok(Json(
         json!({ "success": true, "message": "Weekly messages reset" }),
     ))
-}
-
-// ============================================================================
-// FIXTURE COMMENT COUNT
-// ============================================================================
-
-pub async fn get_fixture_comment_count_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<Value>> {
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
-
-    let result = channel_fixtures_col
-        .find_one(doc! {
-            "channel_id": &channel_id,
-            "fixture_id": &fixture_id,
-        })
-        .await?;
-
-    let count = result.map(|cf| cf.comment_count).unwrap_or(0);
-
-    Ok(Json(json!({
-        "success": true,
-        "count": count,
-    })))
-}
-
-// ============================================================================
-// GET CHANNEL INVITE CODE
-// ============================================================================
-
-pub async fn get_channel_invite_code_handler(
-    State(state): State<AppState>,
-    Path(channel_id): Path<String>,
-) -> Result<Json<serde_json::Value>> {
-    let channels_col = state.db.collection::<Channel>("channels");
-
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &channel_id })
-        .await?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    Ok(Json(json!({
-        "success": true,
-        "invite_code": channel.invite_code,
-    })))
-}
-
-// ============================================================================
-// GET CHANNEL VOTES
-// ============================================================================
-
-pub async fn get_channel_votes_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>> {
-    let votes_col: Collection<Vote> = state.db.collection("votes");
-    let channels_col: Collection<Channel> = state.db.collection("channels");
-
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &channel_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    // Build a map of user_id -> username from channel members
-    let member_map: HashMap<String, String> = channel
-        .members
-        .iter()
-        .map(|m| (m.user_id.clone(), m.username.clone()))
-        .collect();
-
-    let mut cursor = votes_col
-        .find(doc! { "fixture_id": &fixture_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?;
-
-    let mut channel_votes = Vec::new();
-    while let Some(vote) = cursor.next().await {
-        let vote: Vote = vote.map_err(|e| AppError::MongoDB(e))?;
-
-        // ✅ Only include votes from channel members
-        if let Some(username) = member_map.get(&vote.user_id) {
-            channel_votes.push(json!({
-                "user_id": vote.user_id,
-                "user_name": username,
-                "selection": vote.selection,
-                "voted_at": vote.voted_at,
-                "is_correct": vote.is_correct,
-                "points_awarded": vote.points_awarded,
-            }));
-        }
-    }
-
-    let vote_count = channel_votes.len();
-
-    Ok(Json(json!({
-        "success": true,
-        "fixture_id": fixture_id,
-        "channel_id": channel_id,
-        "votes": channel_votes,
-        "count": vote_count,
-        "vote_count": vote_count,
-    })))
-}
-
-// ============================================================================
-// FIXTURE LATEST COMMENT
-// ============================================================================
-
-pub async fn get_fixture_latest_comment_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<Value>> {
-    let messages_col = state.db.collection::<Message>("messages");
-
-    let filter = doc! {
-        "channel_id": &channel_id,
-        "fixture_id": &fixture_id,
-    };
-
-    let mut cursor = messages_col
-        .find(filter)
-        .sort(doc! { "sent_at": -1 })
-        .limit(1)
-        .await?;
-
-    let latest_comment = if cursor.advance().await? {
-        let message: Message = cursor.deserialize_current()?;
-        Some(json!({
-            "id": message.message_id,
-            "user_id": message.sender_id,
-            "username": message.sender_name,
-            "comment": message.text,
-            "selection": message.selection,
-            "timestamp": message.sent_at,
-        }))
-    } else {
-        None
-    };
-
-    Ok(Json(json!({
-        "success": true,
-        "latest_comment": latest_comment,
-    })))
-}
-
-// ============================================================================
-// MARK CHAT AS READ
-// ============================================================================
-
-pub async fn mark_chat_as_read_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id, user_id)): Path<(String, String, String)>,
-) -> Result<Json<Value>> {
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
-
-    let unread_key = format!("unread_counts.{}", user_id);
-
-    channel_fixtures_col
-        .update_one(
-            doc! {
-                "channel_id": &channel_id,
-                "fixture_id": &fixture_id,
-            },
-            doc! { "$set": { unread_key: 0 } },
-        )
-        .await?;
-
-    Ok(Json(json!({
-        "success": true,
-        "message": "Chat marked as read",
-    })))
-}
-
-// ============================================================================
-// GET USER UNREAD COUNT
-// ============================================================================
-
-pub async fn get_user_unread_count_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id, user_id)): Path<(String, String, String)>,
-) -> Result<Json<Value>> {
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
-
-    let result = channel_fixtures_col
-        .find_one(doc! {
-            "channel_id": &channel_id,
-            "fixture_id": &fixture_id,
-        })
-        .await?;
-
-    let unread_count = result
-        .and_then(|cf| cf.unread_counts.get(&user_id).copied())
-        .unwrap_or(0);
-
-    Ok(Json(json!({
-        "success": true,
-        "unread_count": unread_count,
-    })))
-}
-
-// ============================================================================
-// LIKES HANDLERS
-// ============================================================================
-
-#[derive(Debug, serde::Deserialize)]
-pub struct ToggleLikeRequest {
-    pub fixture_id: String,
-    pub channel_id: String,
-    pub user_id: String,
-    pub username: String,
-    pub action: String, // "like" or "unlike"
-}
-
-pub async fn toggle_like_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<ToggleLikeRequest>,
-) -> Result<Json<serde_json::Value>> {
-    let likes_col = state.db.collection::<Like>("likes");
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
-    let channels_col = state.db.collection::<Channel>("channels");
-    let now = DateTime::now();
-
-    // 1. Check if user already liked
-    let existing_like = likes_col
-        .find_one(doc! {
-            "fixture_id": &payload.fixture_id,
-            "channel_id": &payload.channel_id,
-            "user_id": &payload.user_id,
-        })
-        .await?;
-
-    let is_liking = payload.action == "like";
-    let is_unliking = payload.action == "unlike";
-
-    if is_liking && existing_like.is_some() {
-        return Err(AppError::ValidationError(
-            "Already liked this fixture".to_string(),
-        ));
-    }
-
-    if is_unliking && existing_like.is_none() {
-        return Err(AppError::ValidationError(
-            "Not liked this fixture".to_string(),
-        ));
-    }
-
-    // 2. Start transaction
-    let mut session = state.client.start_session().await?;
-    session.start_transaction().await?;
-
-    // 3. Update ChannelFixture likes_count
-    let like_increment = if is_liking { 1 } else { -1 };
-
-    channel_fixtures_col
-        .update_one(
-            doc! {
-                "channel_id": &payload.channel_id,
-                "fixture_id": &payload.fixture_id,
-            },
-            doc! { "$inc": { "likes_count": like_increment } },
-        )
-        .session(&mut session)
-        .await?;
-
-    // 4. Insert or delete from likes collection
-    if is_liking {
-        let like = Like::new(
-            payload.fixture_id.clone(),
-            payload.channel_id.clone(),
-            payload.user_id.clone(),
-            payload.username.clone(),
-        );
-        likes_col.insert_one(&like).session(&mut session).await?;
-    } else {
-        likes_col
-            .delete_one(doc! {
-                "fixture_id": &payload.fixture_id,
-                "channel_id": &payload.channel_id,
-                "user_id": &payload.user_id,
-            })
-            .session(&mut session)
-            .await?;
-    }
-
-    // 5. Update ChannelMember's likes_count
-    channels_col
-        .update_one(
-            doc! {
-                "channel_id": &payload.channel_id,
-                "members.user_id": &payload.user_id,
-            },
-            doc! { "$inc": { "members.$.likes_count": like_increment } },
-        )
-        .session(&mut session)
-        .await?;
-
-    // 6. Update last_active_at
-    channels_col
-        .update_one(
-            doc! {
-                "channel_id": &payload.channel_id,
-                "members.user_id": &payload.user_id,
-            },
-            doc! { "$set": { "members.$.last_active_at": now } },
-        )
-        .session(&mut session)
-        .await?;
-
-    // 7. Commit
-    session.commit_transaction().await?;
-
-    // 8. Get updated count
-    let updated = channel_fixtures_col
-        .find_one(doc! {
-            "channel_id": &payload.channel_id,
-            "fixture_id": &payload.fixture_id,
-        })
-        .await?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    Ok(Json(json!({
-        "success": true,
-        "fixture_id": payload.fixture_id,
-        "channel_id": payload.channel_id,
-        "total_likes": updated.likes_count,
-        "user_has_liked": is_liking,
-        "action": payload.action,
-    })))
-}
-
-// ============================================================================
-// GET FIXTURE LIKES
-// ============================================================================
-
-pub async fn get_fixture_likes_handler(
-    State(state): State<AppState>,
-    Path((channel_id, fixture_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>> {
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
-
-    let result = channel_fixtures_col
-        .find_one(doc! {
-            "channel_id": &channel_id,
-            "fixture_id": &fixture_id,
-        })
-        .await?;
-
-    let likes_count = result.map(|cf| cf.likes_count).unwrap_or(0);
-
-    Ok(Json(json!({
-        "success": true,
-        "total_likes": likes_count,
-    })))
-}
-
-// ============================================================================
-// CHECK USER LIKED
-// ============================================================================
-
-pub async fn check_user_liked_handler(
-    State(state): State<AppState>,
-    Path((user_id, channel_id, fixture_id)): Path<(String, String, String)>,
-) -> Result<Json<serde_json::Value>> {
-    let likes_col = state.db.collection::<Like>("likes");
-
-    let has_liked = likes_col
-        .find_one(doc! {
-            "fixture_id": &fixture_id,
-            "channel_id": &channel_id,
-            "user_id": &user_id,
-        })
-        .await?
-        .is_some();
-
-    Ok(Json(json!({
-        "success": true,
-        "has_liked": has_liked,
-    })))
-}
-
-// ============================================================================
-// GET USER LIKED FIXTURES
-// ============================================================================
-
-pub async fn get_user_liked_fixtures_handler(
-    State(state): State<AppState>,
-    Path((user_id, channel_id)): Path<(String, String)>,
-) -> Result<Json<serde_json::Value>> {
-    let likes_col = state.db.collection::<Like>("likes");
-
-    let mut cursor = likes_col
-        .find(doc! {
-            "user_id": &user_id,
-            "channel_id": &channel_id,
-        })
-        .await?;
-
-    let mut fixture_ids = Vec::new();
-    while cursor.advance().await? {
-        let like: Like = cursor.deserialize_current()?;
-        fixture_ids.push(like.fixture_id);
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "fixture_ids": fixture_ids,
-        "count": fixture_ids.len(),
-    })))
 }
