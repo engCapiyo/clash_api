@@ -22,6 +22,21 @@ use crate::models::notification::FCMToken;
 use crate::state::AppState;
 
 // ============================================================================
+// COLLECTION NAMES
+//
+// "games"    -> league competitions (EPL, Serie A, UCL, etc.)
+// "fixtures" -> national team matches (WC qualifiers, friendlies, etc.)
+//
+// Both use the same `Game` struct/schema. Read handlers merge across both.
+// Write handlers resolve which collection actually owns a given matchId
+// and update that one (falling back to the other if the first doesn't
+// match), so a matchId never needs to be pre-tagged by the caller.
+// ============================================================================
+
+const GAMES_COLLECTION: &str = "games";
+const FIXTURES_COLLECTION: &str = "fixtures";
+
+// ============================================================================
 // TOLERANT GAME FETCHING
 // ============================================================================
 
@@ -190,6 +205,111 @@ async fn find_history_games_tolerant(
 }
 
 // ============================================================================
+// COMBINED (LEAGUES + NATIONAL TEAMS) READ HELPERS
+// ============================================================================
+
+/// Queries both `games` and `fixtures` with the same filter and merges results.
+async fn find_games_tolerant_all(state: &AppState, filter: Document) -> Result<Vec<Game>> {
+    let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
+    let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
+
+    let mut games = find_games_tolerant(&games_col, filter.clone()).await?;
+    let mut fixtures = find_games_tolerant(&fixtures_col, filter).await?;
+    games.append(&mut fixtures);
+    Ok(games)
+}
+
+/// Looks up a single doc in `games` first, falling back to `fixtures`.
+async fn find_game_tolerant_all(state: &AppState, filter: Document) -> Result<Option<Game>> {
+    let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
+    if let Some(g) = find_game_tolerant(&games_col, filter.clone()).await? {
+        return Ok(Some(g));
+    }
+    let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
+    find_game_tolerant(&fixtures_col, filter).await
+}
+
+// ============================================================================
+// COMBINED (LEAGUES + NATIONAL TEAMS) WRITE HELPERS
+// ============================================================================
+
+/// Which physical collection a write landed in. Callers use this to route
+/// any follow-up read/delete/broadcast to the same collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GameSource {
+    Games,
+    Fixtures,
+}
+
+impl GameSource {
+    fn collection_name(&self) -> &'static str {
+        match self {
+            GameSource::Games => GAMES_COLLECTION,
+            GameSource::Fixtures => FIXTURES_COLLECTION,
+        }
+    }
+
+    fn collection(&self, state: &AppState) -> Collection<Game> {
+        state.db.collection(self.collection_name())
+    }
+}
+
+/// Runs `update` against `games` first; if nothing matched, retries against
+/// `fixtures`. Returns which collection was actually updated, or
+/// `DocumentNotFound` if the matchId exists in neither.
+async fn update_one_in_either(
+    state: &AppState,
+    filter: Document,
+    update: Document,
+) -> Result<GameSource> {
+    let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
+    let result = games_col.update_one(filter.clone(), update.clone()).await?;
+    if result.matched_count > 0 {
+        return Ok(GameSource::Games);
+    }
+
+    let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
+    let result = fixtures_col.update_one(filter, update).await?;
+    if result.matched_count > 0 {
+        return Ok(GameSource::Fixtures);
+    }
+
+    Err(AppError::DocumentNotFound)
+}
+
+/// Same idea, but for `$push`/`$inc`-style update docs where the caller
+/// wants a soft no-op (rather than a hard error) when the matchId isn't
+/// found in either collection. Returns `None` if unmatched anywhere.
+async fn update_one_in_either_opt(
+    state: &AppState,
+    filter: Document,
+    update: Document,
+) -> Result<Option<GameSource>> {
+    match update_one_in_either(state, filter, update).await {
+        Ok(source) => Ok(Some(source)),
+        Err(AppError::DocumentNotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Deletes a matchId from whichever collection it's actually in.
+async fn delete_one_in_either(state: &AppState, filter: Document) -> Result<GameSource> {
+    let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
+    let result = games_col.delete_one(filter.clone()).await?;
+    if result.deleted_count > 0 {
+        return Ok(GameSource::Games);
+    }
+
+    let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
+    let result = fixtures_col.delete_one(filter).await?;
+    if result.deleted_count > 0 {
+        return Ok(GameSource::Fixtures);
+    }
+
+    Err(AppError::DocumentNotFound)
+}
+
+// ============================================================================
 // TEST NOTIFICATION
 // ============================================================================
 
@@ -309,16 +429,15 @@ fn parse_kickoff_utc(date_iso: &str, time_str: &str) -> Option<chrono::DateTime<
 }
 
 // ============================================================================
-// GAME HANDLERS
+// GAME HANDLERS (now merged across games + fixtures)
 // ============================================================================
 
 pub async fn get_games(
     State(state): State<AppState>,
     Query(query): Query<GameQuery>,
 ) -> Result<Json<Vec<Game>>> {
-    tracing::info!("🔍 GET /api/games called");
+    tracing::info!("🔍 GET /api/games called (leagues + national teams)");
 
-    let collection: Collection<Game> = state.db.collection("games");
     let mut filter = doc! {};
 
     if query.status.is_none() && query.is_live.is_none() {
@@ -335,7 +454,7 @@ pub async fn get_games(
         filter.insert("isLive", is_live);
     }
 
-    let mut games = find_games_tolerant(&collection, filter).await?;
+    let mut games = find_games_tolerant_all(&state, filter).await?;
 
     games.sort_by(|a, b| a.kickoff_utc.cmp(&b.kickoff_utc));
     let limit = query.limit.unwrap_or(100).max(0) as usize;
@@ -349,10 +468,9 @@ pub async fn get_game_by_id(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Game>> {
-    let collection: Collection<Game> = state.db.collection("games");
     let filter = doc! { "_id": &id };
 
-    match find_game_tolerant(&collection, filter).await? {
+    match find_game_tolerant_all(&state, filter).await? {
         Some(game) => Ok(Json(game)),
         None => Err(AppError::DocumentNotFound),
     }
@@ -362,29 +480,28 @@ pub async fn get_game_by_match_id(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<Game>> {
-    let collection: Collection<Game> = state.db.collection("games");
     let filter = doc! { "matchId": &match_id };
 
-    match find_game_tolerant(&collection, filter).await? {
+    match find_game_tolerant_all(&state, filter).await? {
         Some(game) => Ok(Json(game)),
         None => Err(AppError::DocumentNotFound),
     }
 }
 
 pub async fn get_live_games(State(state): State<AppState>) -> Result<Json<Vec<Game>>> {
-    let collection: Collection<Game> = state.db.collection("games");
     let filter = doc! { "status": "live", "isLive": true };
 
-    let live_games = find_games_tolerant(&collection, filter).await?;
+    let mut live_games = find_games_tolerant_all(&state, filter).await?;
+    live_games.sort_by(|a, b| a.kickoff_utc.cmp(&b.kickoff_utc));
+
     tracing::info!("✅ Fetched {} live games", live_games.len());
     Ok(Json(live_games))
 }
 
 pub async fn get_upcoming_games(State(state): State<AppState>) -> Result<Json<Vec<Game>>> {
-    let collection: Collection<Game> = state.db.collection("games");
     let filter = doc! { "status": "upcoming" };
 
-    let games = find_games_tolerant(&collection, filter).await?;
+    let games = find_games_tolerant_all(&state, filter).await?;
 
     let now = Utc::now();
     const MATCH_DURATION_MINS: i64 = 120;
@@ -455,7 +572,6 @@ pub async fn update_game_score(
 ) -> Result<Json<Game>> {
     use crate::models::channel::ChannelFixture;
 
-    let collection: Collection<Game> = state.db.collection("games");
     let filter = doc! { "matchId": &match_id };
     let mut update_doc = doc! {};
 
@@ -482,13 +598,10 @@ pub async fn update_game_score(
     }
     update_doc.insert("scrapedAt", BsonDateTime::from_chrono(Utc::now()));
 
-    let update_result = collection
-        .update_one(filter.clone(), doc! { "$set": update_doc })
-        .await?;
-
-    if update_result.matched_count == 0 {
-        return Err(AppError::DocumentNotFound);
-    }
+    // Resolves whether this matchId lives in `games` or `fixtures` and
+    // updates whichever one actually owns it.
+    let source = update_one_in_either(&state, filter.clone(), doc! { "$set": update_doc }).await?;
+    let collection = source.collection(&state);
 
     if payload.home_score.is_some() || payload.away_score.is_some() {
         if let Some(game) = find_game_tolerant(&collection, filter.clone()).await? {
@@ -522,8 +635,9 @@ pub async fn update_game_score(
             }
 
             tracing::info!(
-                "📡 Broadcasted score update for {} to {} channels: {}-{}",
+                "📡 Broadcasted score update for {} ({:?}) to {} channels: {}-{}",
                 match_id,
+                source,
                 channel_count,
                 game.home_score.unwrap_or(0),
                 game.away_score.unwrap_or(0)
@@ -556,8 +670,6 @@ pub async fn update_game_status(
     use crate::handlers::ws_handler::broadcast_live_match_update;
     use crate::models::channel::ChannelFixture;
 
-    let collection: Collection<Game> = state.db.collection("games");
-
     let valid_statuses = ["upcoming", "soon", "live", "completed"];
     if !valid_statuses.contains(&payload.status.as_str()) {
         return Err(AppError::invalid_data(&format!(
@@ -577,10 +689,11 @@ pub async fn update_game_status(
         "scrapedAt": BsonDateTime::from_chrono(Utc::now()),
     }};
 
-    collection.update_one(filter.clone(), update).await?;
+    let source = update_one_in_either(&state, filter.clone(), update).await?;
+    let collection = source.collection(&state);
 
     if payload.status == "completed" {
-        tracing::info!("🏁 Match {} auto-finalizing...", match_id);
+        tracing::info!("🏁 Match {} ({:?}) auto-finalizing...", match_id, source);
 
         if let Some(game) = find_game_tolerant(&collection, filter.clone()).await? {
             let home_score = game.home_score.unwrap_or(0);
@@ -651,7 +764,6 @@ pub async fn receive_live_update(
 
     tracing::info!("🔴 Live update received: {:?}", update);
 
-    let games_col: Collection<Game> = state.db.collection("games");
     let filter = doc! { "matchId": &update.fixture_id };
 
     let (status, is_live, available_for_voting) = match update.event_type.as_str() {
@@ -679,13 +791,14 @@ pub async fn receive_live_update(
         set_doc.insert("minuteDisplay", minute_display);
     }
 
-    games_col
-        .update_one(filter.clone(), doc! { "$set": set_doc })
-        .await?;
+    // Try `games` then `fixtures`; a national-team match_id will now be
+    // picked up instead of silently matching zero documents.
+    let source = update_one_in_either(&state, filter.clone(), doc! { "$set": set_doc }).await?;
 
     tracing::info!(
-        "✅ Updated {}: {}-{} (status: {}, {}')",
+        "✅ Updated {} ({:?}): {}-{} (status: {}, {}')",
         update.fixture_id,
+        source,
         update.home_score,
         update.away_score,
         status,
@@ -750,6 +863,7 @@ pub async fn receive_live_update(
         "fixture_id": update.fixture_id,
         "event_type": update.event_type,
         "status": status,
+        "source_collection": source.collection_name(),
         "channels_notified": channel_count,
     })))
 }
@@ -825,8 +939,6 @@ pub async fn store_lineups(
 ) -> Result<Json<serde_json::Value>> {
     tracing::info!("📋 Storing lineups for fixture: {}", payload.fixture_id);
 
-    let games_col: Collection<Game> = state.db.collection("games");
-
     let home_lineup = TeamLineup {
         formation: payload.lineups.home.formation.clone(),
         coach: Coach {
@@ -860,19 +972,20 @@ pub async fn store_lineups(
         AppError::InternalServerError(format!("Failed to serialize lineups: {}", e))
     })?;
 
-    games_col
-        .update_one(
-            doc! { "matchId": &payload.fixture_id },
-            doc! { "$set": {
-                "lineups": bson_doc,
-                "lineupsFetched": true,
-                "lineupsFetchedAt": BsonDateTime::from_chrono(Utc::now()),
-            }},
-        )
-        .await?;
+    let source = update_one_in_either(
+        &state,
+        doc! { "matchId": &payload.fixture_id },
+        doc! { "$set": {
+            "lineups": bson_doc,
+            "lineupsFetched": true,
+            "lineupsFetchedAt": BsonDateTime::from_chrono(Utc::now()),
+        }},
+    )
+    .await?;
 
     tracing::info!(
-        "✅ Lineups embedded in fixture document for {} (home: {}, away: {})",
+        "✅ Lineups embedded in {:?} fixture document for {} (home: {}, away: {})",
+        source,
         payload.fixture_id,
         home_player_count,
         away_player_count
@@ -881,6 +994,7 @@ pub async fn store_lineups(
     Ok(Json(json!({
         "success": true,
         "fixture_id": payload.fixture_id,
+        "source_collection": source.collection_name(),
         "home_players": home_player_count,
         "away_players": away_player_count,
     })))
@@ -890,9 +1004,7 @@ pub async fn get_lineups(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("games");
-
-    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
+    let game = find_game_tolerant_all(&state, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -909,9 +1021,7 @@ pub async fn get_simplified_lineups(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("games");
-
-    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
+    let game = find_game_tolerant_all(&state, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -928,9 +1038,7 @@ pub async fn check_lineups_available(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("games");
-
-    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
+    let game = find_game_tolerant_all(&state, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1045,8 +1153,6 @@ pub async fn add_statistics_snapshot(
 ) -> Result<Json<serde_json::Value>> {
     tracing::info!("📊 Adding statistics snapshot for {}", payload.fixture_id);
 
-    let games_col: Collection<Game> = state.db.collection("games");
-
     let snapshot = StatisticsSnapshot {
         minute: payload.minute,
         statistics: MatchStatistics {
@@ -1060,22 +1166,23 @@ pub async fn add_statistics_snapshot(
         AppError::InternalServerError(format!("Failed to serialize statistics: {}", e))
     })?;
 
-    games_col
-        .update_one(
-            doc! { "matchId": &payload.fixture_id },
-            doc! {
-                "$push": { "statistics": bson_snapshot },
-                "$set": {
-                    "lastStatisticsMinute": payload.minute,
-                    "scrapedAt": BsonDateTime::from_chrono(Utc::now()),
-                }
-            },
-        )
-        .await?;
+    let source = update_one_in_either(
+        &state,
+        doc! { "matchId": &payload.fixture_id },
+        doc! {
+            "$push": { "statistics": bson_snapshot },
+            "$set": {
+                "lastStatisticsMinute": payload.minute,
+                "scrapedAt": BsonDateTime::from_chrono(Utc::now()),
+            }
+        },
+    )
+    .await?;
 
     Ok(Json(json!({
         "success": true,
         "fixture_id": payload.fixture_id,
+        "source_collection": source.collection_name(),
         "minute": payload.minute,
     })))
 }
@@ -1093,8 +1200,6 @@ pub async fn bulk_update_statistics(
     let snapshots = payload["snapshots"]
         .as_array()
         .ok_or_else(|| AppError::invalid_data("Missing snapshots array"))?;
-
-    let games_col: Collection<Game> = state.db.collection("games");
 
     let mut bson_snapshots = Vec::new();
     for snapshot in snapshots {
@@ -1121,22 +1226,23 @@ pub async fn bulk_update_statistics(
         .and_then(|s| s["minute"].as_i64())
         .unwrap_or(0) as i32;
 
-    games_col
-        .update_one(
-            doc! { "matchId": fixture_id },
-            doc! {
-                "$push": { "statistics": { "$each": bson_snapshots } },
-                "$set": {
-                    "lastStatisticsMinute": last_minute,
-                    "scrapedAt": BsonDateTime::from_chrono(Utc::now()),
-                }
-            },
-        )
-        .await?;
+    let source = update_one_in_either(
+        &state,
+        doc! { "matchId": fixture_id },
+        doc! {
+            "$push": { "statistics": { "$each": bson_snapshots } },
+            "$set": {
+                "lastStatisticsMinute": last_minute,
+                "scrapedAt": BsonDateTime::from_chrono(Utc::now()),
+            }
+        },
+    )
+    .await?;
 
     Ok(Json(json!({
         "success": true,
         "fixture_id": fixture_id,
+        "source_collection": source.collection_name(),
         "count": snapshots.len(),
     })))
 }
@@ -1145,9 +1251,7 @@ pub async fn get_match_statistics(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("games");
-
-    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
+    let game = find_game_tolerant_all(&state, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1163,9 +1267,7 @@ pub async fn get_latest_statistics(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("games");
-
-    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
+    let game = find_game_tolerant_all(&state, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1228,9 +1330,7 @@ pub async fn get_statistics_at_minute(
     State(state): State<AppState>,
     Path((match_id, minute)): Path<(String, i32)>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("games");
-
-    let game = find_game_tolerant(&games_col, doc! { "matchId": &match_id })
+    let game = find_game_tolerant_all(&state, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1265,7 +1365,6 @@ pub async fn add_commentary(
 ) -> Result<Json<serde_json::Value>> {
     tracing::info!("📝 Adding commentary for match: {}", payload.match_id);
 
-    let collection: Collection<Game> = state.db.collection("games");
     let now = BsonDateTime::from_chrono(Utc::now());
     let mut entry = payload.entry;
     entry.created_at = now;
@@ -1274,20 +1373,16 @@ pub async fn add_commentary(
         AppError::InternalServerError(format!("Failed to serialize commentary: {}", e))
     })?;
 
-    let result = collection
-        .update_one(
-            doc! { "matchId": &payload.match_id },
-            doc! {
-                "$push": { "commentary": bson_entry },
-                "$inc": { "commentary_count": 1 },
-                "$set": { "lastCommentaryAt": now }
-            },
-        )
-        .await?;
-
-    if result.matched_count == 0 {
-        return Err(AppError::DocumentNotFound);
-    }
+    let source = update_one_in_either(
+        &state,
+        doc! { "matchId": &payload.match_id },
+        doc! {
+            "$push": { "commentary": bson_entry },
+            "$inc": { "commentary_count": 1 },
+            "$set": { "lastCommentaryAt": now }
+        },
+    )
+    .await?;
 
     let broadcast_msg = json!({
         "type": "commentary.new",
@@ -1313,13 +1408,15 @@ pub async fn add_commentary(
     }
 
     tracing::info!(
-        "✅ Commentary stored and broadcasted to {} channels",
+        "✅ Commentary stored in {:?} and broadcasted to {} channels",
+        source,
         channel_count
     );
 
     Ok(Json(json!({
         "success": true,
         "message": "Commentary added",
+        "source_collection": source.collection_name(),
         "channels_notified": channel_count,
     })))
 }
@@ -1330,9 +1427,8 @@ pub async fn get_latest_commentary(
     Query(params): Query<LatestCommentaryQuery>,
 ) -> Result<Json<serde_json::Value>> {
     let limit = params.limit.unwrap_or(20);
-    let collection: Collection<Game> = state.db.collection("games");
 
-    let game = find_game_tolerant(&collection, doc! { "matchId": &match_id })
+    let game = find_game_tolerant_all(&state, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
@@ -1348,8 +1444,95 @@ pub async fn get_latest_commentary(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CommentaryBulkUpdate {
+    pub match_id: String,
+    pub entries: Vec<CommentaryEntry>,
+}
+
+pub async fn add_commentary_bulk(
+    State(state): State<AppState>,
+    Json(payload): Json<CommentaryBulkUpdate>,
+) -> Result<Json<serde_json::Value>> {
+    tracing::info!(
+        "📝 Adding {} bulk commentary entries for match: {}",
+        payload.entries.len(),
+        payload.match_id
+    );
+
+    if payload.entries.is_empty() {
+        return Ok(Json(json!({
+            "success": true,
+            "message": "No entries to add",
+            "count": 0,
+        })));
+    }
+
+    let mut bson_entries = Vec::with_capacity(payload.entries.len());
+    let mut broadcast_entries = Vec::with_capacity(payload.entries.len());
+
+    for mut entry in payload.entries {
+        entry.created_at = BsonDateTime::from_chrono(Utc::now());
+        let bson_entry = bson::to_bson(&entry).map_err(|e| {
+            AppError::InternalServerError(format!("Failed to serialize commentary entry: {}", e))
+        })?;
+        broadcast_entries.push(entry);
+        bson_entries.push(bson_entry);
+    }
+
+    let count = bson_entries.len() as i64;
+    let now = BsonDateTime::from_chrono(Utc::now());
+
+    let source = update_one_in_either(
+        &state,
+        doc! { "matchId": &payload.match_id },
+        doc! {
+            "$push": { "commentary": { "$each": bson_entries } },
+            "$inc": { "commentary_count": count },
+            "$set": { "lastCommentaryAt": now }
+        },
+    )
+    .await?;
+
+    let broadcast_msg = json!({
+        "type": "commentary.bulk",
+        "payload": broadcast_entries,
+        "timestamp": Utc::now().to_rfc3339(),
+    });
+
+    use crate::models::channel::ChannelFixture;
+    let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
+    let mut cursor = channel_fixtures_col
+        .find(doc! { "fixture_id": &payload.match_id })
+        .await?;
+
+    let broadcast_json = serde_json::to_string(&broadcast_msg).unwrap();
+    let mut channel_count = 0;
+
+    while cursor.advance().await? {
+        let cf = cursor.deserialize_current()?;
+        let room_key = format!("{}_{}", cf.channel_id, payload.match_id);
+        let tx = state.get_or_create_broadcaster(&room_key);
+        let _ = tx.send(broadcast_json.clone());
+        channel_count += 1;
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Bulk commentary added",
+        "source_collection": source.collection_name(),
+        "count": count,
+        "channels_notified": channel_count,
+    })))
+}
+
 // ============================================================================
 // HISTORY / ARCHIVE HANDLERS
+//
+// Both `games` and `fixtures` archive into the same `games_history`
+// collection -- history reads were already merged by nature of the query,
+// no separate "fixtures_history" is needed unless you want to keep leagues
+// and national teams physically separate after completion too.
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -1369,14 +1552,11 @@ pub async fn move_completed_to_history(
 ) -> Result<Json<serde_json::Value>> {
     tracing::info!("📦 Moving completed game {} to history", match_id);
 
-    let games_col: Collection<Game> = state.db.collection("games");
     let history_col: Collection<HistoryGame> = state.db.collection("games_history");
 
-    let game_opt = find_game_tolerant(
-        &games_col,
-        doc! { "matchId": &match_id, "status": "completed" },
-    )
-    .await?;
+    let game_opt =
+        find_game_tolerant_all(&state, doc! { "matchId": &match_id, "status": "completed" })
+            .await?;
 
     let game = match game_opt {
         Some(g) => g,
@@ -1448,8 +1628,8 @@ pub async fn move_completed_to_history(
             e
         })?;
 
-    games_col
-        .delete_one(doc! { "matchId": &match_id_clone })
+    // Deletes from whichever of `games` / `fixtures` actually held this doc.
+    let deleted_from = delete_one_in_either(&state, doc! { "matchId": &match_id_clone })
         .await
         .map_err(|e| {
             tracing::error!(
@@ -1460,12 +1640,13 @@ pub async fn move_completed_to_history(
             e
         })?;
 
-    tracing::info!("✅ Game {} moved to history", match_id);
+    tracing::info!("✅ Game {} ({:?}) moved to history", match_id, deleted_from);
 
     Ok(Json(json!({
         "success": true,
         "message": format!("Game {} moved to history", match_id),
         "match_id": match_id,
+        "source_collection": deleted_from.collection_name(),
     })))
 }
 
@@ -1548,69 +1729,79 @@ pub async fn get_history_game_by_match_id(
 pub async fn cleanup_stale_completed_games(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>> {
-    tracing::info!("🧹 Cleaning up stale completed games");
+    tracing::info!("🧹 Cleaning up stale completed games (leagues + national teams)");
 
-    let games_col: Collection<Game> = state.db.collection("games");
     let history_col: Collection<HistoryGame> = state.db.collection("games_history");
 
     let one_hour_ago = BsonDateTime::from_chrono(Utc::now() - chrono::Duration::hours(1));
-    let stale_games = find_games_tolerant(
-        &games_col,
-        doc! {
-            "status": "completed",
-            "scrapedAt": { "$lt": one_hour_ago }
-        },
-    )
-    .await?;
+    let stale_filter = doc! {
+        "status": "completed",
+        "scrapedAt": { "$lt": one_hour_ago }
+    };
+
+    // Pull stale docs from both collections, remembering which collection
+    // each one came from so we delete from the right place afterward.
+    let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
+    let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
+
+    let stale_games = find_games_tolerant(&games_col, stale_filter.clone()).await?;
+    let stale_fixtures = find_games_tolerant(&fixtures_col, stale_filter).await?;
 
     let mut moved_count = 0;
-    for game in stale_games {
-        let match_id = game.match_id.clone();
 
-        let history_game = HistoryGame {
-            id: game.id.clone(),
-            match_id: game.match_id.clone(),
-            threesixtyfive_game_id: game.threesixtyfive_game_id.clone(),
-            home_team: game.home_team.clone(),
-            away_team: game.away_team.clone(),
-            league: game.league.clone(),
-            minutes_played: game.minutes_played,
-            minute_display: game.minute_display.clone(),
-            home_win: game.home_win,
-            away_win: game.away_win,
-            draw: game.draw,
-            date: game.date.clone(),
-            time: game.time.clone(),
-            date_iso: game.date_iso.clone(),
-            kickoff_utc: game.kickoff_utc,
-            home_score: game.home_score,
-            away_score: game.away_score,
-            status: game.status.clone(),
-            is_live: game.is_live,
-            available_for_voting: game.available_for_voting,
-            time_elapsed: game.time_elapsed,
-            result: game.result.clone(),
-            source: game.source.clone(),
-            scraped_at: game.scraped_at,
-            last_scraped_at: game.last_scraped_at,
-            last_polled_at: game.last_polled_at,
-            commentary: game.commentary.clone(),
-            last_commentary_at: game.last_commentary_at,
-            lineups: game.lineups,
-            lineups_fetched: game.lineups_fetched,
-            lineups_fetched_at: game.lineups_fetched_at,
-            statistics: game.statistics,
-            last_statistics_minute: game.last_statistics_minute,
-            forwarded_event_signatures: game.forwarded_event_signatures,
-            completed_at: BsonDateTime::from_chrono(Utc::now()),
-            moved_to_history: true,
-            created_at: game.created_at,
-        };
+    for (games, source) in [
+        (stale_games, GameSource::Games),
+        (stale_fixtures, GameSource::Fixtures),
+    ] {
+        for game in games {
+            let match_id = game.match_id.clone();
 
-        history_col.insert_one(history_game).await?;
+            let history_game = HistoryGame {
+                id: game.id.clone(),
+                match_id: game.match_id.clone(),
+                threesixtyfive_game_id: game.threesixtyfive_game_id.clone(),
+                home_team: game.home_team.clone(),
+                away_team: game.away_team.clone(),
+                league: game.league.clone(),
+                minutes_played: game.minutes_played,
+                minute_display: game.minute_display.clone(),
+                home_win: game.home_win,
+                away_win: game.away_win,
+                draw: game.draw,
+                date: game.date.clone(),
+                time: game.time.clone(),
+                date_iso: game.date_iso.clone(),
+                kickoff_utc: game.kickoff_utc,
+                home_score: game.home_score,
+                away_score: game.away_score,
+                status: game.status.clone(),
+                is_live: game.is_live,
+                available_for_voting: game.available_for_voting,
+                time_elapsed: game.time_elapsed,
+                result: game.result.clone(),
+                source: game.source.clone(),
+                scraped_at: game.scraped_at,
+                last_scraped_at: game.last_scraped_at,
+                last_polled_at: game.last_polled_at,
+                commentary: game.commentary.clone(),
+                last_commentary_at: game.last_commentary_at,
+                lineups: game.lineups,
+                lineups_fetched: game.lineups_fetched,
+                lineups_fetched_at: game.lineups_fetched_at,
+                statistics: game.statistics,
+                last_statistics_minute: game.last_statistics_minute,
+                forwarded_event_signatures: game.forwarded_event_signatures,
+                completed_at: BsonDateTime::from_chrono(Utc::now()),
+                moved_to_history: true,
+                created_at: game.created_at,
+            };
 
-        games_col.delete_one(doc! { "matchId": &match_id }).await?;
-        moved_count += 1;
+            history_col.insert_one(history_game).await?;
+
+            let collection = source.collection(&state);
+            collection.delete_one(doc! { "matchId": &match_id }).await?;
+            moved_count += 1;
+        }
     }
 
     tracing::info!("✅ Moved {} stale completed games to history", moved_count);
@@ -1619,92 +1810,5 @@ pub async fn cleanup_stale_completed_games(
         "success": true,
         "message": format!("Moved {} stale games to history", moved_count),
         "moved_count": moved_count,
-    })))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CommentaryBulkUpdate {
-    pub match_id: String,
-    pub entries: Vec<CommentaryEntry>,
-}
-
-pub async fn add_commentary_bulk(
-    State(state): State<AppState>,
-    Json(payload): Json<CommentaryBulkUpdate>,
-) -> Result<Json<serde_json::Value>> {
-    tracing::info!(
-        "📝 Adding {} bulk commentary entries for match: {}",
-        payload.entries.len(),
-        payload.match_id
-    );
-
-    if payload.entries.is_empty() {
-        return Ok(Json(json!({
-            "success": true,
-            "message": "No entries to add",
-            "count": 0,
-        })));
-    }
-
-    let collection: Collection<Game> = state.db.collection("games");
-
-    let mut bson_entries = Vec::with_capacity(payload.entries.len());
-    let mut broadcast_entries = Vec::with_capacity(payload.entries.len());
-
-    for mut entry in payload.entries {
-        entry.created_at = BsonDateTime::from_chrono(Utc::now());
-        let bson_entry = bson::to_bson(&entry).map_err(|e| {
-            AppError::InternalServerError(format!("Failed to serialize commentary entry: {}", e))
-        })?;
-        broadcast_entries.push(entry);
-        bson_entries.push(bson_entry);
-    }
-
-    let count = bson_entries.len() as i64;
-    let now = BsonDateTime::from_chrono(Utc::now());
-
-    let result = collection
-        .update_one(
-            doc! { "matchId": &payload.match_id },
-            doc! {
-                "$push": { "commentary": { "$each": bson_entries } },
-                "$inc": { "commentary_count": count },
-                "$set": { "lastCommentaryAt": now }
-            },
-        )
-        .await?;
-
-    if result.matched_count == 0 {
-        return Err(AppError::DocumentNotFound);
-    }
-
-    let broadcast_msg = json!({
-        "type": "commentary.bulk",
-        "payload": broadcast_entries,
-        "timestamp": Utc::now().to_rfc3339(),
-    });
-
-    use crate::models::channel::ChannelFixture;
-    let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
-    let mut cursor = channel_fixtures_col
-        .find(doc! { "fixture_id": &payload.match_id })
-        .await?;
-
-    let broadcast_json = serde_json::to_string(&broadcast_msg).unwrap();
-    let mut channel_count = 0;
-
-    while cursor.advance().await? {
-        let cf = cursor.deserialize_current()?;
-        let room_key = format!("{}_{}", cf.channel_id, payload.match_id);
-        let tx = state.get_or_create_broadcaster(&room_key);
-        let _ = tx.send(broadcast_json.clone());
-        channel_count += 1;
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "message": "Bulk commentary added",
-        "count": count,
-        "channels_notified": channel_count,
     })))
 }
