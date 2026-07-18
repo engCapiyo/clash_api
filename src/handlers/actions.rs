@@ -25,6 +25,9 @@ use std::collections::HashSet;
 // ============================================================================
 // HELPER: Get all channel IDs where user is a member
 // ============================================================================
+// ============================================================================
+// HELPER: Get all channel IDs where user is a member
+// ============================================================================
 async fn get_user_channel_ids(
     channels_col: &Collection<Channel>,
     user_id: &str,
@@ -45,8 +48,10 @@ async fn get_user_channel_ids(
             tracing::error!("❌ Failed to deserialize channel: {}", e);
             AppError::MongoDB(e)
         })?;
-        channel_ids.push(channel.channel_id);
-        tracing::debug!("📌 Found channel: {}", channel.channel_id);
+
+        let channel_id = channel.channel_id.clone();
+        tracing::debug!("📌 Found channel: {}", channel_id);
+        channel_ids.push(channel_id);
     }
 
     tracing::info!("✅ User {} is in {} channels", user_id, channel_ids.len());
