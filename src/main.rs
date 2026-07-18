@@ -137,7 +137,6 @@ async fn build_router(app_state: AppState) -> Router {
         .nest("/api/posts", routes::posts::routes())
         .nest("/api/pledges", routes::pledges::routes())
         .nest("/api/lipaclash", routes::mpesa::mpesa_routes())
-        .nest("/api/votes", routes::vote_routes::vote_routes())
         .nest("/api/archive", routes::archive::archive_routes())
         .nest(
             "/api/sub_fixtures",
@@ -145,14 +144,9 @@ async fn build_router(app_state: AppState) -> Router {
         )
         .nest("/api/chats", routes::chat::routes())
         .nest("/api/visibility", routes::visibility::visibility_routes())
-        .nest("/ws", routes::vote_routes::ws_routes())
         .nest("/ws/channel", routes::channel::ws_channel_routes())
         .nest("/comments", routes::posts::comment_routes())
         .nest("/api/channels", routes::channel::channel_routes())
-        .nest(
-            "/api/notifications",
-            routes::vote_routes::notification_routes(),
-        )
         .nest("/api/profile", routes::user_profile::user_profile_routes())
         .nest("/api", routes::posts::upload_routes())
         .layer(cors)

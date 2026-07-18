@@ -20,44 +20,19 @@ pub fn routes() -> Router<AppState> {
             "/test-notification",
             post(games::send_test_notification_from_poller),
         )
-        // ── Lineups (now in games) ────────────────────────────────────────────
+        // ── Lineups ─────────────────────────────────────────────────────────────
         .route("/lineups", post(games::store_lineups))
-        // ── Statistics (now in games) ─────────────────────────────────────────
+        // ── Statistics ──────────────────────────────────────────────────────────
         .route("/statistics", post(games::add_statistics_snapshot))
         .route("/statistics/bulk", post(games::bulk_update_statistics))
-        // ── Events ─────────────────────────────────────────────────────────────
+        // ── Events ──────────────────────────────────────────────────────────────
         .route("/events", post(events_handler::add_event))
         .route("/events/bulk", post(events_handler::bulk_add_events))
-        // ── Batch / Fast Counts ───────────────────────────────────────────────
-        .route(
-            "/fixture/counts/batch",
-            post(games::get_batch_fixture_counts_fast),
-        )
-        // ── Match-specific routes ────────────────────────────────────────────
+        // ── Match-specific routes ──────────────────────────────────────────────
         .route("/match/:match_id", get(games::get_game_by_match_id))
         .route(
             "/history/:match_id",
             get(games::get_history_game_by_match_id),
-        )
-        .route(
-            "/fixture/:fixture_id/votes/fast",
-            get(games::get_fixture_vote_count_fast),
-        )
-        .route(
-            "/fixture/:fixture_id/comments/fast",
-            get(games::get_fixture_comment_count_fast),
-        )
-        .route(
-            "/fixture/:fixture_id/counts/fast",
-            get(games::get_fixture_counts_fast),
-        )
-        .route(
-            "/fixture/:fixture_id/voters",
-            get(games::get_fixture_voters_fast),
-        )
-        .route(
-            "/fixture/:fixture_id/user/:user_id/voted",
-            get(games::check_user_voted_fast),
         )
         // ── Lineups (match-specific) ──────────────────────────────────────────
         .route("/:match_id/lineups", get(games::get_lineups))
@@ -79,19 +54,14 @@ pub fn routes() -> Router<AppState> {
             "/:match_id/statistics/:minute",
             get(games::get_statistics_at_minute),
         )
-        // ── :match_id routes (must come last) ─────────────────────────────────
-        .route("/:match_id/score", put(games::update_game_score))
-        .route("/:match_id/status", put(games::update_game_status))
-        .route(
-            "/:match_id/move-to-history",
-            post(games::move_completed_to_history),
-        )
+        // ── Commentary ─────────────────────────────────────────────────────────
         .route("/:match_id/commentary", get(games::get_latest_commentary))
         .route(
             "/:match_id/commentary/latest",
             get(games::get_latest_commentary),
         )
         .route("/commentary/bulk", post(games::add_commentary_bulk))
+        // ── Events (match-specific) ──────────────────────────────────────────
         .route("/:match_id/events", get(events_handler::get_match_events))
         .route(
             "/:match_id/events/:event_type",
@@ -109,5 +79,13 @@ pub fn routes() -> Router<AppState> {
             "/events/:event_id",
             delete(events_handler::delete_event_by_id),
         )
+        // ── Score & Status ─────────────────────────────────────────────────────
+        .route("/:match_id/score", put(games::update_game_score))
+        .route("/:match_id/status", put(games::update_game_status))
+        .route(
+            "/:match_id/move-to-history",
+            post(games::move_completed_to_history),
+        )
+        // ── Get by ID (must come last) ──────────────────────────────────────
         .route("/:id", get(games::get_game_by_id))
 }

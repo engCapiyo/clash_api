@@ -47,7 +47,7 @@ pub struct ChannelMember {
     pub correct_votes: i32,
     pub total_votes: i32,
     pub msg_count: i32,
-    pub likes_count: i32, // ✅ NEW: Total likes given by this member in this channel
+    pub likes_count: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_active_at: Option<DateTime>,
 }
@@ -65,7 +65,7 @@ pub struct ChannelActivity {
 }
 
 // ============================================================================
-// FIXTURE (Global)
+// FIXTURE (Global - Master Data Only)
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,10 +84,28 @@ pub struct Fixture {
     pub result: Option<String>,
     pub home_score: Option<i32>,
     pub away_score: Option<i32>,
+    // ✅ NO counts here — they belong in channel_fixtures
 }
 
 // ============================================================================
-// CHANNEL FIXTURE (Per-channel fixture data)
+// VOTE COUNTS
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VoteCounts {
+    pub home: i32,
+    pub away: i32,
+    pub draw: i32,
+}
+
+impl VoteCounts {
+    pub fn total(&self) -> i32 {
+        self.home + self.away + self.draw
+    }
+}
+
+// ============================================================================
+// CHANNEL FIXTURE (Per-channel fixture data — ALL COUNTS LIVE HERE)
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -99,25 +117,19 @@ pub struct ChannelFixture {
     pub match_name: String,
     pub kickoff_time: String,
     pub status: String,
+
+    // ✅ ALL COUNTS LIVE HERE
     pub vote_counts: VoteCounts,
     pub comment_count: i32,
-    pub likes_count: i32, // ✅ NEW: Total likes for this fixture in this channel
+    pub pledge_count: i32, // ✅ NEW
+    pub bet_count: i32,    // ✅ NEW
+    pub likes_count: i32,
+
     pub unread_counts: HashMap<String, i32>,
     pub last_message: Option<String>,
     pub last_message_at: Option<DateTime>,
     pub last_sender: Option<String>,
     pub added_at: DateTime,
-}
-
-// ============================================================================
-// VOTE COUNTS
-// ============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct VoteCounts {
-    pub home: i32,
-    pub away: i32,
-    pub draw: i32,
 }
 
 // ============================================================================
@@ -177,10 +189,26 @@ pub struct Vote {
     pub id: Option<ObjectId>,
     pub fixture_id: String,
     pub user_id: String,
+    pub user_name: String,
     pub selection: String, // "home" | "away" | "draw"
     pub is_correct: Option<bool>,
     pub points_awarded: Option<i32>,
     pub voted_at: DateTime,
+}
+
+impl Vote {
+    pub fn new(fixture_id: String, user_id: String, user_name: String, selection: String) -> Self {
+        Self {
+            id: None,
+            fixture_id,
+            user_id,
+            user_name,
+            selection,
+            is_correct: None,
+            points_awarded: None,
+            voted_at: DateTime::now(),
+        }
+    }
 }
 
 // ============================================================================
@@ -242,11 +270,9 @@ pub struct AdminRewardScore {
 }
 
 // ============================================================================
-// LIKE - NEW
+// LIKE
 // ============================================================================
 
-/// A like on a fixture within a channel.
-/// Stored in a separate "likes" collection.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Like {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -257,10 +283,6 @@ pub struct Like {
     pub username: String,
     pub created_at: DateTime,
 }
-
-// ============================================================================
-// LIKE HELPER METHODS
-// ============================================================================
 
 impl Like {
     pub fn new(fixture_id: String, channel_id: String, user_id: String, username: String) -> Self {
@@ -276,7 +298,7 @@ impl Like {
 }
 
 // ============================================================================
-// HELPER: Create ChannelMember with default likes_count
+// CONSTRUCTORS
 // ============================================================================
 
 impl ChannelMember {
@@ -303,10 +325,6 @@ impl ChannelMember {
         }
     }
 }
-
-// ============================================================================
-// HELPER: Create ChannelFixture with default likes_count
-// ============================================================================
 
 impl ChannelFixture {
     pub fn new(
@@ -335,6 +353,8 @@ impl ChannelFixture {
                 draw: 0,
             },
             comment_count: 0,
+            pledge_count: 0,
+            bet_count: 0,
             likes_count: 0,
             unread_counts,
             last_message: None,

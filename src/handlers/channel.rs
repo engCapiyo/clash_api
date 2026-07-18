@@ -89,6 +89,7 @@ pub async fn finalize_fixture_result_handler(
     let fixtures_col = state.db.collection::<Fixture>("fixtures");
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
+    // ✅ Update fixture status (match data — still in fixtures)
     fixtures_col
         .update_one(
             doc! { "fixture_id": &payload.fixture_id },
@@ -101,6 +102,7 @@ pub async fn finalize_fixture_result_handler(
         )
         .await?;
 
+    // ✅ Update channel_fixtures status
     channel_fixtures_col
         .update_many(
             doc! { "fixture_id": &payload.fixture_id },
@@ -303,7 +305,7 @@ pub async fn create_channel_handler(
 }
 
 // ============================================================================
-// CHECK USER VOTE IN CHANNEL (deprecated)
+// CHECK USER VOTE IN CHANNEL
 // ============================================================================
 
 pub async fn check_user_vote_in_channel_handler(
@@ -640,6 +642,8 @@ pub async fn initialize_fixture_chat_handler(
             draw: 0,
         },
         comment_count: 0,
+        pledge_count: 0,
+        bet_count: 0,
         likes_count: 0,
         unread_counts,
         last_message: None,
@@ -800,13 +804,14 @@ pub async fn get_messages_handler(
 }
 
 // ============================================================================
-// CAST VOTE (GLOBAL)
+// CAST VOTE — UPDATED: Only updates channel_fixtures.vote_counts
 // ============================================================================
 
 #[derive(Debug, serde::Deserialize)]
 pub struct CastVoteRequest {
     pub fixture_id: String,
     pub user_id: String,
+    pub username: String,
     pub selection: String,
 }
 
@@ -814,20 +819,21 @@ pub async fn cast_vote_handler(
     State(state): State<AppState>,
     Json(payload): Json<CastVoteRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    let games_col: Collection<Game> = state.db.collection("fixtures");
+    let votes_col = state.db.collection::<Vote>("votes");
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
     let users_col = state.db.collection::<User>("users");
     let channels_col = state.db.collection::<Channel>("channels");
     let now = DateTime::now();
 
-    let existing_voter = games_col
+    // ✅ Check if already voted (using votes collection)
+    let existing_vote = votes_col
         .find_one(doc! {
-            "match_id": &payload.fixture_id,
-            "voters.userId": &payload.user_id,
+            "fixture_id": &payload.fixture_id,
+            "user_id": &payload.user_id,
         })
         .await?;
 
-    if existing_voter.is_some() {
+    if existing_vote.is_some() {
         return Err(AppError::ValidationError(
             "Already voted on this fixture".to_string(),
         ));
@@ -849,25 +855,21 @@ pub async fn cast_vote_handler(
     let is_correct_placeholder: Option<bool> = None;
     let points_awarded_placeholder: Option<i32> = None;
 
-    games_col
-        .update_one(
-            doc! { "match_id": &payload.fixture_id },
-            doc! {
-                "$inc": { "votes": 1 },
-                "$push": {
-                    "voters": {
-                        "userId": &payload.user_id,
-                        "userName": &user.username,
-                        "selection": display_selection,
-                        "isCorrect": is_correct_placeholder,
-                        "pointsAwarded": points_awarded_placeholder,
-                        "votedAt": now,
-                    }
-                }
-            },
-        )
-        .await?;
+    // ✅ Insert vote into votes collection
+    let vote = Vote {
+        id: None,
+        fixture_id: payload.fixture_id.clone(),
+        user_id: payload.user_id.clone(),
+        user_name: payload.username.clone(),
+        selection: display_selection.to_string(),
+        is_correct: is_correct_placeholder,
+        points_awarded: points_awarded_placeholder,
+        voted_at: now,
+    };
 
+    votes_col.insert_one(&vote).await?;
+
+    // ✅ ONLY update channel_fixtures.vote_counts (NOT fixtures)
     let increment_field = match payload.selection.as_str() {
         "home" => "vote_counts.home",
         "away" => "vote_counts.away",
@@ -882,6 +884,7 @@ pub async fn cast_vote_handler(
         )
         .await?;
 
+    // ✅ Update user's total_votes
     users_col
         .update_one(
             doc! { "_id": user_id_obj },
@@ -889,6 +892,7 @@ pub async fn cast_vote_handler(
         )
         .await?;
 
+    // ✅ Update channel member's last_active_at
     let mut channel_cursor = channels_col
         .find(doc! { "members.user_id": &payload.user_id })
         .await?;
@@ -915,7 +919,7 @@ pub async fn cast_vote_handler(
 }
 
 // ============================================================================
-// CREATE PLEDGE WITH VOTE
+// CREATE PLEDGE WITH VOTE — UPDATED: Only updates channel_fixtures
 // ============================================================================
 
 #[derive(Debug, serde::Deserialize)]
@@ -929,6 +933,7 @@ pub struct CreatePledgeAndVoteRequest {
     pub away_team: String,
     pub starter_id: String,
     pub fixture_id: String,
+    pub channel_id: Option<String>,
 }
 
 pub async fn get_fixture_pledgers_handler(
@@ -979,9 +984,9 @@ pub async fn create_pledge_with_vote_handler(
 
     let users_col: Collection<User> = state.db.collection("users");
     let pledges_col: Collection<Pledge> = state.db.collection("pledges");
-    let games_col: Collection<Game> = state.db.collection("fixtures");
     let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
     let channels_col: Collection<Channel> = state.db.collection("channels");
+    let votes_col: Collection<Vote> = state.db.collection("votes");
 
     let starter_id = match ObjectId::parse_str(&payload.starter_id) {
         Ok(id) => id,
@@ -993,10 +998,12 @@ pub async fn create_pledge_with_vote_handler(
     };
 
     let fixture_id = payload.fixture_id.clone();
+    let channel_id = payload.channel_id.clone().unwrap_or_default();
 
     let mut session: mongodb::ClientSession = state.client.start_session().await?;
     session.start_transaction().await?;
 
+    // Check balance
     let user = users_col
         .find_one(doc! { "_id": starter_id })
         .session(&mut session)
@@ -1011,34 +1018,29 @@ pub async fn create_pledge_with_vote_handler(
         )));
     }
 
-    let existing_voter = games_col
+    // Check if already voted
+    let existing_vote = votes_col
         .find_one(doc! {
-            "match_id": &fixture_id,
-            "voters.userId": &payload.starter_id,
+            "fixture_id": &fixture_id,
+            "user_id": &payload.starter_id,
         })
         .session(&mut session)
         .await?;
 
-    if existing_voter.is_some() {
-        session.abort_transaction().await?;
-        return Err(AppError::ValidationError(
-            "Already voted on this fixture".to_string(),
-        ));
-    }
-
-    let fixture_exists = games_col
-        .find_one(doc! { "match_id": &fixture_id })
-        .session(&mut session)
-        .await?;
-
-    if fixture_exists.is_none() {
-        session.abort_transaction().await?;
-        return Err(AppError::DocumentNotFound);
-    }
+    let display_selection = match payload.selection.as_str() {
+        "home" => "home_team",
+        "away" => "away_team",
+        "draw" => "draw",
+        _ => {
+            session.abort_transaction().await?;
+            return Err(AppError::ValidationError("Invalid selection".to_string()));
+        }
+    };
 
     let now = chrono::Utc::now();
     let now_bson = DateTime::from_chrono(now);
 
+    // Deduct balance
     users_col
         .update_one(
             doc! { "_id": starter_id },
@@ -1050,13 +1052,7 @@ pub async fn create_pledge_with_vote_handler(
         .session(&mut session)
         .await?;
 
-    let display_selection = match payload.selection.as_str() {
-        "home" => "home_team",
-        "away" => "away_team",
-        "draw" => "draw",
-        _ => &payload.selection,
-    };
-
+    // Create pledge
     let pledge = Pledge {
         _id: Some(ObjectId::new()),
         username: payload.username.clone(),
@@ -1078,62 +1074,51 @@ pub async fn create_pledge_with_vote_handler(
         .session(&mut session)
         .await?;
 
-    let pledger_entry = doc! {
-        "userId": &payload.starter_id,
-        "userName": &payload.username,
-        "selection": display_selection,
-        "amount": payload.amount,
-        "pledgedAt": now_bson,
-    };
+    // ✅ Insert vote if not already voted
+    if existing_vote.is_none() {
+        let vote = Vote {
+            id: None,
+            fixture_id: fixture_id.clone(),
+            user_id: payload.starter_id.clone(),
+            user_name: payload.username.clone(),
+            selection: display_selection.to_string(),
+            is_correct: None,
+            points_awarded: None,
+            voted_at: now_bson,
+        };
 
-    let is_correct_placeholder: Option<bool> = None;
-    let points_awarded_placeholder: Option<i32> = None;
+        votes_col.insert_one(&vote).session(&mut session).await?;
 
-    let voter_entry = doc! {
-        "userId": &payload.starter_id,
-        "userName": &payload.username,
-        "selection": display_selection,
-        "isCorrect": is_correct_placeholder,
-        "pointsAwarded": points_awarded_placeholder,
-        "votedAt": now_bson,
-    };
+        // ✅ UPDATE channel_fixtures.vote_counts
+        let increment_field = match payload.selection.as_str() {
+            "home" => "vote_counts.home",
+            "away" => "vote_counts.away",
+            "draw" => "vote_counts.draw",
+            _ => {
+                session.abort_transaction().await?;
+                return Err(AppError::ValidationError("Invalid selection".to_string()));
+            }
+        };
 
-    let increment_field = match payload.selection.as_str() {
-        "home" => "vote_counts.home",
-        "away" => "vote_counts.away",
-        "draw" => "vote_counts.draw",
-        _ => {
-            session.abort_transaction().await?;
-            return Err(AppError::ValidationError("Invalid selection".to_string()));
-        }
-    };
+        channel_fixtures_col
+            .update_many(
+                doc! { "fixture_id": &fixture_id },
+                doc! { "$inc": { increment_field: 1 } },
+            )
+            .session(&mut session)
+            .await?;
+    }
 
-    games_col
-        .update_one(
-            doc! { "match_id": &fixture_id },
-            doc! {
-                "$inc": {
-                    "pledges": 1,
-                    "votes": 1,
-                },
-                "$push": {
-                    "pledgers": pledger_entry,
-                    "voters": voter_entry,
-                },
-                "$set": { "updated_at": now_bson }
-            },
-        )
-        .session(&mut session)
-        .await?;
-
+    // ✅ UPDATE channel_fixtures.pledge_count (NOT fixtures.pledges)
     channel_fixtures_col
         .update_many(
             doc! { "fixture_id": &fixture_id },
-            doc! { "$inc": { increment_field: 1 } },
+            doc! { "$inc": { "pledge_count": 1 } },
         )
         .session(&mut session)
         .await?;
 
+    // Update user's total_votes
     users_col
         .update_one(
             doc! { "_id": starter_id },
@@ -1142,17 +1127,12 @@ pub async fn create_pledge_with_vote_handler(
         .session(&mut session)
         .await?;
 
-    let mut channel_cursor = channels_col
-        .find(doc! { "members.user_id": &payload.starter_id })
-        .session(&mut session)
-        .await?;
-
-    while channel_cursor.advance(&mut session).await? {
-        let channel: Channel = channel_cursor.deserialize_current()?;
+    // Update channel member's last_active_at
+    if !channel_id.is_empty() {
         channels_col
             .update_one(
                 doc! {
-                    "channel_id": &channel.channel_id,
+                    "channel_id": &channel_id,
                     "members.user_id": &payload.starter_id,
                 },
                 doc! { "$set": { "members.$.last_active_at": now_bson } },
@@ -2201,12 +2181,9 @@ pub async fn get_channel_invite_code_handler(
 }
 
 // ============================================================================
-// FIXTURE VOTE COUNT
+// GET CHANNEL VOTES
 // ============================================================================
 
-// ============================================================================
-// GET CHANNEL VOTE COUNT (Same pattern as pledges and bets - reads from fixtures)
-// ============================================================================
 pub async fn get_channel_votes_handler(
     State(state): State<AppState>,
     Path((channel_id, fixture_id)): Path<(String, String)>,
@@ -2240,7 +2217,7 @@ pub async fn get_channel_votes_handler(
         if let Some(username) = member_map.get(&vote.user_id) {
             channel_votes.push(json!({
                 "user_id": vote.user_id,
-                "user_name": username,  // ✅ Now we have username
+                "user_name": username,
                 "selection": vote.selection,
                 "voted_at": vote.voted_at,
                 "is_correct": vote.is_correct,
@@ -2260,6 +2237,7 @@ pub async fn get_channel_votes_handler(
         "vote_count": vote_count,
     })))
 }
+
 // ============================================================================
 // FIXTURE LATEST COMMENT
 // ============================================================================
@@ -2357,7 +2335,7 @@ pub async fn get_user_unread_count_handler(
 }
 
 // ============================================================================
-// LIKES HANDLERS - NEW
+// LIKES HANDLERS
 // ============================================================================
 
 #[derive(Debug, serde::Deserialize)]
@@ -2512,7 +2490,7 @@ pub async fn get_fixture_likes_handler(
 }
 
 // ============================================================================
-// CHECK USER LIKED (Uses likes collection directly)
+// CHECK USER LIKED
 // ============================================================================
 
 pub async fn check_user_liked_handler(
@@ -2537,7 +2515,7 @@ pub async fn check_user_liked_handler(
 }
 
 // ============================================================================
-// GET USER LIKED FIXTURES (Uses likes collection directly)
+// GET USER LIKED FIXTURES
 // ============================================================================
 
 pub async fn get_user_liked_fixtures_handler(

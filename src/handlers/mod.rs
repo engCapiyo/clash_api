@@ -19,6 +19,4 @@ pub(crate) mod posta;
 pub(crate) mod statistics_handler;
 pub mod sub_fixture_handler;
 pub(crate) mod user_profile;
-
-pub(crate) mod vote_handlers;
 pub mod ws_handler;
