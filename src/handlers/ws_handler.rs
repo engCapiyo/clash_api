@@ -202,6 +202,10 @@ async fn handle_socket(
 // ROOM FORWARDER — pipes one room's broadcast messages to this client
 // ============================================================================
 
+// ============================================================================
+// ROOM FORWARDER — pipes one room's broadcast messages to this client
+// ============================================================================
+
 fn spawn_room_forwarder(
     state: &AppState,
     room_key: &str,
@@ -232,6 +236,10 @@ fn spawn_room_forwarder(
 // HANDLE INCOMING MESSAGE
 // ============================================================================
 
+// ============================================================================
+// HANDLE INCOMING MESSAGE - FIXED
+// ============================================================================
+
 async fn handle_incoming_message(
     text: String,
     state: &AppState,
@@ -254,6 +262,9 @@ async fn handle_incoming_message(
 
     match message_type {
         Some("room.join") => {
+            // ✅ Clone sender for use in this branch
+            let sender_clone = sender.clone();
+
             let payload = match json_msg.get("payload") {
                 Some(p) => p,
                 None => {
@@ -290,7 +301,7 @@ async fn handle_incoming_message(
                     "timestamp": Utc::now().to_rfc3339(),
                 });
                 if let Ok(ack_json) = serde_json::to_string(&ack) {
-                    let mut guard = sender.lock().await;
+                    let mut guard = sender_clone.lock().await;
                     let _ = guard.send(WsMessage::Text(ack_json)).await;
                 }
                 return;
@@ -307,7 +318,9 @@ async fn handle_incoming_message(
                 old_handle.abort();
             }
 
-            let new_handle = spawn_room_forwarder(state, &new_room_key, sender.clone());
+            // ✅ Clone sender for spawn_room_forwarder
+            let sender_for_forwarder = sender.clone();
+            let new_handle = spawn_room_forwarder(state, &new_room_key, sender_for_forwarder);
             *forwarder.lock().await = Some(new_handle);
             *current = new_room_key.clone();
             drop(current);
@@ -318,13 +331,16 @@ async fn handle_incoming_message(
                 "timestamp": Utc::now().to_rfc3339(),
             });
             if let Ok(ack_json) = serde_json::to_string(&ack) {
-                let mut guard = sender.lock().await;
+                let mut guard = sender_clone.lock().await;
                 let _ = guard.send(WsMessage::Text(ack_json)).await;
             }
         }
 
         Some("chat.message") => {
             tracing::info!("✅ Matched chat.message");
+
+            // ✅ Clone sender for use in this branch
+            let sender_clone = sender.clone();
 
             let payload = match json_msg.get("payload") {
                 Some(p) => p.clone(),
@@ -444,6 +460,9 @@ async fn handle_incoming_message(
         }
 
         Some("typing") => {
+            // ✅ Clone sender for use in this branch
+            let sender_clone = sender.clone();
+
             if let Some(payload) = json_msg.get("payload") {
                 let channel_id = payload
                     .get("channelId")
@@ -490,6 +509,9 @@ async fn handle_incoming_message(
 
         Some("join.request") => {
             tracing::info!("📨 Join request via WebSocket");
+
+            // ✅ Clone sender for use in this branch
+            let sender_clone = sender.clone();
 
             if let Some(payload) = json_msg.get("payload") {
                 let channel_id = payload
@@ -581,7 +603,7 @@ async fn handle_incoming_message(
                         });
 
                         if let Ok(json) = serde_json::to_string(&confirmation) {
-                            let mut guard = sender.lock().await;
+                            let mut guard = sender_clone.lock().await;
                             let _ = guard.send(WsMessage::Text(json)).await;
                         }
                     }
