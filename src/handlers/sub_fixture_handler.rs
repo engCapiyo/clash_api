@@ -23,6 +23,58 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 // ============================================================================
+// HELPER: Resolve market_id from either ObjectId or business key
+// ============================================================================
+async fn resolve_market_id(
+    markets_col: &Collection<SubFixtureMarket>,
+    match_id: &str,
+    market_id_or_oid: &str,
+) -> Result<String, AppError> {
+    if market_id_or_oid.is_empty() {
+        return Err(AppError::ValidationError(
+            "market_id is required".to_string(),
+        ));
+    }
+
+    // Try to parse as ObjectId first
+    if let Ok(oid) = bson::oid::ObjectId::parse_str(market_id_or_oid) {
+        // Look up the market by ObjectId to get the actual market_id
+        if let Some(market) = markets_col
+            .find_one(doc! { "_id": oid })
+            .await
+            .map_err(|e| AppError::MongoDB(e))?
+        {
+            tracing::debug!(
+                "✅ Resolved ObjectId {} to market_id: {}",
+                market_id_or_oid,
+                market.market_id
+            );
+            return Ok(market.market_id);
+        }
+    }
+
+    // Not a valid ObjectId or not found, use as-is (business key)
+    // But verify the market exists with this market_id
+    let market = markets_col
+        .find_one(doc! {
+            "matchId": match_id,
+            "marketId": market_id_or_oid,
+        })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or_else(|| {
+            tracing::warn!(
+                "❌ Market not found: match={}, market_id={}",
+                match_id,
+                market_id_or_oid
+            );
+            AppError::DocumentNotFound
+        })?;
+
+    Ok(market.market_id)
+}
+
+// ============================================================================
 // 1. CREATE SUB-FIXTURE BET
 // ============================================================================
 pub async fn create_sub_fixture_bet_handler(
@@ -32,6 +84,7 @@ pub async fn create_sub_fixture_bet_handler(
     let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
     let users_col: Collection<User> = state.db.collection("users");
     let games_col: Collection<Game> = state.db.collection("games");
+    let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
 
     tracing::info!(
         "📊 Creating sub-fixture bet: match={}, user={}, selection={}, amount={}",
@@ -50,6 +103,26 @@ pub async fn create_sub_fixture_bet_handler(
     let starter_id = bson::oid::ObjectId::parse_str(&payload.starter_id)
         .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
 
+    // Resolve market_id - accept both ObjectId and business key
+    let market_id = resolve_market_id(&markets_col, &payload.match_id, &payload.market_id).await?;
+
+    // Get market for validation
+    let market = markets_col
+        .find_one(doc! {
+            "matchId": &payload.match_id,
+            "marketId": &market_id,
+        })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or_else(|| AppError::DocumentNotFound)?;
+
+    if market.status != "open" {
+        return Err(AppError::ValidationError(format!(
+            "Market is not open (status: {})",
+            market.status
+        )));
+    }
+
     // Validate match exists
     let game = games_col
         .find_one(doc! { "matchId": &payload.match_id })
@@ -67,7 +140,7 @@ pub async fn create_sub_fixture_bet_handler(
     let existing = bets_col
         .find_one(doc! {
             "match_id": &payload.match_id,
-            "market_id": &payload.market_id,
+            "market_id": &market_id,
             "starter_id": starter_id,
             "status": doc! { "$in": ["open", "matched"] },
         })
@@ -119,12 +192,12 @@ pub async fn create_sub_fixture_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // Create bet
+    // Create bet with resolved market_id
     let now = BsonDateTime::now();
     let bet = SubFixtureBet {
         id: None,
         match_id: payload.match_id.clone(),
-        market_id: payload.market_id.clone(),
+        market_id: market_id.clone(),
         starter_id,
         starter_name: payload.starter_name.clone(),
         starter_selection: payload.selection.clone(),
@@ -152,6 +225,27 @@ pub async fn create_sub_fixture_bet_handler(
         .map(|oid| oid.to_hex())
         .ok_or_else(|| AppError::InternalServerError("Failed to get bet ID".to_string()))?;
 
+    // Update market pledge counts and totals
+    markets_col
+        .update_one(
+            doc! {
+                "matchId": &payload.match_id,
+                "marketId": &market_id,
+            },
+            doc! {
+                "$inc": {
+                    &format!("pledgeCounts.{}", payload.selection): 1,
+                    &format!("pledgeTotals.{}", payload.selection): payload.amount as i32,
+                },
+                "$set": {
+                    "updatedAt": now,
+                }
+            },
+        )
+        .session(&mut session)
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
     session
         .commit_transaction()
         .await
@@ -162,7 +256,7 @@ pub async fn create_sub_fixture_bet_handler(
         "message": "Sub-fixture bet created successfully",
         "bet_id": bet_id,
         "match_id": payload.match_id,
-        "market_id": payload.market_id,
+        "market_id": market_id,
         "status": "open",
         "amount": payload.amount,
         "new_balance": user.balance - payload.amount,
@@ -170,7 +264,7 @@ pub async fn create_sub_fixture_bet_handler(
 }
 
 // ============================================================================
-// 2. FILL SUB-FIXTURE BET
+// 2. FILL SUB-FIXTURE BET - FIXED
 // ============================================================================
 pub async fn fill_sub_fixture_bet_handler(
     State(state): State<AppState>,
@@ -180,6 +274,7 @@ pub async fn fill_sub_fixture_bet_handler(
     let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
     let users_col: Collection<User> = state.db.collection("users");
     let games_col: Collection<Game> = state.db.collection("games");
+    let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
 
     tracing::info!(
         "📊 Filling sub-fixture bet: bet_id={}, user={}, selection={}, amount={}",
@@ -200,13 +295,16 @@ pub async fn fill_sub_fixture_bet_handler(
     let finisher_id = bson::oid::ObjectId::parse_str(&payload.finisher_id)
         .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
 
-    // Find open bet
+    // Resolve market_id - accept both ObjectId and business key
+    let market_id = resolve_market_id(&markets_col, &payload.match_id, &payload.market_id).await?;
+
+    // Find open bet with resolved market_id
     let bet = bets_col
         .find_one(doc! {
             "_id": bet_oid,
             "status": "open",
             "match_id": &payload.match_id,
-            "market_id": &payload.market_id,
+            "market_id": &market_id,
         })
         .await
         .map_err(|e| AppError::MongoDB(e))?
@@ -688,15 +786,6 @@ pub async fn settle_sub_fixture_bets_for_market(
 // ============================================================================
 // 6b. SETTLE SUB-FIXTURE MARKET (HTTP-exposed wrapper)
 // ============================================================================
-// The function above (settle_sub_fixture_bets_for_market) existed but was
-// never reachable over HTTP -- no route called it. This handler exposes it
-// so the Python poller can call it directly once it detects a first_goal/
-// first_card/first_corner event or a final over/under 2.5 result.
-//
-// Wrapped in Arc::new(state.clone()) purely to satisfy the &Arc<AppState>
-// signature the internal function already has -- if AppState is cheaply
-// Clone (typical axum pattern: mongodb::Client + config, all internally
-// Arc'd), this is a no-op allocation, not a real state duplication.
 pub async fn settle_sub_fixture_market_handler(
     State(state): State<AppState>,
     Json(payload): Json<SettleSubFixtureMarketRequest>,
@@ -729,16 +818,6 @@ pub async fn settle_sub_fixture_market_handler(
 // ============================================================================
 // 7. GET MARKETS FOR MATCH
 // ============================================================================
-// Was a stub returning "markets": [] unconditionally -- the Flutter client's
-// Sub-Fixtures tab (SwipeableVotePledgeModal._loadSubFixtures) hits
-// GET /sub_fixtures/markets/:match_id expecting real data, so it always
-// rendered "No sub-fixtures available" regardless of what existed in Mongo.
-//
-// FIXED: filter now uses "matchId"/"isVisible" (camelCase) -- SubFixtureMarket
-// is #[serde(rename_all = "camelCase")], so documents are actually stored with
-// those keys, not "match_id"/"is_visible". The doc! macro takes plain string
-// keys and does NOT go through serde's rename, so the old snake_case filter
-// silently matched zero documents even when markets existed in Mongo.
 pub async fn get_markets_for_match_handler(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
@@ -771,14 +850,6 @@ pub async fn get_markets_for_match_handler(
 // ============================================================================
 // 7b. GET SUB-FIXTURE VISIBILITY FOR MATCH
 // ============================================================================
-// The Flutter client calls GET /sub_fixtures/visibility/:match_id before
-// ever showing the Sub-Fixtures tab (_checkSubFixtureVisibility). That
-// route didn't exist anywhere, so the request 404'd, the catch block set
-// _subFixturesVisible = false, and the whole tab silently disappeared --
-// _loadSubFixtures() never even ran. Visible := at least one visible
-// market currently exists for this match.
-//
-// FIXED: same "matchId"/"isVisible" camelCase correction as above.
 pub async fn get_sub_fixture_visibility_handler(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
@@ -803,9 +874,6 @@ pub async fn get_sub_fixture_visibility_handler(
 // ============================================================================
 // 8. GET MARKET DETAILS
 // ============================================================================
-// FIXED: same camelCase correction ("matchId"/"marketId") as the two
-// handlers above -- this previously could never find a market document
-// either.
 pub async fn get_market_details_handler(
     State(state): State<AppState>,
     Path((match_id, market_id)): Path<(String, String)>,
@@ -866,11 +934,6 @@ pub async fn get_market_details_handler(
 // ============================================================================
 // 9. CREATE SUB-FIXTURE MARKET
 // ============================================================================
-// Mirrors SubFixtureStore.create_market() in mongo_store.py exactly, so
-// whichever side actually calls this (Python direct-Mongo write is the
-// primary path -- this exists for parity / as an HTTP-callable option).
-// Idempotent: checks for an existing (matchId, marketId) doc before
-// inserting, same guarantee as $setOnInsert on the Python side.
 pub async fn create_sub_fixture_market_handler(
     State(state): State<AppState>,
     Json(payload): Json<CreateSubFixtureMarketRequest>,
@@ -916,7 +979,7 @@ pub async fn create_sub_fixture_market_handler(
     }
 
     let market = SubFixtureMarket {
-        id: None, // Option<ObjectId> -- Mongo auto-generates on insert
+        id: None,
         match_id: payload.match_id.clone(),
         market_id: market_id.clone(),
         market_type: payload.market_type.clone(),
