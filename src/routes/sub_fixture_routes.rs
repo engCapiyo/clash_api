@@ -54,6 +54,10 @@ pub fn sub_fixture_routes() -> Router<AppState> {
             get(crate::handlers::sub_fixture_handler::get_markets_for_match_handler),
         )
         .route(
+            "/sub-fixture/market/create",
+            post(crate::handlers::sub_fixture_handler::create_sub_fixture_market_handler),
+        )
+        .route(
             "/visibility/:match_id",
             get(crate::handlers::sub_fixture_handler::get_sub_fixture_visibility_handler),
         )

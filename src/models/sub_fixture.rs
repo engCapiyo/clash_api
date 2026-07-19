@@ -156,6 +156,14 @@ pub struct SettleSubFixtureMarketRequest {
     pub market_id: String,
     pub winning_team: Option<String>,
 }
+#[derive(Debug, Deserialize)]
+pub struct CreateSubFixtureMarketRequest {
+    pub match_id: String,
+    pub market_type: String,  // "first_goal" | "first_card" | "first_corner"
+    pub options: Vec<String>, // e.g. ["home", "away"]
+    pub line: Option<f64>,
+    pub lock_at: Option<DateTime>,
+}
 
 impl From<SubFixtureBet> for SubFixtureBetResponse {
     fn from(bet: SubFixtureBet) -> Self {

@@ -3,9 +3,9 @@ use crate::{
     models::{
         game::Game,
         sub_fixture::{
-            BetStatus, CreateSubFixtureBetRequest, FillSubFixtureBetRequest,
-            SettleSubFixtureMarketRequest, SubFixtureBet, SubFixtureBetResponse, SubFixtureMarket,
-            SubFixtureMarketResponse,
+            BetStatus, CreateSubFixtureBetRequest, CreateSubFixtureMarketRequest,
+            FillSubFixtureBetRequest, SettleSubFixtureMarketRequest, SubFixtureBet,
+            SubFixtureBetResponse, SubFixtureMarket, SubFixtureMarketResponse,
         },
         user::User,
     },
@@ -686,7 +686,7 @@ pub async fn settle_sub_fixture_bets_for_market(
 }
 
 // ============================================================================
-// 6b. SETTLE SUB-FIXTURE MARKET (HTTP-exposed wrapper) -- NEW
+// 6b. SETTLE SUB-FIXTURE MARKET (HTTP-exposed wrapper)
 // ============================================================================
 // The function above (settle_sub_fixture_bets_for_market) existed but was
 // never reachable over HTTP -- no route called it. This handler exposes it
@@ -733,6 +733,12 @@ pub async fn settle_sub_fixture_market_handler(
 // Sub-Fixtures tab (SwipeableVotePledgeModal._loadSubFixtures) hits
 // GET /sub_fixtures/markets/:match_id expecting real data, so it always
 // rendered "No sub-fixtures available" regardless of what existed in Mongo.
+//
+// FIXED: filter now uses "matchId"/"isVisible" (camelCase) -- SubFixtureMarket
+// is #[serde(rename_all = "camelCase")], so documents are actually stored with
+// those keys, not "match_id"/"is_visible". The doc! macro takes plain string
+// keys and does NOT go through serde's rename, so the old snake_case filter
+// silently matched zero documents even when markets existed in Mongo.
 pub async fn get_markets_for_match_handler(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
@@ -741,10 +747,10 @@ pub async fn get_markets_for_match_handler(
 
     let mut cursor = markets_col
         .find(doc! {
-            "match_id": &match_id,
-            "is_visible": true,
+            "matchId": &match_id,
+            "isVisible": true,
         })
-        .sort(doc! { "created_at": 1 })
+        .sort(doc! { "createdAt": 1 })
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
@@ -763,7 +769,7 @@ pub async fn get_markets_for_match_handler(
 }
 
 // ============================================================================
-// 7b. GET SUB-FIXTURE VISIBILITY FOR MATCH -- NEW
+// 7b. GET SUB-FIXTURE VISIBILITY FOR MATCH
 // ============================================================================
 // The Flutter client calls GET /sub_fixtures/visibility/:match_id before
 // ever showing the Sub-Fixtures tab (_checkSubFixtureVisibility). That
@@ -771,6 +777,8 @@ pub async fn get_markets_for_match_handler(
 // _subFixturesVisible = false, and the whole tab silently disappeared --
 // _loadSubFixtures() never even ran. Visible := at least one visible
 // market currently exists for this match.
+//
+// FIXED: same "matchId"/"isVisible" camelCase correction as above.
 pub async fn get_sub_fixture_visibility_handler(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
@@ -779,8 +787,8 @@ pub async fn get_sub_fixture_visibility_handler(
 
     let visible_count = markets_col
         .count_documents(doc! {
-            "match_id": &match_id,
-            "is_visible": true,
+            "matchId": &match_id,
+            "isVisible": true,
         })
         .await
         .map_err(|e| AppError::MongoDB(e))?;
@@ -795,6 +803,9 @@ pub async fn get_sub_fixture_visibility_handler(
 // ============================================================================
 // 8. GET MARKET DETAILS
 // ============================================================================
+// FIXED: same camelCase correction ("matchId"/"marketId") as the two
+// handlers above -- this previously could never find a market document
+// either.
 pub async fn get_market_details_handler(
     State(state): State<AppState>,
     Path((match_id, market_id)): Path<(String, String)>,
@@ -803,7 +814,7 @@ pub async fn get_market_details_handler(
     let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
 
     let market = markets_col
-        .find_one(doc! { "match_id": &match_id, "market_id": &market_id })
+        .find_one(doc! { "matchId": &match_id, "marketId": &market_id })
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
@@ -849,5 +860,89 @@ pub async fn get_market_details_handler(
             "total_pot": total_pot,
         },
         "bets": bets,
+    })))
+}
+
+// ============================================================================
+// 9. CREATE SUB-FIXTURE MARKET
+// ============================================================================
+// Mirrors SubFixtureStore.create_market() in mongo_store.py exactly, so
+// whichever side actually calls this (Python direct-Mongo write is the
+// primary path -- this exists for parity / as an HTTP-callable option).
+// Idempotent: checks for an existing (matchId, marketId) doc before
+// inserting, same guarantee as $setOnInsert on the Python side.
+pub async fn create_sub_fixture_market_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateSubFixtureMarketRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
+
+    if payload.options.is_empty() {
+        return Err(AppError::ValidationError(
+            "options must not be empty".to_string(),
+        ));
+    }
+
+    let market_id = format!("{}_{}", payload.match_id, payload.market_type);
+    let now = BsonDateTime::now();
+
+    let mut pledge_counts: HashMap<String, i32> = HashMap::new();
+    let mut pledge_totals: HashMap<String, i32> = HashMap::new();
+    for opt in &payload.options {
+        pledge_counts.insert(opt.clone(), 0);
+        pledge_totals.insert(opt.clone(), 0);
+    }
+
+    tracing::info!(
+        "📊 Creating sub-fixture market: match={}, type={}, market_id={}",
+        payload.match_id,
+        payload.market_type,
+        market_id
+    );
+
+    let existing = markets_col
+        .find_one(doc! { "matchId": &payload.match_id, "marketId": &market_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    if let Some(existing_market) = existing {
+        return Ok(Json(json!({
+            "success": true,
+            "created": false,
+            "match_id": payload.match_id,
+            "market_id": market_id,
+            "market": SubFixtureMarketResponse::from(existing_market),
+        })));
+    }
+
+    let market = SubFixtureMarket {
+        id: None, // Option<ObjectId> -- Mongo auto-generates on insert
+        match_id: payload.match_id.clone(),
+        market_id: market_id.clone(),
+        market_type: payload.market_type.clone(),
+        options: payload.options.clone(),
+        line: payload.line,
+        status: "open".to_string(),
+        lock_at: payload.lock_at,
+        pledge_counts,
+        pledge_totals,
+        result: None,
+        is_visible: true,
+        created_at: now,
+        updated_at: now,
+        settled_at: None,
+    };
+
+    markets_col
+        .insert_one(&market)
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    Ok(Json(json!({
+        "success": true,
+        "created": true,
+        "match_id": payload.match_id,
+        "market_id": market_id,
+        "market": SubFixtureMarketResponse::from(market),
     })))
 }
