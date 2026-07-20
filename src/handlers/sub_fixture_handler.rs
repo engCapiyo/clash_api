@@ -522,17 +522,35 @@ pub async fn get_user_sub_fixture_bets_handler(
 // ============================================================================
 // 5. GET MATCHED SUB-FIXTURE BETS FOR A MARKET
 // ============================================================================
+// ============================================================================
+// 5. GET MATCHED SUB-FIXTURE BETS FOR A MARKET
+// ============================================================================
+// ============================================================================
+// 5. GET SUB-FIXTURE BETS FOR A MARKET (open + matched)
+// ============================================================================
 pub async fn get_market_sub_fixture_bets_handler(
     State(state): State<AppState>,
     Path((match_id, market_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
+    let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
 
+    // Resolve market_id - accept both ObjectId and business key, same as
+    // create/fill handlers. Without this, requests using the Mongo _id hex
+    // never match bets, which are always stored under the resolved business
+    // key.
+    let market_id = resolve_market_id(&markets_col, &match_id, &market_id).await?;
+
+    // Previously filtered to "matched" only, which silently hid every
+    // unmatched (open) pledge -- including the user's own pledge right
+    // after they place it, before anyone fills it. The Dart client's
+    // expandable pledges list expects to see all pledges on a market,
+    // not just matched ones.
     let mut cursor = bets_col
         .find(doc! {
             "match_id": &match_id,
             "market_id": &market_id,
-            "status": "matched",
+            "status": doc! { "$in": ["open", "matched"] },
         })
         .sort(doc! { "created_at": -1 })
         .await
@@ -544,6 +562,9 @@ pub async fn get_market_sub_fixture_bets_handler(
         bets.push(SubFixtureBetResponse::from(bet));
     }
 
+    // total_pot is already starter_amount for open bets and
+    // starter_amount + finisher_amount for matched ones, so summing it
+    // directly is correct for both statuses.
     let total_pot: f64 = bets.iter().map(|b| b.total_pot).sum();
 
     Ok(Json(json!({
@@ -555,7 +576,6 @@ pub async fn get_market_sub_fixture_bets_handler(
         "total_pot": total_pot,
     })))
 }
-
 // ============================================================================
 // 6. SETTLE SUB-FIXTURE BETS FOR A MARKET (internal, reusable logic)
 // ============================================================================
@@ -874,12 +894,21 @@ pub async fn get_sub_fixture_visibility_handler(
 // ============================================================================
 // 8. GET MARKET DETAILS
 // ============================================================================
+// ============================================================================
+// 8. GET MARKET DETAILS
+// ============================================================================
 pub async fn get_market_details_handler(
     State(state): State<AppState>,
     Path((match_id, market_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
     let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
+
+    // Resolve market_id - accept both ObjectId and business key. Same fix as
+    // get_market_sub_fixture_bets_handler: the client may pass either the
+    // Mongo _id hex or the business marketId, but bets are always stored
+    // under the business key.
+    let market_id = resolve_market_id(&markets_col, &match_id, &market_id).await?;
 
     let market = markets_col
         .find_one(doc! { "matchId": &match_id, "marketId": &market_id })
