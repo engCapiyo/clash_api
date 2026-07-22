@@ -23,14 +23,6 @@ use crate::state::AppState;
 
 // ============================================================================
 // COLLECTION NAMES
-//
-// "games"    -> league competitions (EPL, Serie A, UCL, etc.)
-// "fixtures" -> national team matches (WC qualifiers, friendlies, etc.)
-//
-// Both use the same `Game` struct/schema. Read handlers merge across both.
-// Write handlers resolve which collection actually owns a given matchId
-// and update that one (falling back to the other if the first doesn't
-// match), so a matchId never needs to be pre-tagged by the caller.
 // ============================================================================
 
 const GAMES_COLLECTION: &str = "games";
@@ -70,8 +62,7 @@ async fn find_game_tolerant(
             match mongodb::bson::from_document::<Game>(stripped) {
                 Ok(game) => {
                     tracing::warn!(
-                        "⚠️ Recovered fixture {} by dropping malformed 'lineups' field -- \
-                         this document needs data cleanup in MongoDB",
+                        "⚠️ Recovered fixture {} by dropping malformed 'lineups' field",
                         match_id
                     );
                     Ok(Some(game))
@@ -205,10 +196,9 @@ async fn find_history_games_tolerant(
 }
 
 // ============================================================================
-// COMBINED (LEAGUES + NATIONAL TEAMS) READ HELPERS
+// COMBINED READ HELPERS
 // ============================================================================
 
-/// Queries both `games` and `fixtures` with the same filter and merges results.
 async fn find_games_tolerant_all(state: &AppState, filter: Document) -> Result<Vec<Game>> {
     let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
     let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
@@ -219,7 +209,6 @@ async fn find_games_tolerant_all(state: &AppState, filter: Document) -> Result<V
     Ok(games)
 }
 
-/// Looks up a single doc in `games` first, falling back to `fixtures`.
 async fn find_game_tolerant_all(state: &AppState, filter: Document) -> Result<Option<Game>> {
     let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
     if let Some(g) = find_game_tolerant(&games_col, filter.clone()).await? {
@@ -230,11 +219,9 @@ async fn find_game_tolerant_all(state: &AppState, filter: Document) -> Result<Op
 }
 
 // ============================================================================
-// COMBINED (LEAGUES + NATIONAL TEAMS) WRITE HELPERS
+// COMBINED WRITE HELPERS
 // ============================================================================
 
-/// Which physical collection a write landed in. Callers use this to route
-/// any follow-up read/delete/broadcast to the same collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GameSource {
     Games,
@@ -254,9 +241,6 @@ impl GameSource {
     }
 }
 
-/// Runs `update` against `games` first; if nothing matched, retries against
-/// `fixtures`. Returns which collection was actually updated, or
-/// `DocumentNotFound` if the matchId exists in neither.
 async fn update_one_in_either(
     state: &AppState,
     filter: Document,
@@ -277,9 +261,6 @@ async fn update_one_in_either(
     Err(AppError::DocumentNotFound)
 }
 
-/// Same idea, but for `$push`/`$inc`-style update docs where the caller
-/// wants a soft no-op (rather than a hard error) when the matchId isn't
-/// found in either collection. Returns `None` if unmatched anywhere.
 async fn update_one_in_either_opt(
     state: &AppState,
     filter: Document,
@@ -292,7 +273,6 @@ async fn update_one_in_either_opt(
     }
 }
 
-/// Deletes a matchId from whichever collection it's actually in.
 async fn delete_one_in_either(state: &AppState, filter: Document) -> Result<GameSource> {
     let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
     let result = games_col.delete_one(filter.clone()).await?;
@@ -429,7 +409,7 @@ fn parse_kickoff_utc(date_iso: &str, time_str: &str) -> Option<chrono::DateTime<
 }
 
 // ============================================================================
-// GAME HANDLERS (now merged across games + fixtures)
+// GAME HANDLERS
 // ============================================================================
 
 pub async fn get_games(
@@ -543,7 +523,7 @@ pub async fn get_upcoming_games(State(state): State<AppState>) -> Result<Json<Ve
 }
 
 // ============================================================================
-// UPDATE GAME SCORE
+// UPDATE GAME SCORE - UPDATED (timeElapsed only)
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -559,10 +539,6 @@ pub struct UpdateGameScoreRequest {
     pub is_live: Option<bool>,
     #[serde(rename = "timeElapsed")]
     pub time_elapsed: Option<f64>,
-    #[serde(rename = "minutesPlayed")]
-    pub minutes_played: Option<i32>,
-    #[serde(rename = "minuteDisplay")]
-    pub minute_display: Option<String>,
 }
 
 pub async fn update_game_score(
@@ -590,16 +566,8 @@ pub async fn update_game_score(
     if let Some(time_elapsed) = payload.time_elapsed {
         update_doc.insert("timeElapsed", time_elapsed);
     }
-    if let Some(minutes_played) = payload.minutes_played {
-        update_doc.insert("minutesPlayed", minutes_played);
-    }
-    if let Some(minute_display) = payload.minute_display {
-        update_doc.insert("minuteDisplay", minute_display);
-    }
     update_doc.insert("scrapedAt", BsonDateTime::from_chrono(Utc::now()));
 
-    // Resolves whether this matchId lives in `games` or `fixtures` and
-    // updates whichever one actually owns it.
     let source = update_one_in_either(&state, filter.clone(), doc! { "$set": update_doc }).await?;
     let collection = source.collection(&state);
 
@@ -615,9 +583,7 @@ pub async fn update_game_score(
                 "fixture_id": match_id,
                 "home_score": game.home_score.unwrap_or(0),
                 "away_score": game.away_score.unwrap_or(0),
-                "minute": game.time_elapsed,
-                "minutes_played": game.minutes_played,
-                "minute_display": game.minute_display,
+                "time_elapsed": game.time_elapsed,
             });
 
             let mut channel_count = 0;
@@ -750,7 +716,7 @@ pub async fn update_game_status(
 }
 
 // ============================================================================
-// RECEIVE LIVE UPDATE
+// RECEIVE LIVE UPDATE - UPDATED (timeElapsed only)
 // ============================================================================
 
 pub async fn receive_live_update(
@@ -776,33 +742,29 @@ pub async fn receive_live_update(
     let mut set_doc = doc! {
         "homeScore": update.home_score,
         "awayScore": update.away_score,
-        "timeElapsed": update.minute,
         "status": status,
         "isLive": is_live,
         "availableForVoting": available_for_voting,
         "scrapedAt": BsonDateTime::from_chrono(Utc::now()),
     };
 
-    if let Some(minutes_played) = update.minutes_played {
-        set_doc.insert("minutesPlayed", minutes_played);
+    // ✅ Use time_elapsed if provided, otherwise use minute as fallback
+    if let Some(time_elapsed) = update.time_elapsed {
+        set_doc.insert("timeElapsed", time_elapsed);
+    } else {
+        set_doc.insert("timeElapsed", update.minute as f64);
     }
 
-    if let Some(minute_display) = &update.minute_display {
-        set_doc.insert("minuteDisplay", minute_display);
-    }
-
-    // Try `games` then `fixtures`; a national-team match_id will now be
-    // picked up instead of silently matching zero documents.
     let source = update_one_in_either(&state, filter.clone(), doc! { "$set": set_doc }).await?;
 
     tracing::info!(
-        "✅ Updated {} ({:?}): {}-{} (status: {}, {}')",
+        "✅ Updated {} ({:?}): {}-{} (status: {}, time: {:.1}')",
         update.fixture_id,
         source,
         update.home_score,
         update.away_score,
         status,
-        update.minute
+        update.time_elapsed.unwrap_or(update.minute as f64)
     );
 
     if update.event_type == "match_end" {
@@ -832,13 +794,11 @@ pub async fn receive_live_update(
         "event_type": update.event_type,
         "home_score": update.home_score,
         "away_score": update.away_score,
-        "minute": update.minute,
-        "minute_display": update.minute_display,
+        "time_elapsed": update.time_elapsed.unwrap_or(update.minute as f64),
         "scorer": update.scorer,
         "player": update.player,
         "assist": update.assist,
         "team": update.team,
-        "minutes_played": update.minutes_played,
         "status": status,
         "is_live": is_live,
     });
@@ -1528,11 +1488,6 @@ pub async fn add_commentary_bulk(
 
 // ============================================================================
 // HISTORY / ARCHIVE HANDLERS
-//
-// Both `games` and `fixtures` archive into the same `games_history`
-// collection -- history reads were already merged by nature of the query,
-// no separate "fixtures_history" is needed unless you want to keep leagues
-// and national teams physically separate after completion too.
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -1552,7 +1507,6 @@ pub async fn move_completed_to_history(
 ) -> Result<Json<serde_json::Value>> {
     tracing::info!("📦 Moving completed game {} to history", match_id);
 
-    // Determine which collection the game is in
     let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
     let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
 
@@ -1572,7 +1526,6 @@ pub async fn move_completed_to_history(
         if fixture_opt.is_some() {
             GameSource::Fixtures
         } else {
-            // Check if already in history
             let games_history_col: Collection<HistoryGame> = state.db.collection("games_history");
             let fixtures_history_col: Collection<HistoryGame> =
                 state.db.collection("fixtures_history");
@@ -1621,8 +1574,6 @@ pub async fn move_completed_to_history(
         home_team: game.home_team.clone(),
         away_team: game.away_team.clone(),
         league: game.league.clone(),
-        minutes_played: game.minutes_played,
-        minute_display: game.minute_display.clone(),
         home_win: game.home_win,
         away_win: game.away_win,
         draw: game.draw,
@@ -1654,7 +1605,6 @@ pub async fn move_completed_to_history(
         created_at: game.created_at,
     };
 
-    // Insert into the appropriate history collection
     let history_col_name = match source_collection {
         GameSource::Games => "games_history",
         GameSource::Fixtures => "fixtures_history",
@@ -1670,7 +1620,6 @@ pub async fn move_completed_to_history(
             e
         })?;
 
-    // Delete from source collection
     let source_col = source_collection.collection(&state);
     source_col
         .delete_one(doc! { "matchId": &match_id_clone })
@@ -1686,9 +1635,6 @@ pub async fn move_completed_to_history(
         "history_collection": history_col_name,
     })))
 }
-// ============================================================================
-// UPDATED HISTORY HANDLER - QUERIES BOTH COLLECTIONS
-// ============================================================================
 
 pub async fn get_history_games(
     State(state): State<AppState>,
@@ -1701,7 +1647,6 @@ pub async fn get_history_games(
 
     let mut filter = doc! {};
 
-    // Apply filters
     if let Some(league) = &query.league {
         filter.insert("league", league);
     }
@@ -1739,7 +1684,6 @@ pub async fn get_history_games(
     let skip = query.skip.unwrap_or(0);
     let sort = doc! { "completedAt": -1 };
 
-    // Query BOTH collections
     let (games_history, games_total) = find_history_games_tolerant(
         &games_history_col,
         filter.clone(),
@@ -1758,14 +1702,12 @@ pub async fn get_history_games(
     )
     .await?;
 
-    // Merge and sort by completedAt (newest first)
     let mut all_history = Vec::new();
     all_history.extend(games_history);
     all_history.extend(fixtures_history);
 
     all_history.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
 
-    // Apply skip/limit after merge
     let total = games_total + fixtures_total;
     let skip_usize = skip as usize;
     let limit_usize = limit as usize;
@@ -1806,7 +1748,6 @@ pub async fn get_history_game_by_match_id(
 
     let filter = doc! { "matchId": &match_id };
 
-    // Try games_history first
     let (mut games, _) =
         find_history_games_tolerant(&games_history_col, filter.clone(), doc! {}, 0, 1).await?;
 
@@ -1818,7 +1759,6 @@ pub async fn get_history_game_by_match_id(
         })));
     }
 
-    // Fallback to fixtures_history
     let (mut fixtures, _) =
         find_history_games_tolerant(&fixtures_history_col, filter, doc! {}, 0, 1).await?;
 
@@ -1845,8 +1785,6 @@ pub async fn cleanup_stale_completed_games(
         "scrapedAt": { "$lt": one_hour_ago }
     };
 
-    // Pull stale docs from both collections, remembering which collection
-    // each one came from so we delete from the right place afterward.
     let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
     let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
 
@@ -1869,8 +1807,6 @@ pub async fn cleanup_stale_completed_games(
                 home_team: game.home_team.clone(),
                 away_team: game.away_team.clone(),
                 league: game.league.clone(),
-                minutes_played: game.minutes_played,
-                minute_display: game.minute_display.clone(),
                 home_win: game.home_win,
                 away_win: game.away_win,
                 draw: game.draw,

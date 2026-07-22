@@ -151,7 +151,7 @@ where
 }
 
 // ============================================================================
-// MAIN GAME MODEL — MASTER DATA ONLY (NO COUNTS)
+// MAIN GAME MODEL — ONLY timeElapsed (no minutesPlayed or minuteDisplay)
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,14 +173,6 @@ pub struct Game {
     pub away_team: String,
 
     pub league: String,
-
-    #[serde(rename = "minutesPlayed")]
-    #[serde(default)]
-    pub minutes_played: Option<i32>,
-
-    #[serde(rename = "minuteDisplay")]
-    #[serde(default)]
-    pub minute_display: Option<String>,
 
     #[serde(rename = "homeWin")]
     #[serde(default)]
@@ -240,8 +232,7 @@ pub struct Game {
     #[serde(default)]
     pub last_polled_at: Option<BsonDateTime>,
 
-    // ❌ REMOVED: votes, voters, comments, commentary_count
-    // ✅ KEPT: commentary (match events)
+    // Commentary (match events)
     pub commentary: Vec<CommentaryEntry>,
 
     #[serde(rename = "lastCommentaryAt")]
@@ -302,14 +293,6 @@ pub struct HistoryGame {
 
     pub league: String,
 
-    #[serde(rename = "minutesPlayed")]
-    #[serde(default)]
-    pub minutes_played: Option<i32>,
-
-    #[serde(rename = "minuteDisplay")]
-    #[serde(default)]
-    pub minute_display: Option<String>,
-
     #[serde(rename = "homeWin")]
     #[serde(default)]
     pub home_win: Option<f64>,
@@ -368,7 +351,6 @@ pub struct HistoryGame {
     #[serde(default)]
     pub last_polled_at: Option<BsonDateTime>,
 
-    // ❌ REMOVED: votes, voters, comments, commentary_count
     pub commentary: Vec<CommentaryEntry>,
 
     #[serde(rename = "lastCommentaryAt")]
@@ -421,10 +403,6 @@ pub struct UpdateGameScoreRequest {
     pub is_live: Option<bool>,
     #[serde(rename = "timeElapsed")]
     pub time_elapsed: Option<f64>,
-    #[serde(rename = "minutesPlayed")]
-    pub minutes_played: Option<i32>,
-    #[serde(rename = "minuteDisplay")]
-    pub minute_display: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -449,8 +427,6 @@ pub struct LiveGameUpdate {
     #[serde(rename = "awayScore")]
     pub away_score: i32,
     pub minute: i32,
-    #[serde(rename = "minuteDisplay")]
-    pub minute_display: Option<String>,
     pub status: Option<String>,
     #[serde(rename = "isLive")]
     pub is_live: Option<bool>,
@@ -461,8 +437,8 @@ pub struct LiveGameUpdate {
     pub assist: Option<String>,
     pub team: Option<String>,
     pub timestamp: Option<DateTime<Utc>>,
-    #[serde(rename = "minutesPlayed")]
-    pub minutes_played: Option<i32>,
+    #[serde(rename = "timeElapsed")]
+    pub time_elapsed: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -532,8 +508,6 @@ impl Game {
             home_team,
             away_team,
             league,
-            minutes_played: None,
-            minute_display: None,
             home_win: None,
             away_win: None,
             draw: None,
