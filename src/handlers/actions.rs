@@ -25,9 +25,6 @@ use std::collections::HashSet;
 // ============================================================================
 // HELPER: Get all channel IDs where user is a member
 // ============================================================================
-// ============================================================================
-// HELPER: Get all channel IDs where user is a member
-// ============================================================================
 async fn get_user_channel_ids(
     channels_col: &Collection<Channel>,
     user_id: &str,
@@ -59,6 +56,116 @@ async fn get_user_channel_ids(
 }
 
 // ============================================================================
+// HELPER: Get all channel members
+// ============================================================================
+async fn get_channel_members(
+    channels_col: &Collection<Channel>,
+    channel_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let channel = channels_col
+        .find_one(doc! { "channel_id": channel_id })
+        .await
+        .map_err(|e| {
+            tracing::error!("❌ Failed to find channel: {}", e);
+            AppError::MongoDB(e)
+        })?
+        .ok_or_else(|| {
+            tracing::warn!("⚠️ Channel not found: {}", channel_id);
+            AppError::DocumentNotFound
+        })?;
+
+    Ok(channel.members.iter().map(|m| m.user_id.clone()).collect())
+}
+
+// ============================================================================
+// HELPER: Send WebSocket broadcast
+// ============================================================================
+async fn broadcast_to_room(
+    state: &AppState,
+    room_key: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) {
+    let tx = state.get_or_create_broadcaster(room_key);
+
+    let ws_message = serde_json::json!({
+        "type": event_type,
+        "payload": payload,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+
+    if let Ok(json) = serde_json::to_string(&ws_message) {
+        let _ = tx.send(json);
+        tracing::info!("📡 Broadcasted {} to room {}", event_type, room_key);
+    }
+}
+
+// ============================================================================
+// HELPER: Send notification to channel members
+// ============================================================================
+async fn notify_channel_members(
+    state: &AppState,
+    actor_id: &str,
+    channel_id: &str,
+    fixture_id: &str,
+    notification_type: &str,
+    title: &str,
+    body: &str,
+    payload: serde_json::Value,
+) -> Result<(), AppError> {
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+    let member_ids = get_channel_members(&channels_col, channel_id).await?;
+
+    if member_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Broadcast WebSocket to all members
+    let room_key = format!("{}_{}", channel_id, fixture_id);
+    broadcast_to_room(state, &room_key, notification_type, payload.clone()).await;
+
+    // Send FCM to offline users
+    let fcm_service = match &state.fcm_service {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let data = serde_json::json!({
+        "type": notification_type,
+        "channel_id": channel_id,
+        "fixture_id": fixture_id,
+        "actor_id": actor_id,
+    });
+
+    for user_id in member_ids {
+        if user_id == actor_id {
+            continue;
+        }
+
+        // Check if user is online
+        if state.is_user_online(&user_id) {
+            // Send to personal room
+            let personal_room = format!("user_{}", user_id);
+            broadcast_to_room(state, &personal_room, notification_type, payload.clone()).await;
+        } else {
+            // Send FCM push
+            let _ = fcm_service
+                .send_to_user(
+                    state,
+                    &user_id,
+                    title,
+                    body,
+                    data.clone(),
+                    notification_type,
+                )
+                .await;
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // HELPER: Create or update ChannelFixture for a channel
 // ============================================================================
 async fn upsert_channel_fixture(
@@ -84,7 +191,6 @@ async fn upsert_channel_fixture(
 
     let mut update = doc! {};
 
-    // Base defaults — always safe, never targeted by $inc in this function.
     let mut set_on_insert = doc! {
         "channel_id": channel_id,
         "fixture_id": fixture_id,
@@ -95,10 +201,6 @@ async fn upsert_channel_fixture(
         "added_at": BsonDateTime::now(),
     };
 
-    // Fields that MIGHT be the target of $inc. Use dotted paths (not a
-    // nested subdocument) so each is its own leaf path, and skip whichever
-    // one matches increment_field — otherwise $setOnInsert and $inc collide
-    // on the same path and Mongo throws error 40 on insert.
     let defaultable_fields: [(&str, i32); 5] = [
         ("vote_counts.home", 0),
         ("vote_counts.away", 0),
@@ -121,8 +223,6 @@ async fn upsert_channel_fixture(
         update.insert("$inc", inc);
     }
 
-    tracing::debug!("📤 Update document: {:?}", update);
-
     let result = channel_fixtures_col
         .update_one(filter, update)
         .upsert(true)
@@ -141,6 +241,7 @@ async fn upsert_channel_fixture(
 
     Ok(())
 }
+
 // ============================================================================
 // 1. CAST VOTE — Creates/Updates channel_fixtures for ALL user's channels
 // ============================================================================
@@ -226,6 +327,30 @@ pub async fn cast_vote_handler(
             "active",
         )
         .await?;
+    }
+
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS TO ALL CHANNEL MEMBERS
+    // ============================================================
+    let vote_payload = serde_json::json!({
+        "fixture_id": payload.fixture_id,
+        "user_id": payload.user_id,
+        "username": payload.username,
+        "selection": payload.selection,
+    });
+
+    for channel_id in &channel_ids {
+        let _ = notify_channel_members(
+            &state,
+            &payload.user_id,
+            channel_id,
+            &payload.fixture_id,
+            "vote.cast",
+            "🗳️ New Vote",
+            &format!("{} voted on the match", payload.username),
+            vote_payload.clone(),
+        )
+        .await;
     }
 
     tracing::info!(
@@ -446,6 +571,35 @@ pub async fn create_bet_handler(
         AppError::MongoDB(e)
     })?;
 
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS TO ALL CHANNEL MEMBERS
+    // ============================================================
+    let pledge_payload = serde_json::json!({
+        "fixture_id": fixture_id,
+        "user_id": payload.starter_id,
+        "username": payload.starter_name,
+        "selection": payload.starter_selection,
+        "amount": payload.amount,
+        "bet_id": bet_id,
+    });
+
+    for channel_id in &channel_ids {
+        let _ = notify_channel_members(
+            &state,
+            &payload.starter_id,
+            channel_id,
+            &fixture_id,
+            "pledge.create",
+            "💰 New Pledge",
+            &format!(
+                "{} pledged KES {} on the match",
+                payload.starter_name, payload.amount
+            ),
+            pledge_payload.clone(),
+        )
+        .await;
+    }
+
     tracing::info!(
         "✅ Bet created successfully: {} for user {}",
         bet_id,
@@ -587,7 +741,6 @@ pub async fn fill_bet_handler(
         payload.amount
     );
 
-    // Validate
     if payload.amount <= 0.0 {
         tracing::warn!("⚠️ Invalid amount: {}", payload.amount);
         return Err(AppError::ValidationError(
@@ -817,6 +970,39 @@ pub async fn fill_bet_handler(
         AppError::MongoDB(e)
     })?;
 
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS TO ALL CHANNEL MEMBERS
+    // ============================================================
+    let match_payload = serde_json::json!({
+        "bet_id": payload.bet_id,
+        "fixture_id": bet.fixture_id,
+        "starter_id": bet.starter_id,
+        "starter_name": bet.starter_name,
+        "starter_selection": bet.starter_selection,
+        "finisher_id": payload.finisher_id,
+        "finisher_name": payload.finisher_name,
+        "finisher_selection": payload.finisher_selection,
+        "amount": payload.amount,
+        "total_pot": bet.starter_amount + payload.amount,
+    });
+
+    for channel_id in &all_channel_ids {
+        let _ = notify_channel_members(
+            &state,
+            &payload.finisher_id,
+            channel_id,
+            &bet.fixture_id,
+            "bet.matched",
+            "🤝 Bet Matched",
+            &format!(
+                "{} matched a bet with {} on the match",
+                payload.finisher_name, bet.starter_name
+            ),
+            match_payload.clone(),
+        )
+        .await;
+    }
+
     tracing::info!(
         "✅ Bet filled: bet_id={}, finisher={}, fixture={}, channels_updated={}",
         payload.bet_id,
@@ -859,6 +1045,24 @@ pub async fn settle_bets_handler(
     let mut settled_count = 0;
     let mut refund_count = 0;
 
+    // Get all channels for this fixture
+    let mut channel_cursor = channel_fixtures_col
+        .find(doc! { "fixture_id": &payload.fixture_id })
+        .await
+        .map_err(|e| {
+            tracing::error!("❌ Failed to find channel fixtures: {}", e);
+            AppError::MongoDB(e)
+        })?;
+
+    let mut all_channel_ids = HashSet::new();
+    while let Some(cf) = channel_cursor.next().await {
+        let cf: ChannelFixture = cf.map_err(|e| {
+            tracing::error!("❌ Failed to deserialize channel fixture: {}", e);
+            AppError::MongoDB(e)
+        })?;
+        all_channel_ids.insert(cf.channel_id);
+    }
+
     // ========================================================================
     // PART 1: SETTLE MATCHED BETS
     // ========================================================================
@@ -872,6 +1076,9 @@ pub async fn settle_bets_handler(
             tracing::error!("❌ Failed to find matched bets: {}", e);
             AppError::MongoDB(e)
         })?;
+
+    let mut settled_bets = Vec::new();
+    let mut refunded_bets = Vec::new();
 
     while let Some(bet) = matched_cursor.next().await {
         let bet: Bet = bet.map_err(|e| {
@@ -950,10 +1157,15 @@ pub async fn settle_bets_handler(
                     AppError::MongoDB(e)
                 })?;
 
-            tracing::info!(
-                "✅ Bet {}: Starter {} won {} (total pot)",
+            settled_bets.push((
                 bet_id.to_hex(),
-                bet.starter_id,
+                bet.starter_id.clone(),
+                total_pot,
+                "starter",
+            ));
+            tracing::info!(
+                "✅ Bet {}: Starter won {} (total pot)",
+                bet_id.to_hex(),
                 total_pot
             );
         }
@@ -999,10 +1211,15 @@ pub async fn settle_bets_handler(
                     AppError::MongoDB(e)
                 })?;
 
-            tracing::info!(
-                "✅ Bet {}: Finisher {} won {} (total pot)",
+            settled_bets.push((
                 bet_id.to_hex(),
-                bet.finisher_id.as_deref().unwrap_or("unknown"),
+                bet.finisher_id.clone().unwrap_or_default(),
+                total_pot,
+                "finisher",
+            ));
+            tracing::info!(
+                "✅ Bet {}: Finisher won {} (total pot)",
+                bet_id.to_hex(),
                 total_pot
             );
         }
@@ -1062,10 +1279,8 @@ pub async fn settle_bets_handler(
                     AppError::MongoDB(e)
                 })?;
 
-            tracing::info!(
-                "🔄 Bet {}: Draw/No winner - refunded both parties",
-                bet_id.to_hex()
-            );
+            refunded_bets.push((bet_id.to_hex(), bet.starter_id.clone()));
+            tracing::info!("🔄 Bet {}: Draw - refunded both parties", bet_id.to_hex());
         }
 
         session.commit_transaction().await.map_err(|e| {
@@ -1148,12 +1363,8 @@ pub async fn settle_bets_handler(
         })?;
         refund_count += 1;
 
-        tracing::info!(
-            "🔄 Bet {}: Unmatched - refunded starter {} ({} KES)",
-            bet_id.to_hex(),
-            bet.starter_id,
-            bet.starter_amount
-        );
+        refunded_bets.push((bet_id.to_hex(), bet.starter_id.clone()));
+        tracing::info!("🔄 Bet {}: Unmatched - refunded starter", bet_id.to_hex());
     }
 
     // ========================================================================
@@ -1284,6 +1495,35 @@ pub async fn settle_bets_handler(
                 tracing::error!("❌ Failed to update incorrect voters: {}", e);
                 AppError::MongoDB(e)
             })?;
+    }
+
+    // ============================================================
+    // ✅ SEND SETTLEMENT NOTIFICATIONS TO ALL CHANNEL MEMBERS
+    // ============================================================
+    let result_payload = serde_json::json!({
+        "fixture_id": payload.fixture_id,
+        "result": payload.result,
+        "settled_count": settled_count,
+        "refunded_count": refund_count,
+        "correct_votes": correct_ids.len(),
+        "incorrect_votes": incorrect_ids.len(),
+    });
+
+    for channel_id in &all_channel_ids {
+        let _ = notify_channel_members(
+            &state,
+            "system",
+            channel_id,
+            &payload.fixture_id,
+            "bet.settled",
+            "⚖️ Match Settled",
+            &format!(
+                "Match result: {}. {} bets settled.",
+                payload.result, settled_count
+            ),
+            result_payload.clone(),
+        )
+        .await;
     }
 
     tracing::info!(
@@ -1539,7 +1779,6 @@ pub async fn get_channel_votes_handler(
         fixture_id
     );
 
-    // Get channel members
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await
@@ -1554,7 +1793,6 @@ pub async fn get_channel_votes_handler(
 
     let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
 
-    // Get ALL votes for this fixture
     let mut cursor = votes_col
         .find(doc! { "fixture_id": &fixture_id })
         .await

@@ -41,13 +41,11 @@ fn calculate_points(selection: &str, result: &str) -> i32 {
     }
 }
 
-// Helper to find a fixture in either collection
 async fn find_fixture_in_both(
     fixtures_col: &Collection<Fixture>,
     games_col: &Collection<Game>,
     fixture_id: &str,
 ) -> Result<Option<(String, serde_json::Value)>> {
-    // Try fixtures collection first (nationals)
     let fixture_filter = doc! {
         "$or": [
             { "fixture_id": fixture_id },
@@ -60,7 +58,6 @@ async fn find_fixture_in_both(
         return Ok(Some(("fixtures".to_string(), json)));
     }
 
-    // Try games collection (leagues)
     let mut game_or_clauses = vec![
         doc! { "game_id": fixture_id },
         doc! { "match_id": fixture_id },
@@ -87,7 +84,6 @@ async fn update_fixture_in_both(
     let mut updated_fixtures = false;
     let mut updated_games = false;
 
-    // Update fixtures collection (nationals)
     let fixture_filter = doc! {
         "$or": [
             { "fixture_id": fixture_id },
@@ -111,7 +107,6 @@ async fn update_fixture_in_both(
         updated_fixtures = true;
     }
 
-    // Update games collection (leagues)
     let game_filter = doc! {
         "$or": [
             { "game_id": fixture_id },
@@ -156,6 +151,114 @@ async fn log_membership_event(state: &AppState, channel_id: &str, user_id: &str,
     }
 }
 
+// ============================================================================
+// BROADCAST HELPERS
+// ============================================================================
+
+async fn broadcast_to_channel(
+    state: &AppState,
+    channel_id: &str,
+    fixture_id: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) {
+    let room_key = format!("{}_{}", channel_id, fixture_id);
+    let tx = state.get_or_create_broadcaster(&room_key);
+
+    let ws_message = serde_json::json!({
+        "type": event_type,
+        "payload": payload,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+
+    if let Ok(json) = serde_json::to_string(&ws_message) {
+        let _ = tx.send(json);
+        tracing::info!("📡 Broadcasted {} to room {}", event_type, room_key);
+    }
+}
+
+async fn notify_channel_members(
+    state: &AppState,
+    actor_id: &str,
+    channel_id: &str,
+    fixture_id: &str,
+    notification_type: &str,
+    title: &str,
+    body: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    // ✅ FIXED: only 1 generic parameter
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": channel_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?
+        .ok_or_else(|| {
+            tracing::warn!("⚠️ Channel not found: {}", channel_id);
+            AppError::DocumentNotFound
+        })?;
+
+    let member_ids: Vec<String> = channel
+        .members
+        .iter()
+        .filter(|m| m.user_id != actor_id)
+        .map(|m| m.user_id.clone())
+        .collect();
+
+    if member_ids.is_empty() {
+        return Ok(());
+    }
+
+    broadcast_to_channel(
+        state,
+        channel_id,
+        fixture_id,
+        notification_type,
+        payload.clone(),
+    )
+    .await;
+
+    let fcm_service = match &state.fcm_service {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let data = serde_json::json!({
+        "type": notification_type,
+        "channel_id": channel_id,
+        "fixture_id": fixture_id,
+        "actor_id": actor_id,
+    });
+
+    for user_id in member_ids {
+        if state.is_user_online(&user_id) {
+            let personal_room = format!("user_{}", user_id);
+            let tx = state.get_or_create_broadcaster(&personal_room);
+            let ws_message = serde_json::json!({
+                "type": notification_type,
+                "payload": payload.clone(),
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            });
+            if let Ok(json) = serde_json::to_string(&ws_message) {
+                let _ = tx.send(json);
+            }
+        } else {
+            let _ = fcm_service
+                .send_to_user(
+                    state,
+                    &user_id,
+                    title,
+                    body,
+                    data.clone(),
+                    notification_type,
+                )
+                .await;
+        }
+    }
+
+    Ok(())
+}
 // ============================================================================
 // CREATE CHANNEL
 // ============================================================================
@@ -295,7 +398,6 @@ pub async fn finalize_fixture_result_handler(
     let games_col = state.db.collection::<Game>("games");
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
-    // Update BOTH collections
     let (fixtures_updated, games_updated) = update_fixture_in_both(
         &fixtures_col,
         &games_col,
@@ -304,7 +406,6 @@ pub async fn finalize_fixture_result_handler(
     )
     .await?;
 
-    // Update all channel_fixtures with this fixture_id
     channel_fixtures_col
         .update_many(
             doc! { "fixture_id": &payload.fixture_id },
@@ -312,7 +413,6 @@ pub async fn finalize_fixture_result_handler(
         )
         .await?;
 
-    // Process all votes for this fixture
     let mut cursor = votes_col
         .find(doc! {
             "fixture_id": &payload.fixture_id,
@@ -389,6 +489,35 @@ pub async fn finalize_fixture_result_handler(
         }
     }
 
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS FOR FIXTURE SETTLEMENT
+    // ============================================================
+    let settlement_payload = serde_json::json!({
+        "fixture_id": payload.fixture_id,
+        "result": payload.result,
+        "users_updated": updates.len(),
+    });
+
+    // Get all channels with this fixture
+    let mut channel_cursor = channel_fixtures_col
+        .find(doc! { "fixture_id": &payload.fixture_id })
+        .await?;
+
+    while let Some(cf) = channel_cursor.next().await {
+        let cf: ChannelFixture = cf?;
+        let _ = notify_channel_members(
+            &state,
+            "system",
+            &cf.channel_id,
+            &payload.fixture_id,
+            "fixture.settled",
+            "⚖️ Match Settled",
+            &format!("Match result: {}", payload.result),
+            settlement_payload.clone(),
+        )
+        .await;
+    }
+
     Ok(Json(json!({
         "success": true,
         "processed": true,
@@ -417,6 +546,7 @@ pub struct CastVoteRequest {
     pub user_id: String,
     pub username: String,
     pub selection: String,
+    pub channel_id: Option<String>,
 }
 
 pub async fn cast_vote_handler(
@@ -431,7 +561,6 @@ pub async fn cast_vote_handler(
     let channels_col = state.db.collection::<Channel>("channels");
     let now = BsonDateTime::now();
 
-    // Check if already voted
     let existing_vote = votes_col
         .find_one(doc! {
             "fixture_id": &payload.fixture_id,
@@ -458,7 +587,6 @@ pub async fn cast_vote_handler(
         _ => &payload.selection,
     };
 
-    // Insert vote
     let vote = Vote {
         id: None,
         fixture_id: payload.fixture_id.clone(),
@@ -472,7 +600,6 @@ pub async fn cast_vote_handler(
 
     votes_col.insert_one(&vote).await?;
 
-    // Update channel_fixtures vote counts
     let increment_field = match payload.selection.as_str() {
         "home" => "vote_counts.home",
         "away" => "vote_counts.away",
@@ -487,7 +614,6 @@ pub async fn cast_vote_handler(
         )
         .await?;
 
-    // Update BOTH global collections
     let fixture_filter = doc! {
         "$or": [
             { "fixture_id": &payload.fixture_id },
@@ -510,7 +636,6 @@ pub async fn cast_vote_handler(
         .update_one(game_filter, doc! { "$inc": { "votes": 1 } })
         .await?;
 
-    // Update user's total_votes
     users_col
         .update_one(
             doc! { "_id": user_id_obj },
@@ -518,7 +643,6 @@ pub async fn cast_vote_handler(
         )
         .await?;
 
-    // Update channel members
     let mut channel_cursor = channels_col
         .find(doc! { "members.user_id": &payload.user_id })
         .await?;
@@ -534,6 +658,51 @@ pub async fn cast_vote_handler(
                 doc! { "$set": { "members.$.last_active_at": now } },
             )
             .await?;
+    }
+
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS FOR VOTE
+    // ============================================================
+    let vote_payload = serde_json::json!({
+        "fixture_id": payload.fixture_id,
+        "user_id": payload.user_id,
+        "username": payload.username,
+        "selection": payload.selection,
+    });
+
+    // If channel_id provided, notify that channel
+    if let Some(channel_id) = &payload.channel_id {
+        let _ = notify_channel_members(
+            &state,
+            &payload.user_id,
+            channel_id,
+            &payload.fixture_id,
+            "vote.cast",
+            "🗳️ New Vote",
+            &format!("{} voted on the match", payload.username),
+            vote_payload.clone(),
+        )
+        .await;
+    } else {
+        // Otherwise notify all channels the user is in
+        let mut channel_cursor2 = channels_col
+            .find(doc! { "members.user_id": &payload.user_id })
+            .await?;
+
+        while let Some(channel) = channel_cursor2.next().await {
+            let channel: Channel = channel?;
+            let _ = notify_channel_members(
+                &state,
+                &payload.user_id,
+                &channel.channel_id,
+                &payload.fixture_id,
+                "vote.cast",
+                "🗳️ New Vote",
+                &format!("{} voted on the match", payload.username),
+                vote_payload.clone(),
+            )
+            .await;
+        }
     }
 
     Ok(Json(json!({
@@ -755,7 +924,6 @@ pub async fn rollback_vote_handler(
     let games_col = state.db.collection::<Game>("games");
     let users_col = state.db.collection::<User>("users");
 
-    // Find the vote
     let vote = votes_col
         .find_one(doc! {
             "fixture_id": &payload.fixture_id,
@@ -764,7 +932,6 @@ pub async fn rollback_vote_handler(
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
-    // Delete the vote
     votes_col
         .delete_one(doc! {
             "fixture_id": &payload.fixture_id,
@@ -772,7 +939,6 @@ pub async fn rollback_vote_handler(
         })
         .await?;
 
-    // Decrement channel_fixtures vote counts
     let decrement_field = match vote.selection.as_str() {
         "home_team" | "home" => "vote_counts.home",
         "away_team" | "away" => "vote_counts.away",
@@ -787,7 +953,6 @@ pub async fn rollback_vote_handler(
         )
         .await?;
 
-    // Decrement BOTH global collections
     let fixture_filter = doc! {
         "$or": [
             { "fixture_id": &payload.fixture_id },
@@ -810,7 +975,6 @@ pub async fn rollback_vote_handler(
         .update_one(game_filter, doc! { "$inc": { "votes": -1 } })
         .await?;
 
-    // Decrement user's total_votes
     users_col
         .update_one(
             doc! { "_id": ObjectId::parse_str(&payload.user_id)? },
@@ -827,7 +991,7 @@ pub async fn rollback_vote_handler(
 }
 
 // ============================================================================
-// BET HANDLERS (UPDATED WITH NEW STRUCTURE - NO bet_id field)
+// BET HANDLERS
 // ============================================================================
 
 #[derive(Debug, serde::Deserialize)]
@@ -838,6 +1002,7 @@ pub struct CreateBetRequest {
     pub amount: f64,
     pub fixture_id: String,
     pub vote_id: String,
+    pub channel_id: Option<String>,
 }
 
 pub async fn create_bet_handler(
@@ -847,6 +1012,7 @@ pub async fn create_bet_handler(
     let bets_col = state.db.collection::<Bet>("bets");
     let users_col = state.db.collection::<User>("users");
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+    let channels_col = state.db.collection::<Channel>("channels");
     let now = BsonDateTime::now();
 
     let user_id_obj = ObjectId::parse_str(&payload.starter_id)?;
@@ -862,7 +1028,6 @@ pub async fn create_bet_handler(
         )));
     }
 
-    // Validate vote exists - using fixture_id and user_id
     let votes_col = state.db.collection::<Vote>("votes");
     let vote = votes_col
         .find_one(doc! {
@@ -874,20 +1039,18 @@ pub async fn create_bet_handler(
             "Vote not found for this fixture".to_string(),
         ))?;
 
-    // Create bet using the new_open constructor
     let bet = Bet::new_open(
         payload.fixture_id.clone(),
         payload.starter_id.clone(),
         payload.starter_name.clone(),
         payload.starter_selection.clone(),
         payload.amount,
-        vote.id.unwrap().to_hex(), // Convert ObjectId to string for vote_id
+        vote.id.unwrap().to_hex(),
     );
 
     let inserted = bets_col.insert_one(&bet).await?;
     let bet_id = inserted.inserted_id.as_object_id().unwrap();
 
-    // Deduct balance
     users_col
         .update_one(
             doc! { "_id": user_id_obj },
@@ -898,7 +1061,6 @@ pub async fn create_bet_handler(
         )
         .await?;
 
-    // Update channel_fixtures bet_count
     channel_fixtures_col
         .update_many(
             doc! { "fixture_id": &payload.fixture_id },
@@ -906,11 +1068,55 @@ pub async fn create_bet_handler(
         )
         .await?;
 
-    // Fetch the created bet
     let created_bet = bets_col
         .find_one(doc! { "_id": bet_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
+
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS FOR PLEDGE
+    // ============================================================
+    let pledge_payload = serde_json::json!({
+        "fixture_id": payload.fixture_id,
+        "user_id": payload.starter_id,
+        "username": payload.starter_name,
+        "selection": payload.starter_selection,
+        "amount": payload.amount,
+        "bet_id": bet_id.to_hex(),
+    });
+
+    if let Some(channel_id) = &payload.channel_id {
+        let _ = notify_channel_members(
+            &state,
+            &payload.starter_id,
+            channel_id,
+            &payload.fixture_id,
+            "pledge.create",
+            "💰 New Pledge",
+            &format!("{} pledged KES {:.2}", payload.starter_name, payload.amount),
+            pledge_payload.clone(),
+        )
+        .await;
+    } else {
+        let mut channel_cursor = channels_col
+            .find(doc! { "members.user_id": &payload.starter_id })
+            .await?;
+
+        while let Some(channel) = channel_cursor.next().await {
+            let channel: Channel = channel?;
+            let _ = notify_channel_members(
+                &state,
+                &payload.starter_id,
+                &channel.channel_id,
+                &payload.fixture_id,
+                "pledge.create",
+                "💰 New Pledge",
+                &format!("{} pledged KES {:.2}", payload.starter_name, payload.amount),
+                pledge_payload.clone(),
+            )
+            .await;
+        }
+    }
 
     Ok(Json(json!({
         "success": true,
@@ -931,11 +1137,12 @@ pub async fn create_bet_handler(
 
 #[derive(Debug, serde::Deserialize)]
 pub struct FillBetRequest {
-    pub bet_id: String, // This is the hex string of the ObjectId
+    pub bet_id: String,
     pub finisher_id: String,
     pub finisher_name: String,
     pub finisher_selection: String,
     pub amount: f64,
+    pub channel_id: Option<String>,
 }
 
 pub async fn fill_bet_handler(
@@ -944,12 +1151,11 @@ pub async fn fill_bet_handler(
 ) -> Result<Json<serde_json::Value>> {
     let bets_col = state.db.collection::<Bet>("bets");
     let users_col = state.db.collection::<User>("users");
+    let channels_col = state.db.collection::<Channel>("channels");
     let now = BsonDateTime::now();
 
-    // Parse the bet_id string to ObjectId - using _id not bet_id
     let bet_oid = ObjectId::parse_str(&payload.bet_id)?;
 
-    // Find the open bet by _id
     let bet = bets_col
         .find_one(doc! {
             "_id": bet_oid,
@@ -958,7 +1164,6 @@ pub async fn fill_bet_handler(
         .await?
         .ok_or(AppError::DocumentNotFound)?;
 
-    // Validate finisher has enough balance
     let finisher_obj_id = ObjectId::parse_str(&payload.finisher_id)?;
     let finisher = users_col
         .find_one(doc! { "_id": finisher_obj_id })
@@ -972,7 +1177,6 @@ pub async fn fill_bet_handler(
         )));
     }
 
-    // Validate finisher has a vote for this fixture
     let votes_col = state.db.collection::<Vote>("votes");
     let _finisher_vote = votes_col
         .find_one(doc! {
@@ -984,12 +1188,10 @@ pub async fn fill_bet_handler(
             "Finisher must vote on this fixture first".to_string(),
         ))?;
 
-    // Clone values to avoid move issues
     let finisher_id = payload.finisher_id.clone();
     let finisher_name = payload.finisher_name.clone();
     let finisher_selection = payload.finisher_selection.clone();
 
-    // Update bet with finisher info using _id
     bets_col
         .update_one(
             doc! { "_id": bet_oid },
@@ -1006,7 +1208,6 @@ pub async fn fill_bet_handler(
         )
         .await?;
 
-    // Deduct finisher's balance
     users_col
         .update_one(
             doc! { "_id": finisher_obj_id },
@@ -1017,11 +1218,80 @@ pub async fn fill_bet_handler(
         )
         .await?;
 
-    // Fetch the updated bet
     let updated_bet = bets_col
         .find_one(doc! { "_id": bet_oid })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
+
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS FOR MATCHED BET
+    // ============================================================
+    let match_payload = serde_json::json!({
+        "bet_id": payload.bet_id,
+        "fixture_id": bet.fixture_id,
+        "starter_id": bet.starter_id,
+        "starter_name": bet.starter_name,
+        "starter_selection": bet.starter_selection,
+        "finisher_id": payload.finisher_id,
+        "finisher_name": payload.finisher_name,
+        "finisher_selection": payload.finisher_selection,
+        "amount": payload.amount,
+        "total_pot": bet.starter_amount + payload.amount,
+    });
+
+    if let Some(channel_id) = &payload.channel_id {
+        let _ = notify_channel_members(
+            &state,
+            &payload.finisher_id,
+            channel_id,
+            &bet.fixture_id,
+            "bet.matched",
+            "🤝 Bet Matched",
+            &format!(
+                "{} matched a bet with {}",
+                payload.finisher_name, bet.starter_name
+            ),
+            match_payload.clone(),
+        )
+        .await;
+    } else {
+        // Notify both starter and finisher's channels
+        let mut all_channel_ids = Vec::new();
+        let mut channel_cursor = channels_col
+            .find(doc! { "members.user_id": &bet.starter_id })
+            .await?;
+        while let Some(channel) = channel_cursor.next().await {
+            let channel: Channel = channel?;
+            all_channel_ids.push(channel.channel_id);
+        }
+
+        let mut channel_cursor2 = channels_col
+            .find(doc! { "members.user_id": &payload.finisher_id })
+            .await?;
+        while let Some(channel) = channel_cursor2.next().await {
+            let channel: Channel = channel?;
+            if !all_channel_ids.contains(&channel.channel_id) {
+                all_channel_ids.push(channel.channel_id);
+            }
+        }
+
+        for channel_id in all_channel_ids {
+            let _ = notify_channel_members(
+                &state,
+                &payload.finisher_id,
+                &channel_id,
+                &bet.fixture_id,
+                "bet.matched",
+                "🤝 Bet Matched",
+                &format!(
+                    "{} matched a bet with {}",
+                    payload.finisher_name, bet.starter_name
+                ),
+                match_payload.clone(),
+            )
+            .await;
+        }
+    }
 
     Ok(Json(json!({
         "success": true,
@@ -1056,9 +1326,20 @@ pub async fn settle_bets_handler(
 ) -> Result<Json<serde_json::Value>> {
     let bets_col = state.db.collection::<Bet>("bets");
     let users_col = state.db.collection::<User>("users");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
     let now = BsonDateTime::now();
 
-    // Find all matched bets for this fixture
+    // Get all channels for this fixture
+    let mut channel_cursor = channel_fixtures_col
+        .find(doc! { "fixture_id": &payload.fixture_id })
+        .await?;
+
+    let mut all_channel_ids = Vec::new();
+    while let Some(cf) = channel_cursor.next().await {
+        let cf: ChannelFixture = cf?;
+        all_channel_ids.push(cf.channel_id);
+    }
+
     let mut cursor = bets_col
         .find(doc! {
             "fixture_id": &payload.fixture_id,
@@ -1072,7 +1353,6 @@ pub async fn settle_bets_handler(
     while cursor.advance().await? {
         let bet: Bet = cursor.deserialize_current()?;
 
-        // Determine winner
         let starter_wins = bet.starter_selection == payload.result;
         let finisher_wins = bet
             .finisher_selection
@@ -1081,7 +1361,6 @@ pub async fn settle_bets_handler(
             .unwrap_or(false);
 
         let (winner_id, starter_result, finisher_result) = if starter_wins && finisher_wins {
-            // Both correct - draw (return each their own)
             (None, Some("draw".to_string()), Some("draw".to_string()))
         } else if starter_wins {
             (
@@ -1096,11 +1375,9 @@ pub async fn settle_bets_handler(
                 Some("won".to_string()),
             )
         } else {
-            // Both wrong - house wins (refund both)
             (None, Some("lost".to_string()), Some("lost".to_string()))
         };
 
-        // Update bet using _id
         bets_col
             .update_one(
                 doc! { "_id": bet.id },
@@ -1116,11 +1393,9 @@ pub async fn settle_bets_handler(
             )
             .await?;
 
-        // Payout
         let total_pot = bet.total_pot();
 
         if let Some(winner) = winner_id {
-            // Winner takes all
             let winner_obj_id = ObjectId::parse_str(&winner)?;
             users_col
                 .update_one(
@@ -1140,7 +1415,6 @@ pub async fn settle_bets_handler(
         } else if starter_result == Some("draw".to_string())
             && finisher_result == Some("draw".to_string())
         {
-            // Both correct - refund both
             let starter_obj_id = ObjectId::parse_str(&bet.starter_id)?;
             users_col
                 .update_one(
@@ -1171,7 +1445,6 @@ pub async fn settle_bets_handler(
                 "message": "Both correct - refunded",
             }));
         } else {
-            // Both wrong - house keeps the pot
             results.push(json!({
                 "bet_id": bet.id.unwrap().to_hex(),
                 "result": "house_wins",
@@ -1182,10 +1455,8 @@ pub async fn settle_bets_handler(
         settled_count += 1;
     }
 
-    // Also finalize the fixture
     let fixtures_col = state.db.collection::<Fixture>("fixtures");
     let games_col = state.db.collection::<Game>("games");
-    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
 
     update_fixture_in_both(
         &fixtures_col,
@@ -1201,6 +1472,29 @@ pub async fn settle_bets_handler(
             doc! { "$set": { "status": "completed" } },
         )
         .await?;
+
+    // ============================================================
+    // ✅ SEND SETTLEMENT NOTIFICATIONS
+    // ============================================================
+    let settlement_payload = serde_json::json!({
+        "fixture_id": payload.fixture_id,
+        "result": payload.result,
+        "settled_count": settled_count,
+    });
+
+    for channel_id in all_channel_ids {
+        let _ = notify_channel_members(
+            &state,
+            "system",
+            &channel_id,
+            &payload.fixture_id,
+            "bet.settled",
+            "⚖️ Bet Settlement",
+            &format!("Bets settled. Result: {}", payload.result),
+            settlement_payload.clone(),
+        )
+        .await;
+    }
 
     Ok(Json(json!({
         "success": true,
@@ -1423,7 +1717,6 @@ pub async fn get_single_fixture_handler(
     let fixtures_col = state.db.collection::<Fixture>("fixtures");
     let games_col = state.db.collection::<Game>("games");
 
-    // First try to get from channel_fixtures
     let channel_fixture = channel_fixtures_col
         .find_one(doc! {
             "channel_id": &channel_id,
@@ -1431,7 +1724,6 @@ pub async fn get_single_fixture_handler(
         })
         .await?;
 
-    // Try to find the fixture in both collections
     let fixture_data = find_fixture_in_both(&fixtures_col, &games_col, &fixture_id).await?;
 
     if let Some((source, fixture_json)) = fixture_data {
@@ -1699,7 +1991,6 @@ pub async fn create_pledge_with_vote_handler(
     let mut session: mongodb::ClientSession = state.client.start_session().await?;
     session.start_transaction().await?;
 
-    // Check balance
     let user = users_col
         .find_one(doc! { "_id": starter_id })
         .session(&mut session)
@@ -1714,7 +2005,6 @@ pub async fn create_pledge_with_vote_handler(
         )));
     }
 
-    // Check if already voted
     let existing_vote = votes_col
         .find_one(doc! {
             "fixture_id": &fixture_id,
@@ -1736,7 +2026,6 @@ pub async fn create_pledge_with_vote_handler(
     let now = chrono::Utc::now();
     let now_bson = BsonDateTime::from_chrono(now);
 
-    // Deduct balance
     users_col
         .update_one(
             doc! { "_id": starter_id },
@@ -1748,7 +2037,6 @@ pub async fn create_pledge_with_vote_handler(
         .session(&mut session)
         .await?;
 
-    // Create pledge
     let pledge = Pledge {
         _id: Some(ObjectId::new()),
         username: payload.username.clone(),
@@ -1770,7 +2058,6 @@ pub async fn create_pledge_with_vote_handler(
         .session(&mut session)
         .await?;
 
-    // Insert vote if not already voted
     if existing_vote.is_none() {
         let vote = Vote {
             id: None,
@@ -1803,7 +2090,6 @@ pub async fn create_pledge_with_vote_handler(
             .session(&mut session)
             .await?;
 
-        // Update BOTH global collections
         let fixture_filter = doc! {
             "$or": [
                 { "fixture_id": &fixture_id },
@@ -1829,7 +2115,6 @@ pub async fn create_pledge_with_vote_handler(
             .await?;
     }
 
-    // Update channel_fixtures pledge count
     channel_fixtures_col
         .update_many(
             doc! { "fixture_id": &fixture_id },
@@ -1838,7 +2123,6 @@ pub async fn create_pledge_with_vote_handler(
         .session(&mut session)
         .await?;
 
-    // Update user's total_votes
     users_col
         .update_one(
             doc! { "_id": starter_id },
@@ -1847,7 +2131,6 @@ pub async fn create_pledge_with_vote_handler(
         .session(&mut session)
         .await?;
 
-    // Update channel member's last_active_at
     if !channel_id.is_empty() {
         channels_col
             .update_one(
@@ -1864,6 +2147,31 @@ pub async fn create_pledge_with_vote_handler(
     session.commit_transaction().await?;
 
     let new_balance = user.balance - payload.amount;
+
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS FOR PLEDGE
+    // ============================================================
+    let pledge_payload = serde_json::json!({
+        "fixture_id": fixture_id,
+        "user_id": payload.starter_id,
+        "username": payload.username,
+        "selection": payload.selection,
+        "amount": payload.amount,
+    });
+
+    if let Some(channel_id) = &payload.channel_id {
+        let _ = notify_channel_members(
+            &state,
+            &payload.starter_id,
+            channel_id,
+            &fixture_id,
+            "pledge.create",
+            "💰 New Pledge",
+            &format!("{} pledged KES {:.2}", payload.username, payload.amount),
+            pledge_payload.clone(),
+        )
+        .await;
+    }
 
     Ok(Json(json!({
         "success": true,
@@ -2890,6 +3198,30 @@ pub async fn toggle_like_handler(
         })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
+
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS FOR LIKE
+    // ============================================================
+    let like_payload = serde_json::json!({
+        "fixture_id": payload.fixture_id,
+        "channel_id": payload.channel_id,
+        "user_id": payload.user_id,
+        "username": payload.username,
+        "action": payload.action,
+        "total_likes": updated.likes_count,
+    });
+
+    let _ = notify_channel_members(
+        &state,
+        &payload.user_id,
+        &payload.channel_id,
+        &payload.fixture_id,
+        "like",
+        "❤️ New Like",
+        &format!("{} liked the match", payload.username),
+        like_payload,
+    )
+    .await;
 
     Ok(Json(json!({
         "success": true,

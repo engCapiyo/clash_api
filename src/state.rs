@@ -7,6 +7,7 @@ use crate::errors::AppError;
 use crate::services::cloudinary::CloudinaryService;
 use crate::services::fcm_service::FCMService;
 use crate::services::mpesa_service::MpesaService;
+use crate::services::storage_service::StorageService; // ✅ ADDED
 
 /// One broadcast channel per room key.
 /// Key format: "{channel_id}_{fixture_id}" or "{channel_id}_overall"
@@ -19,12 +20,15 @@ pub struct AppState {
     pub mpesa_service: Option<Arc<MpesaService>>,
     pub fcm_service: Option<Arc<FCMService>>,
     pub cloudinary: CloudinaryService,
+    pub storage_service: StorageService, // ✅ ADDED
     pub comment_broadcaster: CommentBroadcaster,
+    pub active_users: Arc<DashMap<String, bool>>,
 }
 
 impl AppState {
     pub fn new(client: Client, db: Database) -> Result<Self, AppError> {
         let cloudinary = CloudinaryService::new()?;
+        let storage_service = StorageService::new()?; // ✅ ADDED
 
         Ok(AppState {
             client,
@@ -32,7 +36,9 @@ impl AppState {
             mpesa_service: None,
             fcm_service: None,
             cloudinary,
+            storage_service, // ✅ ADDED
             comment_broadcaster: Arc::new(DashMap::new()),
+            active_users: Arc::new(DashMap::new()),
         })
     }
 
@@ -56,5 +62,30 @@ impl AppState {
         self.comment_broadcaster
             .insert(room_key.to_string(), tx.clone());
         tx
+    }
+
+    /// Mark user as online
+    pub fn set_user_online(&self, user_id: &str) {
+        self.active_users.insert(user_id.to_string(), true);
+        tracing::debug!("✅ User {} is now online", user_id);
+    }
+
+    /// Mark user as offline
+    pub fn set_user_offline(&self, user_id: &str) {
+        self.active_users.remove(user_id);
+        tracing::debug!("❌ User {} is now offline", user_id);
+    }
+
+    /// Check if user is online
+    pub fn is_user_online(&self, user_id: &str) -> bool {
+        self.active_users.get(user_id).is_some()
+    }
+
+    /// Get all online users
+    pub fn get_online_users(&self) -> Vec<String> {
+        self.active_users
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 }

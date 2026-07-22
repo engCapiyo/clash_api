@@ -103,6 +103,9 @@ async fn handle_socket(
     username: String,
     state: AppState,
 ) {
+    // ✅ Mark user as online
+    state.set_user_online(&user_id);
+
     let initial_room_key = match &fixture_id {
         Some(f) => format!("{}_{}", channel_id, f),
         None => format!("{}_overall", channel_id),
@@ -136,9 +139,6 @@ async fn handle_socket(
         initial_room_key
     );
 
-    // Tracks which room this connection is currently forwarding broadcasts
-    // from, and the handle of the task doing that forwarding — so a
-    // `room.join` message can swap it out without touching the socket.
     let current_room: Arc<Mutex<String>> = Arc::new(Mutex::new(initial_room_key.clone()));
     let forwarder: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
 
@@ -181,15 +181,15 @@ async fn handle_socket(
         }
     });
 
-    // The connection lives until the client closes it or the recv loop
-    // errors out. The forwarder task is swapped per-room but is not what
-    // keeps the connection alive, so we only need to await recv_task here.
     let _ = &mut recv_task;
     recv_task.await.ok();
 
     if let Some(handle) = forwarder.lock().await.take() {
         handle.abort();
     }
+
+    // ✅ Mark user as offline
+    state.set_user_offline(&user_id);
 
     tracing::info!(
         "🔌 WS disconnected: user {} from room {}",
@@ -199,11 +199,7 @@ async fn handle_socket(
 }
 
 // ============================================================================
-// ROOM FORWARDER — pipes one room's broadcast messages to this client
-// ============================================================================
-
-// ============================================================================
-// ROOM FORWARDER — pipes one room's broadcast messages to this client
+// ROOM FORWARDER
 // ============================================================================
 
 fn spawn_room_forwarder(
@@ -236,10 +232,6 @@ fn spawn_room_forwarder(
 // HANDLE INCOMING MESSAGE
 // ============================================================================
 
-// ============================================================================
-// HANDLE INCOMING MESSAGE - FIXED
-// ============================================================================
-
 async fn handle_incoming_message(
     text: String,
     state: &AppState,
@@ -262,7 +254,6 @@ async fn handle_incoming_message(
 
     match message_type {
         Some("room.join") => {
-            // ✅ Clone sender for use in this branch
             let sender_clone = sender.clone();
 
             let payload = match json_msg.get("payload") {
@@ -318,7 +309,6 @@ async fn handle_incoming_message(
                 old_handle.abort();
             }
 
-            // ✅ Clone sender for spawn_room_forwarder
             let sender_for_forwarder = sender.clone();
             let new_handle = spawn_room_forwarder(state, &new_room_key, sender_for_forwarder);
             *forwarder.lock().await = Some(new_handle);
@@ -339,7 +329,6 @@ async fn handle_incoming_message(
         Some("chat.message") => {
             tracing::info!("✅ Matched chat.message");
 
-            // ✅ Clone sender for use in this branch
             let sender_clone = sender.clone();
 
             let payload = match json_msg.get("payload") {
@@ -385,9 +374,6 @@ async fn handle_incoming_message(
                 user_id
             );
 
-            // ============================================================
-            // ✅ SAVE MESSAGE AND INCREMENT COMMENT COUNT
-            // ============================================================
             match save_message_to_database(
                 state,
                 &channel_id,
@@ -405,9 +391,7 @@ async fn handle_incoming_message(
                 }
             }
 
-            // ============================================================
-            // ✅ BROADCAST COMMENT COUNT UPDATE
-            // ============================================================
+            // Broadcast comment count update
             let room_key = match &fixture_id {
                 Some(f) => format!("{}_{}", channel_id, f),
                 None => format!("{}_overall", channel_id),
@@ -441,9 +425,7 @@ async fn handle_incoming_message(
                 }
             }
 
-            // ============================================================
-            // ✅ BROADCAST THE ACTUAL MESSAGE
-            // ============================================================
+            // Broadcast the actual message
             let broadcast_msg = serde_json::json!({
                 "type": "chat.message",
                 "payload": payload,
@@ -460,7 +442,6 @@ async fn handle_incoming_message(
         }
 
         Some("typing") => {
-            // ✅ Clone sender for use in this branch
             let sender_clone = sender.clone();
 
             if let Some(payload) = json_msg.get("payload") {
@@ -510,7 +491,6 @@ async fn handle_incoming_message(
         Some("join.request") => {
             tracing::info!("📨 Join request via WebSocket");
 
-            // ✅ Clone sender for use in this branch
             let sender_clone = sender.clone();
 
             if let Some(payload) = json_msg.get("payload") {
@@ -617,6 +597,625 @@ async fn handle_incoming_message(
             }
         }
 
+        // ============================================================================
+        // ✅ VOTE EVENTS
+        // ============================================================================
+        Some("vote.cast") => {
+            tracing::info!("🗳️ Vote cast via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ vote.cast missing payload");
+                    return;
+                }
+            };
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let fixture_id = payload
+                .get("fixture_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let user_id = payload
+                .get("user_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if channel_id.is_empty() || fixture_id.is_empty() || user_id.is_empty() {
+                tracing::error!("❌ vote.cast missing required fields");
+                return;
+            }
+
+            // Broadcast to channel room
+            let room_key = format!("{}_{}", channel_id, fixture_id);
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "vote.cast",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = room_broadcaster.send(json);
+                tracing::info!("📡 Broadcasted vote.cast to room: {}", room_key);
+            }
+
+            // ✅ Send to user's personal room for online check
+            let user_room = format!("user_{}", user_id);
+            let user_tx = state.get_or_create_broadcaster(&user_room);
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = user_tx.send(json);
+            }
+        }
+
+        Some("vote.update") => {
+            tracing::info!("📊 Vote update via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ vote.update missing payload");
+                    return;
+                }
+            };
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let fixture_id = payload
+                .get("fixture_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if channel_id.is_empty() || fixture_id.is_empty() {
+                tracing::error!("❌ vote.update missing required fields");
+                return;
+            }
+
+            let room_key = format!("{}_{}", channel_id, fixture_id);
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "vote.update",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = room_broadcaster.send(json);
+                tracing::info!("📡 Broadcasted vote.update to room: {}", room_key);
+            }
+        }
+
+        // ============================================================================
+        // ✅ PLEDGE / BET EVENTS
+        // ============================================================================
+        Some("pledge.create") => {
+            tracing::info!("💰 Pledge created via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ pledge.create missing payload");
+                    return;
+                }
+            };
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let fixture_id = payload
+                .get("fixture_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if channel_id.is_empty() || fixture_id.is_empty() {
+                tracing::error!("❌ pledge.create missing required fields");
+                return;
+            }
+
+            let room_key = format!("{}_{}", channel_id, fixture_id);
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "pledge.create",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = room_broadcaster.send(json);
+                tracing::info!("📡 Broadcasted pledge.create to room: {}", room_key);
+            }
+        }
+
+        Some("bet.matched") => {
+            tracing::info!("🤝 Bet matched via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ bet.matched missing payload");
+                    return;
+                }
+            };
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let fixture_id = payload
+                .get("fixture_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if channel_id.is_empty() || fixture_id.is_empty() {
+                tracing::error!("❌ bet.matched missing required fields");
+                return;
+            }
+
+            let room_key = format!("{}_{}", channel_id, fixture_id);
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "bet.matched",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = room_broadcaster.send(json);
+                tracing::info!("📡 Broadcasted bet.matched to room: {}", room_key);
+            }
+        }
+
+        Some("bet.settled") => {
+            tracing::info!("⚖️ Bet settled via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ bet.settled missing payload");
+                    return;
+                }
+            };
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let fixture_id = payload
+                .get("fixture_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if channel_id.is_empty() || fixture_id.is_empty() {
+                tracing::error!("❌ bet.settled missing required fields");
+                return;
+            }
+
+            let room_key = format!("{}_{}", channel_id, fixture_id);
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "bet.settled",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = room_broadcaster.send(json);
+                tracing::info!("📡 Broadcasted bet.settled to room: {}", room_key);
+            }
+        }
+
+        Some("bet.refunded") => {
+            tracing::info!("🔄 Bet refunded via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ bet.refunded missing payload");
+                    return;
+                }
+            };
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let fixture_id = payload
+                .get("fixture_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if channel_id.is_empty() || fixture_id.is_empty() {
+                tracing::error!("❌ bet.refunded missing required fields");
+                return;
+            }
+
+            let room_key = format!("{}_{}", channel_id, fixture_id);
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "bet.refunded",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = room_broadcaster.send(json);
+                tracing::info!("📡 Broadcasted bet.refunded to room: {}", room_key);
+            }
+        }
+
+        // ============================================================================
+        // ✅ SUB-FIXTURE EVENTS
+        // ============================================================================
+        Some("sub_fixture.pledge") => {
+            tracing::info!("📊 Sub-fixture pledge via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ sub_fixture.pledge missing payload");
+                    return;
+                }
+            };
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let match_id = payload
+                .get("match_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if channel_id.is_empty() || match_id.is_empty() {
+                tracing::error!("❌ sub_fixture.pledge missing required fields");
+                return;
+            }
+
+            let room_key = format!("{}_{}", channel_id, match_id);
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "sub_fixture.pledge",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = room_broadcaster.send(json);
+                tracing::info!("📡 Broadcasted sub_fixture.pledge to room: {}", room_key);
+            }
+        }
+
+        Some("sub_fixture.matched") => {
+            tracing::info!("🤝 Sub-fixture matched via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ sub_fixture.matched missing payload");
+                    return;
+                }
+            };
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let match_id = payload
+                .get("match_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if channel_id.is_empty() || match_id.is_empty() {
+                tracing::error!("❌ sub_fixture.matched missing required fields");
+                return;
+            }
+
+            let room_key = format!("{}_{}", channel_id, match_id);
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "sub_fixture.matched",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = room_broadcaster.send(json);
+                tracing::info!("📡 Broadcasted sub_fixture.matched to room: {}", room_key);
+            }
+        }
+
+        Some("sub_fixture.settled") => {
+            tracing::info!("⚖️ Sub-fixture settled via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ sub_fixture.settled missing payload");
+                    return;
+                }
+            };
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let match_id = payload
+                .get("match_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if channel_id.is_empty() || match_id.is_empty() {
+                tracing::error!("❌ sub_fixture.settled missing required fields");
+                return;
+            }
+
+            let room_key = format!("{}_{}", channel_id, match_id);
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "sub_fixture.settled",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = room_broadcaster.send(json);
+                tracing::info!("📡 Broadcasted sub_fixture.settled to room: {}", room_key);
+            }
+        }
+
+        // ============================================================================
+        // ✅ POST / SOCIAL EVENTS
+        // ============================================================================
+        Some("post.like") => {
+            tracing::info!("❤️ Post like via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ post.like missing payload");
+                    return;
+                }
+            };
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let fixture_id = payload
+                .get("fixture_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let post_id = payload
+                .get("post_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if channel_id.is_empty() || post_id.is_empty() {
+                tracing::error!("❌ post.like missing required fields");
+                return;
+            }
+
+            let room_key = match fixture_id.is_empty() {
+                false => format!("{}_{}", channel_id, fixture_id),
+                true => format!("{}_overall", channel_id),
+            };
+
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "post.like",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = room_broadcaster.send(json);
+                tracing::info!("📡 Broadcasted post.like to room: {}", room_key);
+            }
+        }
+
+        Some("post.comment") => {
+            tracing::info!("💬 Post comment via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ post.comment missing payload");
+                    return;
+                }
+            };
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let fixture_id = payload
+                .get("fixture_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let post_id = payload
+                .get("post_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if channel_id.is_empty() || post_id.is_empty() {
+                tracing::error!("❌ post.comment missing required fields");
+                return;
+            }
+
+            let room_key = match fixture_id.is_empty() {
+                false => format!("{}_{}", channel_id, fixture_id),
+                true => format!("{}_overall", channel_id),
+            };
+
+            let room_broadcaster = state.get_or_create_broadcaster(&room_key);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "post.comment",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = room_broadcaster.send(json);
+                tracing::info!("📡 Broadcasted post.comment to room: {}", room_key);
+            }
+        }
+
+        Some("comrade.added") => {
+            tracing::info!("👥 Comrade added via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ comrade.added missing payload");
+                    return;
+                }
+            };
+
+            let target_user_id = payload
+                .get("target_user_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if target_user_id.is_empty() {
+                tracing::error!("❌ comrade.added missing target_user_id");
+                return;
+            }
+
+            // Send to target user's personal room
+            let user_room = format!("user_{}", target_user_id);
+            let user_tx = state.get_or_create_broadcaster(&user_room);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "comrade.added",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = user_tx.send(json);
+                tracing::info!("📡 Broadcasted comrade.added to user: {}", target_user_id);
+            }
+        }
+
+        // ============================================================================
+        // ✅ CHANNEL JOIN EVENTS
+        // ============================================================================
+        Some("join.approved") => {
+            tracing::info!("✅ Join approved via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ join.approved missing payload");
+                    return;
+                }
+            };
+
+            let user_id = payload
+                .get("user_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let channel_id = payload
+                .get("channel_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if user_id.is_empty() || channel_id.is_empty() {
+                tracing::error!("❌ join.approved missing required fields");
+                return;
+            }
+
+            // Send to user's personal room
+            let user_room = format!("user_{}", user_id);
+            let user_tx = state.get_or_create_broadcaster(&user_room);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "join.approved",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = user_tx.send(json);
+                tracing::info!("📡 Broadcasted join.approved to user: {}", user_id);
+            }
+
+            // Also broadcast to channel room
+            let channel_room = format!("channel_{}", channel_id);
+            let channel_tx = state.get_or_create_broadcaster(&channel_room);
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = channel_tx.send(json);
+            }
+        }
+
+        Some("join.rejected") => {
+            tracing::info!("❌ Join rejected via WebSocket");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ join.rejected missing payload");
+                    return;
+                }
+            };
+
+            let user_id = payload
+                .get("user_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if user_id.is_empty() {
+                tracing::error!("❌ join.rejected missing user_id");
+                return;
+            }
+
+            let user_room = format!("user_{}", user_id);
+            let user_tx = state.get_or_create_broadcaster(&user_room);
+
+            let broadcast_msg = serde_json::json!({
+                "type": "join.rejected",
+                "payload": payload,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&broadcast_msg) {
+                let _ = user_tx.send(json);
+                tracing::info!("📡 Broadcasted join.rejected to user: {}", user_id);
+            }
+        }
+
         _ => {
             tracing::warn!("⚠️ UNMATCHED type: {:?}", message_type);
         }
@@ -624,11 +1223,7 @@ async fn handle_incoming_message(
 }
 
 // ============================================================================
-// PER-CONNECTION LOGIC
-// ============================================================================
-
-// ============================================================================
-// SAVE MESSAGE TO DATABASE - FIXED
+// SAVE MESSAGE TO DATABASE
 // ============================================================================
 
 async fn save_message_to_database(
@@ -643,7 +1238,6 @@ async fn save_message_to_database(
     let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
     let channels_col = state.db.collection::<Channel>("channels");
 
-    // ✅ FIX: Create a String, not a temporary &str
     let message_id = payload
         .get("messageId")
         .and_then(|v| v.as_str())
@@ -726,7 +1320,7 @@ async fn save_message_to_database(
         sender_name: username.to_string(),
         text,
         sent_at: now_bson,
-        message_id: Some(message_id), // ✅ Now message_id is String
+        message_id: Some(message_id),
         selection,
         image_url,
         video_url,
@@ -735,12 +1329,8 @@ async fn save_message_to_database(
         reply_to,
     };
 
-    // Save the message
     messages_col.insert_one(&message).await?;
 
-    // ============================================================
-    // ✅ INCREMENT COMMENT COUNT IN CHANNEL_FIXTURES
-    // ============================================================
     if let Some(fixture_id) = fixture_id {
         let update_result = channel_fixtures_col
             .update_one(
@@ -770,12 +1360,8 @@ async fn save_message_to_database(
         }
     }
 
-    // ============================================================
-    // ✅ UPDATE CHANNEL ACTIVITY
-    // ============================================================
     let now_chrono = chrono::Utc::now();
 
-    // Update channel activity
     channels_col
         .update_one(
             doc! { "channel_id": channel_id },
@@ -791,7 +1377,6 @@ async fn save_message_to_database(
         )
         .await?;
 
-    // Update member's msg_count and last_active_at
     channels_col
         .update_one(
             doc! {

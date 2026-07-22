@@ -1,6 +1,7 @@
 use crate::{
     errors::AppError,
     models::{
+        channel::Channel,
         game::Game,
         sub_fixture::{
             BetStatus, CreateSubFixtureBetRequest, CreateSubFixtureMarketRequest,
@@ -19,8 +20,165 @@ use bson::{doc, DateTime as BsonDateTime};
 use futures_util::StreamExt;
 use mongodb::Collection;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+// ============================================================================
+// HELPER: Get channel members
+// ============================================================================
+async fn get_channel_members_for_match(
+    channels_col: &Collection<Channel>,
+    match_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let mut cursor = channels_col
+        .find(doc! { "fixtures": match_id })
+        .await
+        .map_err(|e| {
+            tracing::error!("❌ Failed to find channels for match: {}", e);
+            AppError::MongoDB(e)
+        })?;
+
+    let mut all_members = HashSet::new();
+    while let Some(channel) = cursor.next().await {
+        let channel: Channel = channel.map_err(|e| {
+            tracing::error!("❌ Failed to deserialize channel: {}", e);
+            AppError::MongoDB(e)
+        })?;
+        for member in channel.members {
+            all_members.insert(member.user_id);
+        }
+    }
+
+    Ok(all_members.into_iter().collect())
+}
+
+// ============================================================================
+// HELPER: Send WebSocket broadcast
+// ============================================================================
+async fn broadcast_to_match_room(
+    state: &AppState,
+    match_id: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+) {
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    let mut cursor = match channels_col.find(doc! { "fixtures": match_id }).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("❌ Failed to find channels for broadcast: {}", e);
+            return;
+        }
+    };
+
+    // ✅ FIX: cursor.next() returns Option<Result<Channel>>
+    while let Some(channel_result) = cursor.next().await {
+        let channel: Channel = match channel_result {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("❌ Failed to deserialize channel: {}", e);
+                continue;
+            }
+        };
+
+        let room_key = format!("{}_{}", channel.channel_id, match_id);
+        let tx = state.get_or_create_broadcaster(&room_key);
+
+        let ws_message = serde_json::json!({
+            "type": event_type,
+            "payload": payload,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+
+        if let Ok(json) = serde_json::to_string(&ws_message) {
+            let _ = tx.send(json);
+            tracing::info!("📡 Broadcasted {} to room {}", event_type, room_key);
+        }
+    }
+}
+
+// ============================================================================
+// HELPER: Send notification to channel members
+// ============================================================================
+async fn notify_sub_fixture_members(
+    state: &AppState,
+    match_id: &str,
+    actor_id: &str,
+    notification_type: &str,
+    title: &str,
+    body: &str,
+    payload: serde_json::Value,
+) -> Result<(), AppError> {
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    let mut cursor = channels_col
+        .find(doc! { "fixtures": match_id })
+        .await
+        .map_err(|e| {
+            tracing::error!("❌ Failed to find channels: {}", e);
+            AppError::MongoDB(e)
+        })?;
+
+    let mut all_member_ids = HashSet::new();
+    while let Some(channel) = cursor.next().await {
+        let channel: Channel = channel.map_err(|e| {
+            tracing::error!("❌ Failed to deserialize channel: {}", e);
+            AppError::MongoDB(e)
+        })?;
+        for member in channel.members {
+            if member.user_id != actor_id {
+                all_member_ids.insert(member.user_id);
+            }
+        }
+    }
+
+    if all_member_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Broadcast WebSocket
+    broadcast_to_match_room(state, match_id, notification_type, payload.clone()).await;
+
+    // Send FCM to offline users
+    let fcm_service = match &state.fcm_service {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+
+    let data = serde_json::json!({
+        "type": notification_type,
+        "match_id": match_id,
+        "actor_id": actor_id,
+    });
+
+    for user_id in all_member_ids {
+        if state.is_user_online(&user_id) {
+            let personal_room = format!("user_{}", user_id);
+            let tx = state.get_or_create_broadcaster(&personal_room);
+            let ws_message = serde_json::json!({
+                "type": notification_type,
+                "payload": payload,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            });
+            if let Ok(json) = serde_json::to_string(&ws_message) {
+                let _ = tx.send(json);
+            }
+        } else {
+            let _ = fcm_service
+                .send_to_user(
+                    state,
+                    &user_id,
+                    title,
+                    body,
+                    data.clone(),
+                    notification_type,
+                )
+                .await;
+        }
+    }
+
+    Ok(())
+}
 
 // ============================================================================
 // HELPER: Resolve market_id from either ObjectId or business key
@@ -251,6 +409,35 @@ pub async fn create_sub_fixture_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS TO ALL CHANNEL MEMBERS
+    // ============================================================
+    let pledge_payload = serde_json::json!({
+        "market_id": market_id,
+        "match_id": payload.match_id,
+        "user_id": payload.starter_id,
+        "username": payload.starter_name,
+        "selection": payload.selection,
+        "amount": payload.amount,
+        "bet_id": bet_id,
+    });
+
+    let _ = notify_sub_fixture_members(
+        &state,
+        &payload.match_id,
+        &payload.starter_id,
+        "sub_fixture.pledge",
+        "📊 Sub-Fixture Pledge",
+        &format!(
+            "{} pledged KES {} on {}",
+            payload.starter_name, payload.amount, market.market_type
+        ),
+        pledge_payload,
+    )
+    .await;
+
+    tracing::info!("✅ Sub-fixture bet created: {}", bet_id);
+
     Ok(Json(json!({
         "success": true,
         "message": "Sub-fixture bet created successfully",
@@ -264,7 +451,7 @@ pub async fn create_sub_fixture_bet_handler(
 }
 
 // ============================================================================
-// 2. FILL SUB-FIXTURE BET - FIXED
+// 2. FILL SUB-FIXTURE BET
 // ============================================================================
 pub async fn fill_sub_fixture_bet_handler(
     State(state): State<AppState>,
@@ -440,6 +627,47 @@ pub async fn fill_sub_fixture_bet_handler(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS TO ALL CHANNEL MEMBERS
+    // ============================================================
+    let match_payload = serde_json::json!({
+        "bet_id": bet_id,
+        "market_id": market_id,
+        "match_id": bet.match_id,
+        "starter_id": bet.starter_id.to_hex(),
+        "starter_name": bet.starter_name,
+        "starter_selection": bet.starter_selection,
+        "finisher_id": payload.finisher_id,
+        "finisher_name": payload.finisher_name,
+        "finisher_selection": payload.selection,
+        "amount": payload.amount,
+        "total_pot": bet.starter_amount + payload.amount,
+    });
+
+    // Get market for title
+    let market = markets_col
+        .find_one(doc! { "matchId": &bet.match_id, "marketId": &market_id })
+        .await
+        .map_err(|e| AppError::MongoDB(e))?;
+
+    let market_type = market
+        .as_ref()
+        .map(|m| m.market_type.as_str())
+        .unwrap_or("sub-fixture");
+
+    let _ = notify_sub_fixture_members(
+        &state,
+        &bet.match_id,
+        &payload.finisher_id,
+        "sub_fixture.matched",
+        "🤝 Sub-Fixture Matched",
+        &format!("{} matched a bet on {}", payload.finisher_name, market_type),
+        match_payload,
+    )
+    .await;
+
+    tracing::info!("✅ Sub-fixture bet filled: {}", bet_id);
+
     Ok(Json(json!({
         "success": true,
         "message": "Sub-fixture bet filled successfully",
@@ -520,12 +748,6 @@ pub async fn get_user_sub_fixture_bets_handler(
 }
 
 // ============================================================================
-// 5. GET MATCHED SUB-FIXTURE BETS FOR A MARKET
-// ============================================================================
-// ============================================================================
-// 5. GET MATCHED SUB-FIXTURE BETS FOR A MARKET
-// ============================================================================
-// ============================================================================
 // 5. GET SUB-FIXTURE BETS FOR A MARKET (open + matched)
 // ============================================================================
 pub async fn get_market_sub_fixture_bets_handler(
@@ -535,17 +757,9 @@ pub async fn get_market_sub_fixture_bets_handler(
     let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
     let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
 
-    // Resolve market_id - accept both ObjectId and business key, same as
-    // create/fill handlers. Without this, requests using the Mongo _id hex
-    // never match bets, which are always stored under the resolved business
-    // key.
+    // Resolve market_id - accept both ObjectId and business key
     let market_id = resolve_market_id(&markets_col, &match_id, &market_id).await?;
 
-    // Previously filtered to "matched" only, which silently hid every
-    // unmatched (open) pledge -- including the user's own pledge right
-    // after they place it, before anyone fills it. The Dart client's
-    // expandable pledges list expects to see all pledges on a market,
-    // not just matched ones.
     let mut cursor = bets_col
         .find(doc! {
             "match_id": &match_id,
@@ -562,9 +776,6 @@ pub async fn get_market_sub_fixture_bets_handler(
         bets.push(SubFixtureBetResponse::from(bet));
     }
 
-    // total_pot is already starter_amount for open bets and
-    // starter_amount + finisher_amount for matched ones, so summing it
-    // directly is correct for both statuses.
     let total_pot: f64 = bets.iter().map(|b| b.total_pot).sum();
 
     Ok(Json(json!({
@@ -576,6 +787,7 @@ pub async fn get_market_sub_fixture_bets_handler(
         "total_pot": total_pot,
     })))
 }
+
 // ============================================================================
 // 6. SETTLE SUB-FIXTURE BETS FOR A MARKET (internal, reusable logic)
 // ============================================================================
@@ -604,7 +816,6 @@ pub async fn settle_sub_fixture_bets_for_market(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
-    // Find all MATCHED bets for this market
     let filter = doc! {
         "match_id": match_id,
         "market_id": market_id,
@@ -623,7 +834,6 @@ pub async fn settle_sub_fixture_bets_for_market(
 
         match winning_team {
             Some(winner) if winner == bet.starter_selection => {
-                // ✅ CASE 1: STARTER WINS - gets full pot
                 users_collection
                     .update_one(
                         doc! { "_id": bet.starter_id },
@@ -648,14 +858,12 @@ pub async fn settle_sub_fixture_bets_for_market(
                     .map_err(|e| AppError::MongoDB(e))?;
 
                 tracing::info!(
-                    "✅ Sub-fixture bet {}: Starter {} won {} (total pot)",
+                    "✅ Sub-fixture bet {}: Starter won {}",
                     bet_id.to_hex(),
-                    bet.starter_id.to_hex(),
                     bet.total_pot
                 );
             }
             Some(winner) if Some(winner) == bet.finisher_selection.as_deref() => {
-                // ✅ CASE 2: FINISHER WINS - gets full pot
                 if let Some(finisher_id) = bet.finisher_id {
                     users_collection
                         .update_one(
@@ -682,16 +890,12 @@ pub async fn settle_sub_fixture_bets_for_market(
                     .map_err(|e| AppError::MongoDB(e))?;
 
                 tracing::info!(
-                    "✅ Sub-fixture bet {}: Finisher {} won {} (total pot)",
+                    "✅ Sub-fixture bet {}: Finisher won {}",
                     bet_id.to_hex(),
-                    bet.finisher_id
-                        .map(|id| id.to_hex())
-                        .unwrap_or("unknown".to_string()),
                     bet.total_pot
                 );
             }
             _ => {
-                // ✅ CASE 3: DRAW / NO WINNER - REFUND BOTH
                 // Refund starter
                 users_collection
                     .update_one(
@@ -702,7 +906,6 @@ pub async fn settle_sub_fixture_bets_for_market(
                     .await
                     .map_err(|e| AppError::MongoDB(e))?;
 
-                // Refund finisher
                 if let Some(finisher_id) = bet.finisher_id {
                     if let Some(finisher_amount) = bet.finisher_amount {
                         users_collection
@@ -730,10 +933,7 @@ pub async fn settle_sub_fixture_bets_for_market(
                     .await
                     .map_err(|e| AppError::MongoDB(e))?;
 
-                tracing::info!(
-                    "🔄 Sub-fixture bet {}: Draw/No winner - refunded both parties",
-                    bet_id.to_hex()
-                );
+                tracing::info!("🔄 Sub-fixture bet {}: Refunded both", bet_id.to_hex());
             }
         }
         settled_count += 1;
@@ -758,7 +958,6 @@ pub async fn settle_sub_fixture_bets_for_market(
         let bet: SubFixtureBet = bet.map_err(|e| AppError::MongoDB(e))?;
         let bet_id = bet.id.unwrap();
 
-        // ✅ REFUND STARTER - no one filled their bet
         users_collection
             .update_one(
                 doc! { "_id": bet.starter_id },
@@ -783,12 +982,9 @@ pub async fn settle_sub_fixture_bets_for_market(
             .map_err(|e| AppError::MongoDB(e))?;
 
         refund_count += 1;
-
         tracing::info!(
-            "🔄 Sub-fixture bet {}: Unmatched - refunded starter {} ({} KES)",
-            bet_id.to_hex(),
-            bet.starter_id.to_hex(),
-            bet.starter_amount
+            "🔄 Sub-fixture bet {}: Unmatched - refunded",
+            bet_id.to_hex()
         );
     }
 
@@ -796,6 +992,31 @@ pub async fn settle_sub_fixture_bets_for_market(
         .commit_transaction()
         .await
         .map_err(|e| AppError::MongoDB(e))?;
+
+    // ============================================================
+    // ✅ SEND SETTLEMENT NOTIFICATIONS
+    // ============================================================
+    let settlement_payload = serde_json::json!({
+        "market_id": market_id,
+        "match_id": match_id,
+        "winning_team": winning_team,
+        "settled_count": settled_count,
+        "refunded_count": refund_count,
+    });
+
+    let _ = notify_sub_fixture_members(
+        state,
+        match_id,
+        "system",
+        "sub_fixture.settled",
+        "⚖️ Sub-Fixture Settled",
+        &format!(
+            "Market settled. {} bets settled, {} refunded.",
+            settled_count, refund_count
+        ),
+        settlement_payload,
+    )
+    .await;
 
     Ok(vec![format!(
         "Settled {} matched bets, refunded {} unmatched bets",
@@ -894,9 +1115,6 @@ pub async fn get_sub_fixture_visibility_handler(
 // ============================================================================
 // 8. GET MARKET DETAILS
 // ============================================================================
-// ============================================================================
-// 8. GET MARKET DETAILS
-// ============================================================================
 pub async fn get_market_details_handler(
     State(state): State<AppState>,
     Path((match_id, market_id)): Path<(String, String)>,
@@ -904,10 +1122,6 @@ pub async fn get_market_details_handler(
     let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
     let bets_col: Collection<SubFixtureBet> = state.db.collection("sub_fixture_bets");
 
-    // Resolve market_id - accept both ObjectId and business key. Same fix as
-    // get_market_sub_fixture_bets_handler: the client may pass either the
-    // Mongo _id hex or the business marketId, but bets are always stored
-    // under the business key.
     let market_id = resolve_market_id(&markets_col, &match_id, &market_id).await?;
 
     let market = markets_col
