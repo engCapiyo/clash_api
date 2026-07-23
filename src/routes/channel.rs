@@ -53,6 +53,8 @@ use crate::handlers::channel::{
     send_message_handler,
     // ✅ Like handlers
     toggle_like_handler,
+    // ✅ Chat media upload
+    upload_chat_media_handler, // ✅ ADD THIS
 };
 use crate::handlers::ws_handler::ws_comments_handler;
 use crate::AppState;
@@ -119,6 +121,12 @@ pub fn channel_routes() -> Router<AppState> {
             get(get_single_fixture_handler),
         )
         // ====================================================================
+        // ✅ CHAT MEDIA UPLOAD
+        // ====================================================================
+        //.route("/media/upload/:user_id", post(upload_chat_media_handler))
+        // In routes/channel.rs
+        .route("/media/upload", post(upload_chat_media_handler))
+        // ====================================================================
         // MESSAGES - FULL CRUD WITH CAPTION & MEDIA SUPPORT
         // ====================================================================
         .route("/:channel_id/messages", get(get_messages_handler))
@@ -136,7 +144,7 @@ pub fn channel_routes() -> Router<AppState> {
             get(get_message_thread_handler),
         )
         // ====================================================================
-        // JOIN REQUESTS - WITH NOTIFICATIONS
+        // JOIN REQUESTS
         // ====================================================================
         .route("/request-join", post(request_join_channel_handler))
         .route(
@@ -155,7 +163,7 @@ pub fn channel_routes() -> Router<AppState> {
             get(get_fixture_pledgers_handler),
         )
         // ====================================================================
-        // VOTES (GLOBAL - no channel_id in path)
+        // VOTES
         // ====================================================================
         .route("/votes/cast", post(cast_vote_handler))
         .route("/votes/user/:user_id", get(get_user_votes_handler))
@@ -163,9 +171,6 @@ pub fn channel_routes() -> Router<AppState> {
             "/votes/check/:fixture_id/:user_id",
             get(check_user_vote_handler),
         )
-        // ====================================================================
-        // CHANNEL VOTES (deprecated)
-        // ====================================================================
         .route(
             "/:channel_id/user/:user_id/votes",
             get(get_user_channel_votes_handler),
@@ -220,274 +225,17 @@ pub fn channel_routes() -> Router<AppState> {
         // ====================================================================
         // LIKES
         // ====================================================================
-        // Toggle like/unlike on a fixture
         .route("/likes/toggle", post(toggle_like_handler))
-        // Get total likes for a fixture in a channel
         .route(
             "/:channel_id/fixtures/:fixture_id/likes",
             get(get_fixture_likes_handler),
         )
-        // Check if a user has liked a fixture
         .route(
             "/likes/check/:user_id/:channel_id/:fixture_id",
             get(check_user_liked_handler),
         )
-        // Get all fixtures a user has liked in a channel
         .route(
             "/likes/user/:user_id/channel/:channel_id",
             get(get_user_liked_fixtures_handler),
         )
 }
-
-// ============================================================================
-// API DOCUMENTATION
-// ============================================================================
-
-/*
-============================================================================
-MESSAGES API
-============================================================================
-
-1. GET MESSAGES
-   GET /api/channels/:channel_id/messages?fixture_id=optional&limit=100&before=timestamp
-
-   Query Parameters:
-   - fixture_id: (optional) Filter by fixture
-   - limit: (optional) Max messages to return (default: 100, max: 500)
-   - before: (optional) Get messages before this timestamp (ISO 8601)
-
-   Response: {
-       "success": true,
-       "messages": [...],
-       "count": 10,
-       "channel_id": "c123",
-       "fixture_id": "f456"
-   }
-
-2. SEND MESSAGE
-   POST /api/channels/:channel_id/messages
-
-   Body: {
-       "user_id": "u123",
-       "username": "john_doe",
-       "text": "Hello world!",
-       "fixture_id": "f456",              // optional
-       "selection": "home",               // optional
-       "caption": "Check this out",       // optional - caption for media
-
-       // Image fields
-       "image_url": "https://...",        // optional
-       "image_public_id": "img_123",      // optional
-       "image_caption": "Sunset",         // optional
-       "is_image": true,
-
-       // Video fields
-       "video_url": "https://...",        // optional
-       "video_public_id": "vid_123",      // optional
-       "video_thumbnail_url": "https://...", // optional
-       "video_caption": "Awesome goal",   // optional
-       "video_duration": 120,             // optional - seconds
-       "video_size": 10485760,            // optional - bytes
-       "is_video": true,
-
-       // Reply fields
-       "reply_to_id": "msg_789",          // optional
-       "reply_to_text": "Great shot!",    // optional
-       "reply_to_username": "jane_doe",   // optional
-       "reply_to_selection": "away"       // optional
-   }
-
-   Response: {
-       "success": true,
-       "message": "Message sent successfully",
-       "data": { ... }  // MessageResponse
-   }
-
-3. GET SINGLE MESSAGE
-   GET /api/channels/:channel_id/messages/:message_id
-
-   Response: {
-       "success": true,
-       "message": { ... }  // MessageResponse
-   }
-
-4. DELETE MESSAGE
-   DELETE /api/channels/:channel_id/messages/:message_id
-
-   Body: {
-       "user_id": "u123"  // Must be the message owner
-   }
-
-   Response: {
-       "success": true,
-       "message": "Message deleted successfully",
-       "message_id": "msg_789"
-   }
-
-5. GET MESSAGE THREAD
-   GET /api/channels/:channel_id/messages/:message_id/thread
-
-   Response: {
-       "success": true,
-       "parent": { ... },  // MessageResponse
-       "replies": [ ... ], // MessageResponse[]
-       "reply_count": 5
-   }
-
-============================================================================
-LIKES API
-============================================================================
-
-1. TOGGLE LIKE
-   POST /api/channels/likes/toggle
-
-   Body: {
-       "fixture_id": "f123",
-       "channel_id": "c456",
-       "user_id": "u789",
-       "username": "john_doe",
-       "action": "like"  // or "unlike"
-   }
-
-   Response: {
-       "success": true,
-       "fixture_id": "f123",
-       "channel_id": "c456",
-       "total_likes": 5,
-       "user_has_liked": true,
-       "action": "like"
-   }
-
-2. GET FIXTURE LIKES
-   GET /api/channels/:channel_id/fixtures/:fixture_id/likes
-
-   Response: {
-       "success": true,
-       "total_likes": 5
-   }
-
-3. CHECK IF USER LIKED
-   GET /api/channels/likes/check/:user_id/:channel_id/:fixture_id
-
-   Response: {
-       "success": true,
-       "has_liked": true
-   }
-
-4. GET USER'S LIKED FIXTURES
-   GET /api/channels/likes/user/:user_id/channel/:channel_id
-
-   Response: {
-       "success": true,
-       "fixture_ids": ["f123", "f456"],
-       "count": 2
-   }
-
-============================================================================
-WEBSOCKET EVENTS
-============================================================================
-
-When a message is sent:
-{
-    "type": "chat.message",
-    "payload": {
-        "messageId": "msg_123",
-        "channel_id": "c456",
-        "fixture_id": "f789",
-        "sender_id": "u123",
-        "sender_name": "john_doe",
-        "text": "Hello!",
-        "selection": "home",
-        "caption": "Check this",
-        "image_url": "https://...",
-        "video_url": "https://...",
-        "is_image": true,
-        "is_video": false,
-        "reply_to": { ... },
-        "sent_at": "2024-01-01T12:00:00Z"
-    }
-}
-
-When a like is toggled:
-{
-    "type": "like",
-    "payload": {
-        "fixture_id": "f123",
-        "channel_id": "c456",
-        "total_likes": 5,
-        "user_id": "u789",
-        "username": "john_doe",
-        "action": "like"
-    }
-}
-
-============================================================================
-FLUTTER SIDE HANDLING
-============================================================================
-
-// In ChatScreen
-void _handleChatMessage(Map<String, dynamic> payload) {
-    final message = ChatMessage.fromJson(payload);
-    setState(() {
-        _messages.add(message);
-        _sortMessages();
-    });
-    _saveMessagesToAppCache();
-    _scrollToBottom();
-}
-
-// In FixturesPage
-void _handleLikeUpdate(Map<String, dynamic> payload) {
-    final fixtureId = payload['fixture_id'];
-    final totalLikes = payload['total_likes'];
-
-    setState(() {
-        _likeStats[fixtureId] = LikeStatsResponse(
-            fixtureId: fixtureId,
-            totalLikes: totalLikes,
-            userHasLiked: payload['user_id'] == widget.userId,
-        );
-    });
-}
-
-============================================================================
-MESSAGE REQUEST EXAMPLE
-============================================================================
-
-// Send a text message
-POST /api/channels/c123/messages
-{
-    "user_id": "u123",
-    "username": "john_doe",
-    "text": "Hello everyone!",
-    "fixture_id": "f456"
-}
-
-// Send an image with caption
-POST /api/channels/c123/messages
-{
-    "user_id": "u123",
-    "username": "john_doe",
-    "text": "",  // Empty text, caption will be used
-    "caption": "Check out this goal!",
-    "image_url": "https://firebase.../goal.jpg",
-    "image_public_id": "images/...",
-    "image_caption": "Goal celebration",
-    "is_image": true,
-    "fixture_id": "f456"
-}
-
-// Reply to a message
-POST /api/channels/c123/messages
-{
-    "user_id": "u123",
-    "username": "john_doe",
-    "text": "I agree!",
-    "reply_to_id": "msg_789",
-    "reply_to_text": "Great shot!",
-    "reply_to_username": "jane_doe",
-    "reply_to_selection": "home"
-}
-
-============================================================================
-*/

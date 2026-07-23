@@ -1,9 +1,10 @@
 use crate::models::user::User;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, State}, // ✅ REMOVED Multipart from here
     response::IntoResponse,
     Json,
 };
+use axum_extra::extract::Multipart; // ✅ ADD THIS - this is the correct import
 use bson::{doc, oid::ObjectId, Bson, DateTime as BsonDateTime};
 use futures_util::StreamExt;
 use mongodb::Collection;
@@ -40,6 +41,119 @@ fn calculate_points(selection: &str, result: &str) -> i32 {
         -3
     }
 }
+
+// ============================================================================
+// CHAT MEDIA UPLOAD HANDLER - ✅ FIXED
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ChatMediaUploadRequest {
+    pub caption: Option<String>,
+}
+
+pub async fn upload_chat_media_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>, // ✅ Path extractor
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>> {
+    let mut caption: Option<String> = None;
+    let mut file_data: Option<Vec<u8>> = None;
+    let mut file_name: Option<String> = None;
+    let mut mime_type: Option<String> = None;
+    let mut thumbnail_data: Option<Vec<u8>> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::Multipart(format!("Failed to read multipart field: {}", e)))?
+    {
+        let field_name = field.name().unwrap_or("").to_string();
+
+        match field_name.as_str() {
+            "caption" => {
+                caption =
+                    Some(field.text().await.map_err(|e| {
+                        AppError::Multipart(format!("Failed to read caption: {}", e))
+                    })?);
+            }
+            "file" => {
+                file_name = field.file_name().map(|s| s.to_string());
+                // ✅ Get content_type BEFORE moving field with bytes()
+                mime_type = field.content_type().map(|s| s.to_string());
+                file_data = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|e| {
+                            AppError::Multipart(format!("Failed to read file data: {}", e))
+                        })?
+                        .to_vec(),
+                );
+            }
+            "videoThumbnail" => {
+                thumbnail_data = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|e| {
+                            AppError::Multipart(format!("Failed to read thumbnail data: {}", e))
+                        })?
+                        .to_vec(),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let file_data = file_data.ok_or(AppError::ValidationError("No file provided".to_string()))?;
+    let file_name = file_name.ok_or(AppError::ValidationError("No file name".to_string()))?;
+
+    if user_id.is_empty() {
+        return Err(AppError::ValidationError("User ID is required".to_string()));
+    }
+
+    let ext = std::path::Path::new(&file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let storage_service = &state.storage_service;
+
+    let (url, public_id) =
+        if ext == "mp4" || ext == "mov" || ext == "avi" || ext == "mkv" || ext == "webm" {
+            storage_service
+                .upload_video(&file_data, &user_id, &ext)
+                .await?
+        } else {
+            storage_service
+                .upload_image(&file_data, &user_id, &ext)
+                .await?
+        };
+
+    // ✅ Upload thumbnail if provided
+    let thumbnail_url = if let Some(thumb_data) = thumbnail_data {
+        storage_service
+            .upload_thumbnail(&thumb_data, &user_id)
+            .await
+            .ok()
+    } else {
+        None
+    };
+
+    Ok(Json(json!({
+        "success": true,
+        "url": url,
+        "public_id": public_id,
+        "file_name": file_name,
+        "caption": caption,
+        "mime_type": mime_type,
+        "thumbnail_url": thumbnail_url,
+    })))
+}
+// ============================================================================
+// REST OF YOUR EXISTING CODE (unchanged below)
+// ============================================================================
 
 async fn find_fixture_in_both(
     fixtures_col: &Collection<Fixture>,
@@ -187,7 +301,6 @@ async fn notify_channel_members(
     body: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
-    // ✅ FIXED: only 1 generic parameter
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
     let channel = channels_col
@@ -259,6 +372,7 @@ async fn notify_channel_members(
 
     Ok(())
 }
+
 // ============================================================================
 // CREATE CHANNEL
 // ============================================================================
@@ -2645,7 +2759,7 @@ pub async fn send_message_handler(
 }
 
 // ============================================================================
-// GET MESSAGES HANDLER (already exists but let's update it)
+// GET MESSAGES HANDLER
 // ============================================================================
 
 #[derive(Debug, Deserialize)]

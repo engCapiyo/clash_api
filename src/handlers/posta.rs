@@ -22,7 +22,7 @@ use crate::models::posta::{
 use crate::state::AppState;
 
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
-const MAX_VIDEO_SIZE: u64 = 50 * 1024 * 1024; // 50MB - ✅ CHANGED to match Flutter
+const MAX_VIDEO_SIZE: u64 = 50 * 1024 * 1024; // 50MB
 const ALLOWED_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "gif"];
 const ALLOWED_VIDEO_EXTENSIONS: [&str; 4] = ["mp4", "mov", "avi", "mkv"];
 const DEFAULT_PAGE_SIZE: i64 = 20;
@@ -284,7 +284,9 @@ pub async fn get_user_post_stats(
     })))
 }
 
-// ========== CREATE POST (with Video Support) ==========
+// ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
+// ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
+// ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
 pub async fn create_post(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -400,12 +402,12 @@ pub async fn create_post(
     }
 
     let collection: Collection<Post> = state.db.collection("posts");
-
     let storage_service = &state.storage_service;
-    let cloudinary_service = &state.cloudinary;
 
     let post = match (image_data, video_data) {
-        // VIDEO ONLY
+        // ============================================================
+        // VIDEO ONLY - Firebase Storage
+        // ============================================================
         (None, Some(video_data)) => {
             let ext = video_extension.unwrap_or("mp4".to_string());
             let (video_url, firebase_public_id) = storage_service
@@ -424,7 +426,7 @@ pub async fn create_post(
                 None
             };
 
-            let duration = 0; // Placeholder - implement actual duration extraction
+            let duration = 0;
             let size = video_data.len() as i64;
 
             Post::new_video_post(
@@ -438,7 +440,9 @@ pub async fn create_post(
             )
         }
 
-        // TEXT + VIDEO + IMAGE
+        // ============================================================
+        // TEXT + VIDEO + IMAGE - All Firebase Storage
+        // ============================================================
         (Some(image_data), Some(video_data)) => {
             // Upload video to Firebase
             let ext = video_extension.unwrap_or("mp4".to_string());
@@ -458,35 +462,19 @@ pub async fn create_post(
                 None
             };
 
-            // Upload image to Cloudinary
+            // ✅ Upload image to Firebase ONLY
             let img_ext = image_extension.unwrap_or("jpg".to_string());
-            let public_id = format!("post_{}_{}", user_id, Uuid::new_v4());
-            let upload_path = format!("fanclash/posts/{}", user_id);
-
-            let (image_url, cloudinary_public_id) = match cloudinary_service
-                .upload_image_with_preset(&image_data, &upload_path, Some(&public_id))
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => cloudinary_service
-                    .upload_image_signed(&image_data, &upload_path, Some(&public_id))
-                    .await
-                    .map_err(|e| AppError::invalid_data(format!("Image upload failed: {}", e)))?,
-            };
-
-            // ✅ Upload image to Firebase as well
-            let (firebase_image_url, firebase_image_public_id) = storage_service
+            let (image_url, firebase_image_public_id) = storage_service
                 .upload_image(&image_data, &user_id, &img_ext)
                 .await
-                .ok()
-                .map(|(url, public_id)| (Some(url), Some(public_id)))
-                .unwrap_or((None, None));
+                .map_err(|e| {
+                    AppError::InternalServerError(format!("Image upload failed: {}", e))
+                })?;
 
             let duration = 0;
             let size = video_data.len() as i64;
 
-            // Create post with both image and video
-            // Use new_text_video_post but also store image data
+            // Create post with both image and video (all Firebase)
             let mut post = Post::new_text_video_post(
                 user_id.clone(),
                 user_name.clone(),
@@ -498,65 +486,68 @@ pub async fn create_post(
                 Some(size),
             );
 
-            // Add image data to the post
+            // ✅ Add image data to the post (Firebase only)
             post.image_url = Some(image_url);
-            post.cloudinary_public_id = Some(cloudinary_public_id);
+            post.firebase_image_public_id = Some(firebase_image_public_id);
             post.image_format = Some(img_ext);
-            post.firebase_image_url = firebase_image_url;
-            post.firebase_image_public_id = firebase_image_public_id;
+            post.post_type = PostType::TextAndVideo;
 
             post
         }
 
-        // IMAGE ONLY (Cloudinary + Firebase)
+        // ============================================================
+        // IMAGE ONLY - Firebase Storage ONLY (NO Cloudinary) - ✅ FIXED
+        // ============================================================
         (Some(image_data), None) => {
             let ext = image_extension.unwrap_or("jpg".to_string());
-            let public_id = format!("post_{}_{}", user_id, Uuid::new_v4());
-            let upload_path = format!("fanclash/posts/{}", user_id);
 
-            let (image_url, cloudinary_public_id) = match cloudinary_service
-                .upload_image_with_preset(&image_data, &upload_path, Some(&public_id))
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => cloudinary_service
-                    .upload_image_signed(&image_data, &upload_path, Some(&public_id))
-                    .await
-                    .map_err(|e| AppError::invalid_data(format!("Image upload failed: {}", e)))?,
-            };
-
-            // ✅ Upload image to Firebase as well
-            let (firebase_image_url, firebase_image_public_id) = storage_service
+            // ✅ Upload image to Firebase ONLY
+            let (image_url, firebase_image_public_id) = storage_service
                 .upload_image(&image_data, &user_id, &ext)
                 .await
-                .ok()
-                .map(|(url, public_id)| (Some(url), Some(public_id)))
-                .unwrap_or((None, None));
+                .map_err(|e| {
+                    AppError::InternalServerError(format!("Image upload failed: {}", e))
+                })?;
+
+            // ✅ Clone image_url before moving it
+            let image_url_clone1 = image_url.clone();
+            let image_url_clone2 = image_url.clone();
+            let firebase_image_public_id_clone = firebase_image_public_id.clone();
 
             match caption {
-                Some(caption_text) => Post::new_text_image_post(
-                    user_id.clone(),
-                    user_name.clone(),
-                    caption_text,
-                    image_url,
-                    cloudinary_public_id,
-                    ext,
-                    firebase_image_url,
-                    firebase_image_public_id,
-                ),
-                None => Post::new_image_post(
-                    user_id.clone(),
-                    user_name.clone(),
-                    image_url,
-                    cloudinary_public_id,
-                    ext,
-                    firebase_image_url,
-                    firebase_image_public_id,
-                ),
+                Some(caption_text) => {
+                    let mut post = Post::new_text_image_post(
+                        user_id.clone(),
+                        user_name.clone(),
+                        caption_text,
+                        image_url,      // ✅ Move original here
+                        "".to_string(), // No Cloudinary public ID
+                        ext.clone(),
+                        Some(image_url_clone1), // ✅ Use clone for firebase_image_url
+                        Some(firebase_image_public_id_clone),
+                    );
+                    post.cloudinary_public_id = None;
+                    post
+                }
+                None => {
+                    let mut post = Post::new_image_post(
+                        user_id.clone(),
+                        user_name.clone(),
+                        image_url_clone2, // ✅ Use clone here
+                        "".to_string(),
+                        ext,
+                        Some(image_url.clone()), // ✅ Clone for firebase_image_url
+                        Some(firebase_image_public_id),
+                    );
+                    post.cloudinary_public_id = None;
+                    post
+                }
             }
         }
 
+        // ============================================================
         // TEXT ONLY
+        // ============================================================
         (None, None) => Post::new_text_post(
             user_id.clone(),
             user_name.clone(),
@@ -641,7 +632,6 @@ pub async fn create_post(
         "post": post_response
     })))
 }
-
 // ========== GET POSTS ==========
 pub async fn get_posts(
     State(state): State<AppState>,
@@ -794,7 +784,7 @@ pub async fn get_post_by_id(
     })))
 }
 
-// ========== DELETE POST ==========
+// ========== DELETE POST (Pure Firebase) ==========
 pub async fn delete_post(
     State(state): State<AppState>,
     Path(post_id): Path<String>,
@@ -813,21 +803,21 @@ pub async fn delete_post(
         None => return Err(AppError::PostNotFound),
     };
 
-    // Delete image from Cloudinary if exists
+    let storage_service = &state.storage_service;
+
+    // ✅ Delete image from Firebase if exists
     if post.has_image() {
-        let cloudinary_service = &state.cloudinary;
-        if let Some(ref public_id) = post.cloudinary_public_id {
-            let _ = cloudinary_service.delete_image(public_id).await;
-        }
-        // Also delete from Firebase if exists
         if let Some(ref public_id) = post.firebase_image_public_id {
-            let _ = state.storage_service.delete_file(public_id).await;
+            let _ = storage_service.delete_file(public_id).await;
+        }
+        // Also check firebase_image_url field
+        if let Some(ref public_id) = post.firebase_image_public_id {
+            let _ = storage_service.delete_file(public_id).await;
         }
     }
 
-    // Delete video from Firebase Storage if exists
+    // ✅ Delete video from Firebase Storage if exists
     if post.has_video() {
-        let storage_service = &state.storage_service;
         if let Some(ref public_id) = post.firebase_public_id {
             let _ = storage_service.delete_file(public_id).await;
         }
@@ -1549,7 +1539,7 @@ pub async fn search_posts(
     })))
 }
 
-// ========== DELETE POSTS BY USER ==========
+// ========== DELETE POSTS BY USER (Pure Firebase) ==========
 pub async fn delete_posts_by_user(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
@@ -1569,23 +1559,18 @@ pub async fn delete_posts_by_user(
         })));
     }
 
-    let cloudinary_service = &state.cloudinary;
     let storage_service = &state.storage_service;
-    let mut deleted_from_cloudinary = 0;
     let mut deleted_from_firebase = 0;
 
     for post in &posts {
+        // ✅ Delete image from Firebase if exists
         if post.has_image() {
-            if let Some(public_id) = &post.cloudinary_public_id {
-                let _ = cloudinary_service.delete_image(public_id).await;
-                deleted_from_cloudinary += 1;
-            }
-            // Also delete Firebase image if exists
             if let Some(public_id) = &post.firebase_image_public_id {
                 let _ = storage_service.delete_file(public_id).await;
                 deleted_from_firebase += 1;
             }
         }
+        // ✅ Delete video from Firebase if exists
         if post.has_video() {
             if let Some(public_id) = &post.firebase_public_id {
                 let _ = storage_service.delete_file(public_id).await;
@@ -1600,7 +1585,6 @@ pub async fn delete_posts_by_user(
         "success": true,
         "message": "All user posts deleted successfully",
         "deleted_from_db": delete_result.deleted_count,
-        "deleted_from_cloudinary": deleted_from_cloudinary,
         "deleted_from_firebase": deleted_from_firebase,
         "user_id": user_id
     })))
