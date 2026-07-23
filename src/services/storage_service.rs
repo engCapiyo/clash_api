@@ -21,6 +21,9 @@ impl StorageService {
         let api_key = env::var("FIREBASE_API_KEY")
             .map_err(|_| AppError::InternalServerError("FIREBASE_API_KEY not set".to_string()))?;
 
+        println!("✅ StorageService initialized with bucket: {}", bucket_name);
+        println!("✅ API Key length: {}", api_key.len());
+
         Ok(Self {
             client: Client::new(),
             bucket_name,
@@ -45,10 +48,16 @@ impl StorageService {
         );
         let path = format!("{}.{}", filename, file_extension);
 
+        println!("📤 Uploading video to Firebase Storage");
+        println!("   Path: {}", path);
+        println!("   Size: {} bytes", data.len());
+
         let url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?uploadType=media&key={}",
             self.bucket_name, &path, self.api_key
         );
+
+        println!("   URL: {}", url);
 
         let response = self
             .client
@@ -57,11 +66,17 @@ impl StorageService {
             .body(data.to_vec())
             .send()
             .await
-            .map_err(|e| AppError::InternalServerError(format!("Video upload failed: {}", e)))?;
+            .map_err(|e| {
+                println!("❌ Reqwest error: {}", e);
+                AppError::InternalServerError(format!("Video upload failed: {}", e))
+            })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        println!("   Response Status: {}", status);
+
+        if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
+            println!("❌ Firebase Error Response: {}", text);
             return Err(AppError::InternalServerError(format!(
                 "Video upload failed: {} - {}",
                 status, text
@@ -69,13 +84,13 @@ impl StorageService {
         }
 
         let download_url = self.get_download_url(&path).await?;
-        let public_id: String = path;
+        println!("✅ Video uploaded successfully: {}", download_url);
 
-        Ok((download_url, public_id))
+        Ok((download_url, path))
     }
 
     // ============================================================================
-    // IMAGE UPLOAD (NEW)
+    // IMAGE UPLOAD
     // ============================================================================
     pub async fn upload_image(
         &self,
@@ -91,10 +106,16 @@ impl StorageService {
         );
         let path = format!("{}.{}", filename, file_extension);
 
+        println!("📤 Uploading image to Firebase Storage");
+        println!("   Path: {}", path);
+        println!("   Size: {} bytes", data.len());
+
         let url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?uploadType=media&key={}",
             self.bucket_name, &path, self.api_key
         );
+
+        println!("   URL: {}", url);
 
         let response = self
             .client
@@ -103,11 +124,17 @@ impl StorageService {
             .body(data.to_vec())
             .send()
             .await
-            .map_err(|e| AppError::InternalServerError(format!("Image upload failed: {}", e)))?;
+            .map_err(|e| {
+                println!("❌ Reqwest error: {}", e);
+                AppError::InternalServerError(format!("Image upload failed: {}", e))
+            })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        println!("   Response Status: {}", status);
+
+        if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
+            println!("❌ Firebase Error Response: {}", text);
             return Err(AppError::InternalServerError(format!(
                 "Image upload failed: {} - {}",
                 status, text
@@ -115,9 +142,9 @@ impl StorageService {
         }
 
         let download_url = self.get_download_url(&path).await?;
-        let public_id: String = path;
+        println!("✅ Image uploaded successfully: {}", download_url);
 
-        Ok((download_url, public_id))
+        Ok((download_url, path))
     }
 
     // ============================================================================
@@ -125,6 +152,10 @@ impl StorageService {
     // ============================================================================
     pub async fn upload_thumbnail(&self, data: &[u8], user_id: &str) -> Result<String, AppError> {
         let path = format!("videos/{}/thumb_{}", user_id, Uuid::new_v4());
+
+        println!("📤 Uploading thumbnail to Firebase Storage");
+        println!("   Path: {}", path);
+        println!("   Size: {} bytes", data.len());
 
         let url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?uploadType=media&key={}",
@@ -139,12 +170,16 @@ impl StorageService {
             .send()
             .await
             .map_err(|e| {
+                println!("❌ Reqwest error: {}", e);
                 AppError::InternalServerError(format!("Thumbnail upload failed: {}", e))
             })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
+        let status = response.status();
+        println!("   Response Status: {}", status);
+
+        if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
+            println!("❌ Firebase Error Response: {}", text);
             return Err(AppError::InternalServerError(format!(
                 "Thumbnail upload failed: {} - {}",
                 status, text
@@ -152,6 +187,8 @@ impl StorageService {
         }
 
         let download_url = self.get_download_url(&path).await?;
+        println!("✅ Thumbnail uploaded successfully: {}", download_url);
+
         Ok(download_url)
     }
 

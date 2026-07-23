@@ -136,6 +136,7 @@ fn parse_if_modified_since(header_value: &str) -> Option<chrono::DateTime<Utc>> 
 
 // ========== GET POST STATS ==========
 pub async fn get_post_stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
+    println!("🔍 get_post_stats called");
     let collection: Collection<Post> = state.db.collection("posts");
 
     let total_posts = collection.count_documents(doc! {}).await?;
@@ -174,6 +175,7 @@ pub async fn update_post_caption(
     Path(post_id): Path<String>,
     Json(payload): Json<UpdateCaptionRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 update_post_caption called for post: {}", post_id);
     let collection: Collection<Post> = state.db.collection("posts");
 
     let object_id = match ObjectId::parse_str(&post_id) {
@@ -210,6 +212,7 @@ pub async fn get_posts_by_user(
     Path(user_id): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 get_posts_by_user called for user: {}", user_id);
     let collection: Collection<Post> = state.db.collection("posts");
 
     let page = params.page.unwrap_or(1).max(1);
@@ -249,6 +252,7 @@ pub async fn get_user_post_stats(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 get_user_post_stats called for user: {}", user_id);
     let collection: Collection<Post> = state.db.collection("posts");
 
     let filter = doc! { "user_id": &user_id };
@@ -286,13 +290,12 @@ pub async fn get_user_post_stats(
 
 // ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
 // ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
-// ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
 pub async fn create_post(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>> {
     let request_id = uuid::Uuid::new_v4();
-    log_info!("[{}] Starting create_post handler", request_id);
+    println!("🔍 [{}] create_post called", request_id);
 
     let mut caption: Option<String> = None;
     let mut user_id = String::new();
@@ -308,6 +311,7 @@ pub async fn create_post(
         AppError::Multipart(format!("Failed to process multipart field: {}", e))
     })? {
         let field_name = field.name().unwrap_or("").to_string();
+        println!("🔍 [{}] Processing field: {}", request_id, field_name);
 
         match field_name.as_str() {
             "caption" => {
@@ -315,7 +319,7 @@ pub async fn create_post(
                     log_error!("[{}] Failed to read caption: {}", request_id, e);
                     AppError::Multipart(format!("Failed to read caption: {}", e))
                 })?;
-
+                println!("🔍 [{}] Caption: {}", request_id, text);
                 if !text.trim().is_empty() {
                     caption = Some(text);
                 }
@@ -325,12 +329,14 @@ pub async fn create_post(
                     log_error!("[{}] Failed to read user_id: {}", request_id, e);
                     AppError::Multipart(format!("Failed to read user_id: {}", e))
                 })?;
+                println!("🔍 [{}] User ID: {}", request_id, user_id);
             }
             "userName" => {
                 user_name = field.text().await.map_err(|e| {
                     log_error!("[{}] Failed to read user_name: {}", request_id, e);
                     AppError::Multipart(format!("Failed to read user_name: {}", e))
                 })?;
+                println!("🔍 [{}] User Name: {}", request_id, user_name);
             }
             "image" => {
                 let file_name = field.file_name().unwrap_or("image").to_string();
@@ -339,7 +345,20 @@ pub async fn create_post(
                     AppError::Multipart(format!("Failed to read image data: {}", e))
                 })?;
 
+                println!(
+                    "🔍 [{}] Image received: {}, size: {} bytes",
+                    request_id,
+                    file_name,
+                    data.len()
+                );
+
                 if data.len() as u64 > MAX_FILE_SIZE {
+                    println!(
+                        "❌ [{}] Image too large: {} > {}",
+                        request_id,
+                        data.len(),
+                        MAX_FILE_SIZE
+                    );
                     return Err(AppError::ImageTooLarge);
                 }
 
@@ -350,11 +369,14 @@ pub async fn create_post(
                     .to_lowercase();
 
                 if !ALLOWED_EXTENSIONS.contains(&ext.as_str()) {
+                    println!("❌ [{}] Invalid image format: {}", request_id, ext);
                     return Err(AppError::InvalidImageFormat);
                 }
 
-                image_extension = Some(ext);
+                let ext_clone = ext.clone();
+                image_extension = Some(ext_clone);
                 image_data = Some(data.to_vec());
+                println!("🔍 [{}] Image accepted, extension: {}", request_id, ext);
             }
             "video" => {
                 let file_name = field.file_name().unwrap_or("video").to_string();
@@ -363,7 +385,20 @@ pub async fn create_post(
                     AppError::Multipart(format!("Failed to read video data: {}", e))
                 })?;
 
+                println!(
+                    "🔍 [{}] Video received: {}, size: {} bytes",
+                    request_id,
+                    file_name,
+                    data.len()
+                );
+
                 if data.len() as u64 > MAX_VIDEO_SIZE {
+                    println!(
+                        "❌ [{}] Video too large: {} > {}",
+                        request_id,
+                        data.len(),
+                        MAX_VIDEO_SIZE
+                    );
                     return Err(AppError::invalid_data("Video too large (max 50MB)"));
                 }
 
@@ -374,11 +409,14 @@ pub async fn create_post(
                     .to_lowercase();
 
                 if !ALLOWED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+                    println!("❌ [{}] Invalid video format: {}", request_id, ext);
                     return Err(AppError::invalid_data("Invalid video format"));
                 }
 
-                video_extension = Some(ext);
+                let ext_clone = ext.clone();
+                video_extension = Some(ext_clone);
                 video_data = Some(data.to_vec());
+                println!("🔍 [{}] Video accepted, extension: {}", request_id, ext);
             }
             "videoThumbnail" => {
                 let data = field.bytes().await.map_err(|e| {
@@ -386,8 +424,15 @@ pub async fn create_post(
                     AppError::Multipart(format!("Failed to read video thumbnail: {}", e))
                 })?;
                 video_thumbnail_data = Some(data.to_vec());
+                println!(
+                    "🔍 [{}] Video thumbnail received, size: {} bytes",
+                    request_id,
+                    data.len()
+                );
             }
-            _ => continue,
+            _ => {
+                println!("🔍 [{}] Unknown field: {}", request_id, field_name);
+            }
         }
     }
 
@@ -405,9 +450,6 @@ pub async fn create_post(
     let storage_service = &state.storage_service;
 
     let post = match (image_data, video_data) {
-        // ============================================================
-        // VIDEO ONLY - Firebase Storage
-        // ============================================================
         (None, Some(video_data)) => {
             let ext = video_extension.unwrap_or("mp4".to_string());
             let (video_url, firebase_public_id) = storage_service
@@ -439,12 +481,7 @@ pub async fn create_post(
                 Some(size),
             )
         }
-
-        // ============================================================
-        // TEXT + VIDEO + IMAGE - All Firebase Storage
-        // ============================================================
         (Some(image_data), Some(video_data)) => {
-            // Upload video to Firebase
             let ext = video_extension.unwrap_or("mp4".to_string());
             let (video_url, firebase_public_id) = storage_service
                 .upload_video(&video_data, &user_id, &ext)
@@ -462,7 +499,6 @@ pub async fn create_post(
                 None
             };
 
-            // ✅ Upload image to Firebase ONLY
             let img_ext = image_extension.unwrap_or("jpg".to_string());
             let (image_url, firebase_image_public_id) = storage_service
                 .upload_image(&image_data, &user_id, &img_ext)
@@ -474,7 +510,6 @@ pub async fn create_post(
             let duration = 0;
             let size = video_data.len() as i64;
 
-            // Create post with both image and video (all Firebase)
             let mut post = Post::new_text_video_post(
                 user_id.clone(),
                 user_name.clone(),
@@ -486,7 +521,6 @@ pub async fn create_post(
                 Some(size),
             );
 
-            // ✅ Add image data to the post (Firebase only)
             post.image_url = Some(image_url);
             post.firebase_image_public_id = Some(firebase_image_public_id);
             post.image_format = Some(img_ext);
@@ -494,14 +528,9 @@ pub async fn create_post(
 
             post
         }
-
-        // ============================================================
-        // IMAGE ONLY - Firebase Storage ONLY (NO Cloudinary) - ✅ FIXED
-        // ============================================================
         (Some(image_data), None) => {
             let ext = image_extension.unwrap_or("jpg".to_string());
 
-            // ✅ Upload image to Firebase ONLY
             let (image_url, firebase_image_public_id) = storage_service
                 .upload_image(&image_data, &user_id, &ext)
                 .await
@@ -509,7 +538,6 @@ pub async fn create_post(
                     AppError::InternalServerError(format!("Image upload failed: {}", e))
                 })?;
 
-            // ✅ Clone image_url before moving it
             let image_url_clone1 = image_url.clone();
             let image_url_clone2 = image_url.clone();
             let firebase_image_public_id_clone = firebase_image_public_id.clone();
@@ -520,10 +548,10 @@ pub async fn create_post(
                         user_id.clone(),
                         user_name.clone(),
                         caption_text,
-                        image_url,      // ✅ Move original here
-                        "".to_string(), // No Cloudinary public ID
+                        image_url,
+                        "".to_string(),
                         ext.clone(),
-                        Some(image_url_clone1), // ✅ Use clone for firebase_image_url
+                        Some(image_url_clone1),
                         Some(firebase_image_public_id_clone),
                     );
                     post.cloudinary_public_id = None;
@@ -533,10 +561,10 @@ pub async fn create_post(
                     let mut post = Post::new_image_post(
                         user_id.clone(),
                         user_name.clone(),
-                        image_url_clone2, // ✅ Use clone here
+                        image_url_clone2,
                         "".to_string(),
                         ext,
-                        Some(image_url.clone()), // ✅ Clone for firebase_image_url
+                        Some(image_url.clone()),
                         Some(firebase_image_public_id),
                     );
                     post.cloudinary_public_id = None;
@@ -544,10 +572,6 @@ pub async fn create_post(
                 }
             }
         }
-
-        // ============================================================
-        // TEXT ONLY
-        // ============================================================
         (None, None) => Post::new_text_post(
             user_id.clone(),
             user_name.clone(),
@@ -558,7 +582,6 @@ pub async fn create_post(
     let insert_result = collection.insert_one(&post).await?;
     let post_response = PostResponse::from(post.clone());
 
-    // Send FCM notifications to ALL users
     let state_clone = state.clone();
     let user_id_clone = user_id.clone();
     let user_name_clone = user_name.clone();
@@ -595,13 +618,6 @@ pub async fn create_post(
             };
 
             if !all_user_ids.is_empty() {
-                println!(
-                    "📱 Notifying ALL {} users about new {} post from {}",
-                    all_user_ids.len(),
-                    media_type,
-                    user_name_clone
-                );
-
                 let _ = fcm_service
                     .send_to_multiple_users(
                         &state_clone,
@@ -764,6 +780,7 @@ pub async fn get_post_by_id(
     State(state): State<AppState>,
     Path(post_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 get_post_by_id called for post: {}", post_id);
     let collection: Collection<Post> = state.db.collection("posts");
 
     let object_id = match ObjectId::parse_str(&post_id) {
@@ -789,6 +806,7 @@ pub async fn delete_post(
     State(state): State<AppState>,
     Path(post_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 delete_post called for post: {}", post_id);
     let collection: Collection<Post> = state.db.collection("posts");
 
     let object_id = match ObjectId::parse_str(&post_id) {
@@ -808,10 +826,7 @@ pub async fn delete_post(
     // ✅ Delete image from Firebase if exists
     if post.has_image() {
         if let Some(ref public_id) = post.firebase_image_public_id {
-            let _ = storage_service.delete_file(public_id).await;
-        }
-        // Also check firebase_image_url field
-        if let Some(ref public_id) = post.firebase_image_public_id {
+            println!("🔍 Deleting Firebase image: {}", public_id);
             let _ = storage_service.delete_file(public_id).await;
         }
     }
@@ -819,6 +834,7 @@ pub async fn delete_post(
     // ✅ Delete video from Firebase Storage if exists
     if post.has_video() {
         if let Some(ref public_id) = post.firebase_public_id {
+            println!("🔍 Deleting Firebase video: {}", public_id);
             let _ = storage_service.delete_file(public_id).await;
         }
     }
@@ -829,6 +845,7 @@ pub async fn delete_post(
         return Err(AppError::PostNotFound);
     }
 
+    println!("✅ delete_post completed for post: {}", post_id);
     Ok(Json(json!({
         "success": true,
         "message": "Post deleted successfully",
@@ -842,6 +859,7 @@ pub async fn like_post(
     Path(post_id): Path<String>,
     Json(payload): Json<LikeRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 like_post called for post: {}", post_id);
     let collection: Collection<Post> = state.db.collection("posts");
 
     let object_id = match ObjectId::parse_str(&post_id) {
@@ -930,6 +948,7 @@ pub async fn unlike_post(
     Path(post_id): Path<String>,
     Json(payload): Json<LikeRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 unlike_post called for post: {}", post_id);
     let collection: Collection<Post> = state.db.collection("posts");
 
     let object_id = match ObjectId::parse_str(&post_id) {
@@ -986,6 +1005,7 @@ pub async fn create_comment(
     Path(post_id): Path<String>,
     Json(payload): Json<CreateCommentRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 create_comment called for post: {}", post_id);
     if payload.comment.trim().is_empty() {
         return Err(AppError::invalid_data("Comment cannot be empty"));
     }
@@ -1171,6 +1191,7 @@ pub async fn get_comments(
     Path(post_id): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 get_comments called for post: {}", post_id);
     let collection: Collection<Comment> = state.db.collection("comments");
 
     let page = params.page.unwrap_or(1).max(1);
@@ -1222,6 +1243,7 @@ pub async fn update_comment(
     Path(comment_id): Path<String>,
     Json(payload): Json<UpdateCommentRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 update_comment called for comment: {}", comment_id);
     if payload.comment.trim().is_empty() {
         return Err(AppError::invalid_data("Comment cannot be empty"));
     }
@@ -1278,6 +1300,7 @@ pub async fn delete_comment(
     Path(comment_id): Path<String>,
     Json(payload): Json<LikeRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 delete_comment called for comment: {}", comment_id);
     let comment_collection: Collection<Comment> = state.db.collection("comments");
 
     let object_id = match ObjectId::parse_str(&comment_id) {
@@ -1338,6 +1361,7 @@ pub async fn like_comment(
     Path(comment_id): Path<String>,
     Json(payload): Json<LikeRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 like_comment called for comment: {}", comment_id);
     let collection: Collection<Comment> = state.db.collection("comments");
 
     let object_id = match ObjectId::parse_str(&comment_id) {
@@ -1394,6 +1418,7 @@ pub async fn unlike_comment(
     Path(comment_id): Path<String>,
     Json(payload): Json<LikeRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 unlike_comment called for comment: {}", comment_id);
     let collection: Collection<Comment> = state.db.collection("comments");
 
     let object_id = match ObjectId::parse_str(&comment_id) {
@@ -1449,6 +1474,7 @@ pub async fn search_posts(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 search_posts called with query: {:?}", params.q);
     let collection: Collection<Post> = state.db.collection("posts");
 
     let mut filter = doc! {};
@@ -1544,6 +1570,7 @@ pub async fn delete_posts_by_user(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 delete_posts_by_user called for user: {}", user_id);
     let collection: Collection<Post> = state.db.collection("posts");
 
     let filter = doc! { "user_id": &user_id };
@@ -1566,6 +1593,7 @@ pub async fn delete_posts_by_user(
         // ✅ Delete image from Firebase if exists
         if post.has_image() {
             if let Some(public_id) = &post.firebase_image_public_id {
+                println!("🔍 Deleting Firebase image: {}", public_id);
                 let _ = storage_service.delete_file(public_id).await;
                 deleted_from_firebase += 1;
             }
@@ -1573,6 +1601,7 @@ pub async fn delete_posts_by_user(
         // ✅ Delete video from Firebase if exists
         if post.has_video() {
             if let Some(public_id) = &post.firebase_public_id {
+                println!("🔍 Deleting Firebase video: {}", public_id);
                 let _ = storage_service.delete_file(public_id).await;
                 deleted_from_firebase += 1;
             }
@@ -1581,6 +1610,10 @@ pub async fn delete_posts_by_user(
 
     let delete_result = collection.delete_many(filter).await?;
 
+    println!(
+        "✅ delete_posts_by_user completed. Deleted {} posts from DB, {} from Firebase",
+        delete_result.deleted_count, deleted_from_firebase
+    );
     Ok(Json(json!({
         "success": true,
         "message": "All user posts deleted successfully",
@@ -1595,6 +1628,7 @@ pub async fn get_post_video(
     State(state): State<AppState>,
     Path(post_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 get_post_video called for post: {}", post_id);
     let collection: Collection<Post> = state.db.collection("posts");
 
     let object_id = match ObjectId::parse_str(&post_id) {
@@ -1625,6 +1659,7 @@ pub async fn get_post_video_thumbnail(
     State(state): State<AppState>,
     Path(post_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    println!("🔍 get_post_video_thumbnail called for post: {}", post_id);
     let collection: Collection<Post> = state.db.collection("posts");
 
     let object_id = match ObjectId::parse_str(&post_id) {
