@@ -26,9 +26,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(client: Client, db: Database) -> Result<Self, AppError> {
+    // ⚠️ now async — StorageService::new() is async because it fetches a
+    // GCP OAuth2 token via gcp_auth at construction time. The caller in
+    // main.rs must `.await` this.
+    pub async fn new(client: Client, db: Database) -> Result<Self, AppError> {
         let cloudinary = CloudinaryService::new()?;
-        let storage_service = StorageService::new()?; // ✅ ADDED
+        let storage_service = StorageService::new().await?; // ✅ now awaited
 
         Ok(AppState {
             client,

@@ -36,6 +36,8 @@ tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1.0"
 mime = "0.3"
 urlencoding = "2.1"
+# Cargo.toml
+gcp_auth = "0.12"
 
 axum-extra = { version = "0.9", features = ["multipart"] }
 futures-util = "0.3"
