@@ -48,13 +48,17 @@ impl StorageService {
         );
         let path = format!("{}.{}", filename, file_extension);
 
+        // ✅ URL encode the path
+        let encoded_path = urlencoding::encode(&path);
+
         println!("📤 Uploading video to Firebase Storage");
         println!("   Path: {}", path);
+        println!("   Encoded Path: {}", encoded_path);
         println!("   Size: {} bytes", data.len());
 
         let url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?uploadType=media&key={}",
-            self.bucket_name, &path, self.api_key
+            self.bucket_name, encoded_path, self.api_key
         );
 
         println!("   URL: {}", url);
@@ -106,13 +110,17 @@ impl StorageService {
         );
         let path = format!("{}.{}", filename, file_extension);
 
+        // ✅ URL encode the path
+        let encoded_path = urlencoding::encode(&path);
+
         println!("📤 Uploading image to Firebase Storage");
         println!("   Path: {}", path);
+        println!("   Encoded Path: {}", encoded_path);
         println!("   Size: {} bytes", data.len());
 
         let url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?uploadType=media&key={}",
-            self.bucket_name, &path, self.api_key
+            self.bucket_name, encoded_path, self.api_key
         );
 
         println!("   URL: {}", url);
@@ -153,14 +161,20 @@ impl StorageService {
     pub async fn upload_thumbnail(&self, data: &[u8], user_id: &str) -> Result<String, AppError> {
         let path = format!("videos/{}/thumb_{}", user_id, Uuid::new_v4());
 
+        // ✅ URL encode the path
+        let encoded_path = urlencoding::encode(&path);
+
         println!("📤 Uploading thumbnail to Firebase Storage");
         println!("   Path: {}", path);
+        println!("   Encoded Path: {}", encoded_path);
         println!("   Size: {} bytes", data.len());
 
         let url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?uploadType=media&key={}",
-            self.bucket_name, &path, self.api_key
+            self.bucket_name, encoded_path, self.api_key
         );
+
+        println!("   URL: {}", url);
 
         let response = self
             .client
@@ -196,9 +210,11 @@ impl StorageService {
     // GET DOWNLOAD URL
     // ============================================================================
     pub async fn get_download_url(&self, path: &str) -> Result<String, AppError> {
+        // ✅ URL encode the path for download URL too
+        let encoded_path = urlencoding::encode(path);
         let url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?alt=media&key={}",
-            self.bucket_name, path, self.api_key
+            self.bucket_name, encoded_path, self.api_key
         );
         Ok(url)
     }
@@ -207,10 +223,16 @@ impl StorageService {
     // DELETE FILE
     // ============================================================================
     pub async fn delete_file(&self, public_id: &str) -> Result<(), AppError> {
+        // ✅ URL encode the public_id for delete too
+        let encoded_id = urlencoding::encode(public_id);
+
         let url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?key={}",
-            self.bucket_name, public_id, self.api_key
+            self.bucket_name, encoded_id, self.api_key
         );
+
+        println!("🔍 Deleting file: {}", public_id);
+        println!("   URL: {}", url);
 
         let response = self
             .client
@@ -222,12 +244,14 @@ impl StorageService {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
+            println!("❌ Delete failed: {} - {}", status, text);
             return Err(AppError::InternalServerError(format!(
                 "Delete failed: {} - {}",
                 status, text
             )));
         }
 
+        println!("✅ File deleted successfully");
         Ok(())
     }
 }
