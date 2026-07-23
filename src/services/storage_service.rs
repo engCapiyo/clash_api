@@ -42,6 +42,23 @@ impl StorageService {
         })
     }
 
+    fn image_content_type(file_extension: &str) -> &'static str {
+        match file_extension.to_lowercase().as_str() {
+            "png" => "image/png",
+            "gif" => "image/gif",
+            _ => "image/jpeg",
+        }
+    }
+
+    fn video_content_type(file_extension: &str) -> &'static str {
+        match file_extension.to_lowercase().as_str() {
+            "mov" => "video/quicktime",
+            "avi" => "video/x-msvideo",
+            "mkv" => "video/x-matroska",
+            _ => "video/mp4",
+        }
+    }
+
     // ============================================================================
     // VIDEO UPLOAD
     // ============================================================================
@@ -60,11 +77,12 @@ impl StorageService {
         let path = format!("{}.{}", filename, file_extension);
         let encoded_path = urlencoding::encode(&path);
 
-        // Firebase Storage's own REST API (v0) — no `uploadType` param.
-        // That param belongs to the raw GCS JSON API and mixing conventions
-        // causes "Invalid HTTP method/URL pair." on this host.
+        // The object path goes in the URL PATH (after /o/), same shape as
+        // delete_file and get_download_url below — not as a `name=` query
+        // param to a bare /o endpoint (that has no POST route, hence
+        // "Invalid HTTP method/URL pair").
         let url = format!(
-            "https://firebasestorage.googleapis.com/v0/b/{}/o?name={}&key={}",
+            "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?key={}",
             self.bucket_name, encoded_path, self.api_key
         );
 
@@ -74,12 +92,7 @@ impl StorageService {
             data.len()
         );
 
-        let content_type = match file_extension.to_lowercase().as_str() {
-            "mov" => "video/quicktime",
-            "avi" => "video/x-msvideo",
-            "mkv" => "video/x-matroska",
-            _ => "video/mp4",
-        };
+        let content_type = Self::video_content_type(file_extension);
 
         let response = self
             .client
@@ -142,7 +155,7 @@ impl StorageService {
         let encoded_path = urlencoding::encode(&path);
 
         let url = format!(
-            "https://firebasestorage.googleapis.com/v0/b/{}/o?name={}&key={}",
+            "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?key={}",
             self.bucket_name, encoded_path, self.api_key
         );
 
@@ -152,11 +165,7 @@ impl StorageService {
             data.len()
         );
 
-        let content_type = match file_extension.to_lowercase().as_str() {
-            "png" => "image/png",
-            "gif" => "image/gif",
-            _ => "image/jpeg",
-        };
+        let content_type = Self::image_content_type(file_extension);
 
         let response = self
             .client
@@ -210,7 +219,7 @@ impl StorageService {
         let encoded_path = urlencoding::encode(&path);
 
         let url = format!(
-            "https://firebasestorage.googleapis.com/v0/b/{}/o?name={}&key={}",
+            "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?key={}",
             self.bucket_name, encoded_path, self.api_key
         );
 
