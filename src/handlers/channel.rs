@@ -19,8 +19,8 @@ use serde::Deserialize;
 use crate::errors::{AppError, Result};
 use crate::models::channel::{
     AdminRewardScore, Channel, ChannelActivity, ChannelFixture, ChannelMember,
-    ChannelMembershipEvent, Fixture, Like, Message, Payout, PendingRequest, ReplyToData, Vote,
-    VoteCounts,
+    ChannelMembershipEvent, Fixture, Like, Message, MessageResponse, Payout, PendingRequest,
+    ReplyToData, Vote, VoteCounts,
 };
 use crate::models::pledges::{CreatePledge, Pledge};
 use crate::AppState;
@@ -2307,26 +2307,367 @@ pub async fn initialize_fixture_chat_handler(
 // ============================================================================
 // GET MESSAGES
 // ============================================================================
+// ============================================================================
+// MESSAGE HANDLERS
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct SendMessageRequest {
+    pub user_id: String,
+    pub username: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixture_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_public_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_caption: Option<String>,
+    #[serde(default)]
+    pub is_image: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_public_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_thumbnail_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_duration: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_size: Option<i64>,
+    #[serde(default)]
+    pub is_video: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_selection: Option<String>,
+}
+
+pub async fn send_message_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+    Json(payload): Json<SendMessageRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let messages_col = state.db.collection::<Message>("messages");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+    let channels_col = state.db.collection::<Channel>("channels");
+    let now = BsonDateTime::now();
+
+    // Validate channel exists
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    // Check if user is a member
+    let is_member = channel.members.iter().any(|m| m.user_id == payload.user_id);
+    if !is_member {
+        return Err(AppError::ValidationError(
+            "User is not a member of this channel".to_string(),
+        ));
+    }
+
+    let message_id = Uuid::new_v4().to_string();
+
+    // Build reply_to data if provided
+    let reply_to = if let Some(reply_id) = &payload.reply_to_id {
+        Some(ReplyToData {
+            message_id: reply_id.clone(),
+            text: payload.reply_to_text.clone().unwrap_or_default(),
+            username: payload.reply_to_username.clone().unwrap_or_default(),
+            selection: payload.reply_to_selection.clone(),
+            is_me: false,
+            image_url: None,
+            video_url: None,
+            is_image: false,
+            is_video: false,
+        })
+    } else {
+        None
+    };
+
+    // Build the message
+    let mut message = Message {
+        id: Some(ObjectId::new()),
+        channel_id: channel_id.clone(),
+        fixture_id: payload.fixture_id.clone(),
+        sender_id: payload.user_id.clone(),
+        sender_name: payload.username.clone(),
+        text: payload.text.clone(),
+        caption: payload.caption.clone(),
+        sent_at: now,
+        message_id: Some(message_id.clone()),
+        selection: payload.selection.clone(),
+        image_url: payload.image_url.clone(),
+        image_public_id: payload.image_public_id.clone(),
+        image_caption: payload.image_caption.clone(),
+        is_image: payload.is_image,
+        video_url: payload.video_url.clone(),
+        video_public_id: payload.video_public_id.clone(),
+        video_thumbnail_url: payload.video_thumbnail_url.clone(),
+        video_caption: payload.video_caption.clone(),
+        video_duration: payload.video_duration,
+        video_size: payload.video_size,
+        is_video: payload.is_video,
+        reply_to,
+        reply_to_id: payload.reply_to_id.clone(),
+    };
+
+    // If this is a reply, try to fetch the original message for richer reply data
+    if let Some(reply_id) = &payload.reply_to_id {
+        if let Ok(Some(replied_msg)) = messages_col.find_one(doc! { "message_id": reply_id }).await
+        {
+            let mut reply_data = ReplyToData {
+                message_id: reply_id.clone(),
+                text: replied_msg.text.clone(),
+                username: replied_msg.sender_name.clone(),
+                selection: replied_msg.selection.clone(),
+                is_me: replied_msg.sender_id == payload.user_id,
+                image_url: replied_msg.image_url.clone(),
+                video_url: replied_msg.video_url.clone(),
+                is_image: replied_msg.is_image,
+                is_video: replied_msg.is_video,
+            };
+            message.reply_to = Some(reply_data);
+            message.reply_to_id = Some(reply_id.clone());
+        }
+    }
+
+    messages_col.insert_one(&message).await?;
+
+    // Update channel fixture counts
+    if let Some(fixture_id) = &payload.fixture_id {
+        let update_result = channel_fixtures_col
+            .update_one(
+                doc! {
+                    "channel_id": &channel_id,
+                    "fixture_id": fixture_id,
+                },
+                doc! {
+                    "$inc": { "comment_count": 1 },
+                    "$set": {
+                        "last_message": &payload.text,
+                        "last_message_at": now,
+                        "last_sender": &payload.username,
+                    }
+                },
+            )
+            .await?;
+
+        // If fixture doesn't exist, create it
+        if update_result.matched_count == 0 {
+            // Try to get fixture info from global fixtures
+            let fixtures_col = state.db.collection::<Fixture>("fixtures");
+            let games_col = state.db.collection::<Game>("games");
+
+            let fixture_data = find_fixture_in_both(&fixtures_col, &games_col, fixture_id).await?;
+
+            let (match_name, kickoff_time, status) = match &fixture_data {
+                Some((source, json_data)) => {
+                    if source == "fixtures" {
+                        let fixture: Fixture = serde_json::from_value(json_data.clone())?;
+                        (
+                            format!("{} vs {}", fixture.home_team, fixture.away_team),
+                            format!("{} {}", fixture.date_iso, fixture.time),
+                            fixture.status,
+                        )
+                    } else {
+                        let game: Game = serde_json::from_value(json_data.clone())?;
+                        (
+                            format!("{} vs {}", game.home_team, game.away_team),
+                            format!("{} {}", game.date_iso, game.time),
+                            game.status,
+                        )
+                    }
+                }
+                None => (
+                    format!("Fixture {}", fixture_id),
+                    "".to_string(),
+                    "live".to_string(),
+                ),
+            };
+
+            let mut unread_counts = std::collections::HashMap::new();
+            for member in &channel.members {
+                unread_counts.insert(member.user_id.clone(), 0);
+            }
+
+            // Create the channel fixture
+            let new_fixture = ChannelFixture {
+                id: None,
+                channel_id: channel_id.clone(),
+                fixture_id: fixture_id.clone(),
+                match_name,
+                kickoff_time,
+                status,
+                vote_counts: VoteCounts {
+                    home: 0,
+                    away: 0,
+                    draw: 0,
+                },
+                comment_count: 1,
+                pledge_count: 0,
+                bet_count: 0,
+                likes_count: 0,
+                unread_counts,
+                last_message: Some(payload.text.clone()),
+                last_message_at: Some(now),
+                last_sender: Some(payload.username.clone()),
+                added_at: now,
+            };
+
+            channel_fixtures_col.insert_one(&new_fixture).await?;
+        }
+    }
+
+    // Increment member message count
+    channels_col
+        .update_one(
+            doc! {
+                "channel_id": &channel_id,
+                "members.user_id": &payload.user_id,
+            },
+            doc! {
+                "$inc": { "members.$.msg_count": 1 },
+                "$set": { "members.$.last_active_at": now }
+            },
+        )
+        .await?;
+
+    // Increment total messages in channel activity
+    channels_col
+        .update_one(
+            doc! { "channel_id": &channel_id },
+            doc! {
+                "$inc": {
+                    "activity.total_messages": 1,
+                    "activity.messages_this_week": 1,
+                },
+                "$set": { "activity.last_message_at": now }
+            },
+        )
+        .await?;
+
+    // Increment unread counts for all other members
+    let mut session = state.client.start_session().await?;
+    session.start_transaction().await?;
+
+    // Get current unread counts
+    let channel_fixture = channel_fixtures_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "fixture_id": payload.fixture_id.as_deref().unwrap_or(""),
+        })
+        .session(&mut session)
+        .await?;
+
+    if let Some(mut cf) = channel_fixture {
+        for member in &channel.members {
+            if member.user_id != payload.user_id {
+                let key = format!("unread_counts.{}", member.user_id);
+                let current = cf.unread_counts.get(&member.user_id).copied().unwrap_or(0);
+                let update_doc = doc! { "$set": { key: current + 1 } };
+                channel_fixtures_col
+                    .update_one(
+                        doc! {
+                            "_id": cf.id,
+                        },
+                        update_doc,
+                    )
+                    .session(&mut session)
+                    .await?;
+            }
+        }
+    }
+
+    session.commit_transaction().await?;
+
+    // ============================================================
+    // ✅ SEND NOTIFICATIONS FOR NEW MESSAGE
+    // ============================================================
+    let message_payload = serde_json::json!({
+        "messageId": message_id,
+        "channel_id": channel_id,
+        "fixture_id": payload.fixture_id,
+        "sender_id": payload.user_id,
+        "sender_name": payload.username,
+        "text": payload.text,
+        "selection": payload.selection,
+        "caption": payload.caption,
+        "image_url": payload.image_url,
+        "video_url": payload.video_url,
+        "is_image": payload.is_image,
+        "is_video": payload.is_video,
+        "reply_to": message.reply_to,
+        "sent_at": now.to_rfc3339_string(),
+    });
+
+    let display_name = payload.username.clone();
+    let preview = if payload.is_image {
+        "📷 Image".to_string()
+    } else if payload.is_video {
+        "🎥 Video".to_string()
+    } else {
+        payload.text.chars().take(50).collect::<String>()
+    };
+
+    let _ = notify_channel_members(
+        &state,
+        &payload.user_id,
+        &channel_id,
+        payload.fixture_id.as_deref().unwrap_or("general"),
+        "chat.message",
+        &format!("💬 {} sent a message", display_name),
+        &preview,
+        message_payload,
+    )
+    .await;
+
+    // Return the created message
+    let response = MessageResponse::from(message);
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Message sent successfully",
+        "data": response,
+    })))
+}
+
+// ============================================================================
+// GET MESSAGES HANDLER (already exists but let's update it)
+// ============================================================================
 
 #[derive(Debug, Deserialize)]
 pub struct MessagesQuery {
-    pub channel_id: String,
     pub fixture_id: Option<String>,
     pub limit: Option<i64>,
     pub before: Option<String>,
 }
 
 pub async fn get_messages_handler(
-    Query(params): Query<MessagesQuery>,
     State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+    Path(channel_id): Path<String>,
+    Query(params): Query<MessagesQuery>,
+) -> Result<Json<serde_json::Value>> {
     let messages_col = state.db.collection::<Message>("messages");
-    let limit = params.limit.unwrap_or(100);
+    let limit = params.limit.unwrap_or(100).min(500);
 
     let mut filter = doc! {
-        "channel_id": &params.channel_id,
+        "channel_id": &channel_id,
     };
 
+    // Filter by fixture_id
     match &params.fixture_id {
         Some(fixture_id) => {
             if fixture_id.is_empty() {
@@ -2352,70 +2693,153 @@ pub async fn get_messages_handler(
         }
     }
 
+    // Filter by before timestamp
     if let Some(before) = &params.before {
         if let Ok(before_time) = BsonDateTime::parse_rfc3339_str(before) {
             filter.insert("sent_at", doc! { "$lt": before_time });
         }
     }
 
-    let mut cursor = match messages_col
+    let mut cursor = messages_col
         .find(filter)
         .sort(doc! { "sent_at": -1 })
         .limit(limit)
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return Json(serde_json::json!({
-                "success": false,
-                "error": format!("Database error: {}", e),
-                "messages": []
-            }));
-        }
-    };
+        .await?;
 
-    let mut messages: Vec<serde_json::Value> = Vec::new();
+    let mut messages: Vec<MessageResponse> = Vec::new();
     while let Some(msg) = cursor.next().await {
-        match msg {
-            Ok(message) => {
-                let msg_json = serde_json::json!({
-                    "id": message.id.map(|oid| oid.to_hex()),
-                    "message_id": message.message_id,
-                    "sender_id": message.sender_id,
-                    "sender_name": message.sender_name,
-                    "text": message.text,
-                    "selection": message.selection,
-                    "sent_at": message.sent_at.to_rfc3339_string(),
-                    "image_url": message.image_url,
-                    "video_url": message.video_url,
-                    "is_image": message.is_image,
-                    "is_video": message.is_video,
-                    "reply_to": message.reply_to.map(|r| serde_json::json!({
-                        "messageId": r.message_id,
-                        "text": r.text,
-                        "username": r.username,
-                        "selection": r.selection,
-                        "isMe": r.is_me,
-                    })),
-                    "fixture_id": message.fixture_id,
-                });
-                messages.push(msg_json);
-            }
-            Err(e) => {
-                tracing::error!("❌ Error reading message: {}", e);
-            }
-        }
+        let msg: Message = msg?;
+        messages.push(MessageResponse::from(msg));
     }
 
+    // Reverse to get chronological order
     messages.reverse();
 
-    Json(serde_json::json!({
+    Ok(Json(json!({
         "success": true,
         "messages": messages,
         "count": messages.len(),
-        "channel_id": params.channel_id,
+        "channel_id": channel_id,
         "fixture_id": params.fixture_id,
-    }))
+    })))
+}
+
+// ============================================================================
+// GET SINGLE MESSAGE
+// ============================================================================
+
+pub async fn get_single_message_handler(
+    State(state): State<AppState>,
+    Path((_channel_id, message_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let messages_col = state.db.collection::<Message>("messages");
+
+    let message = messages_col
+        .find_one(doc! { "message_id": &message_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let response = MessageResponse::from(message);
+
+    Ok(Json(json!({
+        "success": true,
+        "message": response,
+    })))
+}
+
+// ============================================================================
+// DELETE MESSAGE
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteMessageRequest {
+    pub user_id: String,
+}
+
+pub async fn delete_message_handler(
+    State(state): State<AppState>,
+    Path((_channel_id, message_id)): Path<(String, String)>,
+    Json(payload): Json<DeleteMessageRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let messages_col = state.db.collection::<Message>("messages");
+    let channel_fixtures_col = state.db.collection::<ChannelFixture>("channel_fixtures");
+
+    // Find the message
+    let message = messages_col
+        .find_one(doc! { "message_id": &message_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    // Check if user owns the message
+    if message.sender_id != payload.user_id {
+        return Err(AppError::ValidationError(
+            "You can only delete your own messages".to_string(),
+        ));
+    }
+
+    // Delete the message
+    messages_col.delete_one(doc! { "_id": message.id }).await?;
+
+    // Decrement comment count in channel fixture
+    if let Some(fixture_id) = &message.fixture_id {
+        channel_fixtures_col
+            .update_one(
+                doc! {
+                    "channel_id": &message.channel_id,
+                    "fixture_id": fixture_id,
+                },
+                doc! { "$inc": { "comment_count": -1 } },
+            )
+            .await?;
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Message deleted successfully",
+        "message_id": message_id,
+    })))
+}
+
+// ============================================================================
+// GET MESSAGE THREAD (Replies to a message)
+// ============================================================================
+
+pub async fn get_message_thread_handler(
+    State(state): State<AppState>,
+    Path((channel_id, message_id)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let messages_col = state.db.collection::<Message>("messages");
+
+    // Get the parent message
+    let parent = messages_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "message_id": &message_id,
+        })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    // Find all replies to this message
+    let mut cursor = messages_col
+        .find(doc! {
+            "channel_id": &channel_id,
+            "reply_to_id": &message_id,
+        })
+        .sort(doc! { "sent_at": 1 })
+        .await?;
+
+    let mut replies: Vec<MessageResponse> = Vec::new();
+    while let Some(msg) = cursor.next().await {
+        let msg: Message = msg?;
+        replies.push(MessageResponse::from(msg));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "parent": MessageResponse::from(parent),
+        "replies": replies,
+        "reply_count": replies.len(),
+    })))
 }
 
 // ============================================================================

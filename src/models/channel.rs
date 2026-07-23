@@ -84,7 +84,6 @@ pub struct Fixture {
     pub result: Option<String>,
     pub home_score: Option<i32>,
     pub away_score: Option<i32>,
-    // ✅ NO counts here — they belong in channel_fixtures
 }
 
 // ============================================================================
@@ -138,10 +137,10 @@ pub struct ChannelFixture {
 }
 
 // ============================================================================
-// MESSAGE
+// MESSAGE - FULL WITH CAPTION, IMAGES, VIDEOS, REPLY SUPPORT
 // ============================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Message {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
@@ -150,22 +149,51 @@ pub struct Message {
     pub fixture_id: Option<String>,
     pub sender_id: String,
     pub sender_name: String,
+
+    // Text content
     pub text: String,
+
+    // ✅ NEW: Caption for media (separate from text)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+
     pub sent_at: DateTime,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection: Option<String>,
+
+    // ✅ Image fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub video_url: Option<String>,
+    pub image_public_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_caption: Option<String>,
     #[serde(default)]
     pub is_image: bool,
+
+    // ✅ Video fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_public_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_thumbnail_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_duration: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_size: Option<i64>,
     #[serde(default)]
     pub is_video: bool,
+
+    // ✅ Reply support
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<ReplyToData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<String>,
 }
 
 // ============================================================================
@@ -182,6 +210,137 @@ pub struct ReplyToData {
     pub selection: Option<String>,
     #[serde(rename = "isMe")]
     pub is_me: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<String>,
+    #[serde(default)]
+    pub is_image: bool,
+    #[serde(default)]
+    pub is_video: bool,
+}
+
+// ============================================================================
+// MESSAGE REQUEST (For creating new messages)
+// ============================================================================
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CreateMessageRequest {
+    pub user_id: String,
+    pub username: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixture_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_public_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_caption: Option<String>,
+    #[serde(default)]
+    pub is_image: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_public_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_thumbnail_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_duration: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_size: Option<i64>,
+    #[serde(default)]
+    pub is_video: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_selection: Option<String>,
+}
+
+// ============================================================================
+// MESSAGE RESPONSE
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MessageResponse {
+    pub id: String,
+    pub channel_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixture_id: Option<String>,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    pub sent_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_public_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_caption: Option<String>,
+    pub is_image: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_public_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_thumbnail_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_duration: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_size: Option<i64>,
+    pub is_video: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyToData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<String>,
+}
+
+impl From<Message> for MessageResponse {
+    fn from(msg: Message) -> Self {
+        MessageResponse {
+            id: msg.id.map(|id| id.to_hex()).unwrap_or_default(),
+            channel_id: msg.channel_id,
+            fixture_id: msg.fixture_id,
+            sender_id: msg.sender_id,
+            sender_name: msg.sender_name,
+            text: msg.text,
+            caption: msg.caption,
+            sent_at: msg.sent_at.to_string(),
+            message_id: msg.message_id,
+            selection: msg.selection,
+            image_url: msg.image_url,
+            image_public_id: msg.image_public_id,
+            image_caption: msg.image_caption,
+            is_image: msg.is_image,
+            video_url: msg.video_url,
+            video_public_id: msg.video_public_id,
+            video_thumbnail_url: msg.video_thumbnail_url,
+            video_caption: msg.video_caption,
+            video_duration: msg.video_duration,
+            video_size: msg.video_size,
+            is_video: msg.is_video,
+            reply_to: msg.reply_to,
+            reply_to_id: msg.reply_to_id,
+        }
+    }
 }
 
 // ============================================================================
@@ -368,4 +527,192 @@ impl ChannelFixture {
             added_at: DateTime::now(),
         }
     }
+}
+
+impl Message {
+    pub fn new(channel_id: String, sender_id: String, sender_name: String, text: String) -> Self {
+        let now = DateTime::now();
+        Self {
+            id: Some(ObjectId::new()),
+            channel_id,
+            fixture_id: None,
+            sender_id,
+            sender_name,
+            text,
+            caption: None,
+            sent_at: now,
+            message_id: None,
+            selection: None,
+            image_url: None,
+            image_public_id: None,
+            image_caption: None,
+            is_image: false,
+            video_url: None,
+            video_public_id: None,
+            video_thumbnail_url: None,
+            video_caption: None,
+            video_duration: None,
+            video_size: None,
+            is_video: false,
+            reply_to: None,
+            reply_to_id: None,
+        }
+    }
+
+    pub fn with_image(
+        channel_id: String,
+        sender_id: String,
+        sender_name: String,
+        text: String,
+        image_url: String,
+        image_public_id: String,
+        caption: Option<String>,
+    ) -> Self {
+        let now = DateTime::now();
+        Self {
+            id: Some(ObjectId::new()),
+            channel_id,
+            fixture_id: None,
+            sender_id,
+            sender_name,
+            text,
+            caption: caption.clone(),
+            sent_at: now,
+            message_id: None,
+            selection: None,
+            image_url: Some(image_url),
+            image_public_id: Some(image_public_id),
+            image_caption: caption,
+            is_image: true,
+            video_url: None,
+            video_public_id: None,
+            video_thumbnail_url: None,
+            video_caption: None,
+            video_duration: None,
+            video_size: None,
+            is_video: false,
+            reply_to: None,
+            reply_to_id: None,
+        }
+    }
+
+    pub fn with_video(
+        channel_id: String,
+        sender_id: String,
+        sender_name: String,
+        text: String,
+        video_url: String,
+        video_public_id: String,
+        video_thumbnail_url: Option<String>,
+        caption: Option<String>,
+        duration: Option<i32>,
+        size: Option<i64>,
+    ) -> Self {
+        let now = DateTime::now();
+        Self {
+            id: Some(ObjectId::new()),
+            channel_id,
+            fixture_id: None,
+            sender_id,
+            sender_name,
+            text,
+            caption: caption.clone(),
+            sent_at: now,
+            message_id: None,
+            selection: None,
+            image_url: None,
+            image_public_id: None,
+            image_caption: None,
+            is_image: false,
+            video_url: Some(video_url),
+            video_public_id: Some(video_public_id),
+            video_thumbnail_url,
+            video_caption: caption,
+            video_duration: duration,
+            video_size: size,
+            is_video: true,
+            reply_to: None,
+            reply_to_id: None,
+        }
+    }
+
+    pub fn with_reply(
+        channel_id: String,
+        sender_id: String,
+        sender_name: String,
+        text: String,
+        reply_to_id: String,
+        reply_to_text: String,
+        reply_to_username: String,
+        reply_to_selection: Option<String>,
+    ) -> Self {
+        let now = DateTime::now();
+        Self {
+            id: Some(ObjectId::new()),
+            channel_id,
+            fixture_id: None,
+            sender_id,
+            sender_name,
+            text,
+            caption: None,
+            sent_at: now,
+            message_id: None,
+            selection: None,
+            image_url: None,
+            image_public_id: None,
+            image_caption: None,
+            is_image: false,
+            video_url: None,
+            video_public_id: None,
+            video_thumbnail_url: None,
+            video_caption: None,
+            video_duration: None,
+            video_size: None,
+            is_video: false,
+            reply_to: Some(ReplyToData {
+                message_id: reply_to_id.clone(), // ✅ Clone here
+                text: reply_to_text,
+                username: reply_to_username,
+                selection: reply_to_selection,
+                is_me: false,
+                image_url: None,
+                video_url: None,
+                is_image: false,
+                is_video: false,
+            }),
+            reply_to_id: Some(reply_to_id), // ✅ Use original here
+        }
+    }
+}
+
+// ============================================================================
+// CHAT MEDIA UPLOAD REQUEST
+// ============================================================================
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatMediaUploadRequest {
+    pub file: Vec<u8>,
+    pub file_name: String,
+    pub mime_type: String,
+    pub media_type: String, // "image" or "video"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+}
+
+// ============================================================================
+// CHAT MEDIA UPLOAD RESPONSE
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatMediaUploadResponse {
+    pub url: String,
+    pub public_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
 }

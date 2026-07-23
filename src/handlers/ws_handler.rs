@@ -1275,37 +1275,42 @@ async fn save_message_to_database(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // ✅ FIXED: Properly parse reply_to from payload
     let reply_to = payload
         .get("replyTo")
         .and_then(|v| v.as_object())
         .map(|obj| {
-            let message_id = obj
+            let reply_to_id = obj
                 .get("messageId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let text = obj
+            let reply_to_text = obj
                 .get("text")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let username = obj
+            let reply_to_username = obj
                 .get("username")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let selection = obj
+            let reply_to_selection = obj
                 .get("selection")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             let is_me = obj.get("isMe").and_then(|v| v.as_bool()).unwrap_or(false);
 
             ReplyToData {
-                message_id,
-                text,
-                username,
-                selection,
-                is_me,
+                message_id: reply_to_id,
+                text: reply_to_text,
+                username: reply_to_username,
+                selection: reply_to_selection,
+                is_me: false,
+                image_url: None,
+                video_url: None,
+                is_image: false,
+                is_video: false,
             }
         });
 
@@ -1319,16 +1324,24 @@ async fn save_message_to_database(
         sender_id: user_id.to_string(),
         sender_name: username.to_string(),
         text,
+        caption: None,
         sent_at: now_bson,
         message_id: Some(message_id),
         selection,
-        image_url,
-        video_url,
+        image_url: image_url.clone(),
+        image_public_id: None,
+        image_caption: None,
         is_image,
+        video_url: video_url.clone(),
+        video_public_id: None,
+        video_thumbnail_url: None,
+        video_caption: None,
+        video_duration: None,
+        video_size: None,
         is_video,
-        reply_to,
+        reply_to: reply_to.clone(),
+        reply_to_id: reply_to.as_ref().map(|r| r.message_id.clone()),
     };
-
     messages_col.insert_one(&message).await?;
 
     if let Some(fixture_id) = fixture_id {
