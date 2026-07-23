@@ -22,7 +22,7 @@ use crate::models::posta::{
 use crate::state::AppState;
 
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
-const MAX_VIDEO_SIZE: u64 = 20 * 1024 * 1024; // 20MB
+const MAX_VIDEO_SIZE: u64 = 50 * 1024 * 1024; // 50MB - ✅ CHANGED to match Flutter
 const ALLOWED_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "gif"];
 const ALLOWED_VIDEO_EXTENSIONS: [&str; 4] = ["mp4", "mov", "avi", "mkv"];
 const DEFAULT_PAGE_SIZE: i64 = 20;
@@ -362,7 +362,7 @@ pub async fn create_post(
                 })?;
 
                 if data.len() as u64 > MAX_VIDEO_SIZE {
-                    return Err(AppError::invalid_data("Video too large (max 20MB)"));
+                    return Err(AppError::invalid_data("Video too large (max 50MB)"));
                 }
 
                 let ext = std::path::Path::new(&file_name)
@@ -425,6 +425,7 @@ pub async fn create_post(
             };
 
             let duration = 0; // Placeholder - implement actual duration extraction
+            let size = video_data.len() as i64;
 
             Post::new_video_post(
                 user_id.clone(),
@@ -433,12 +434,13 @@ pub async fn create_post(
                 firebase_public_id,
                 thumbnail_url,
                 Some(duration),
-                Some(video_data.len() as i64),
+                Some(size),
             )
         }
-        // TEXT + VIDEO
+
+        // TEXT + VIDEO + IMAGE
         (Some(image_data), Some(video_data)) => {
-            // Upload video
+            // Upload video to Firebase
             let ext = video_extension.unwrap_or("mp4".to_string());
             let (video_url, firebase_public_id) = storage_service
                 .upload_video(&video_data, &user_id, &ext)
@@ -456,7 +458,7 @@ pub async fn create_post(
                 None
             };
 
-            // Upload image
+            // Upload image to Cloudinary
             let img_ext = image_extension.unwrap_or("jpg".to_string());
             let public_id = format!("post_{}_{}", user_id, Uuid::new_v4());
             let upload_path = format!("fanclash/posts/{}", user_id);
@@ -472,19 +474,41 @@ pub async fn create_post(
                     .map_err(|e| AppError::invalid_data(format!("Image upload failed: {}", e)))?,
             };
 
+            // ✅ Upload image to Firebase as well
+            let (firebase_image_url, firebase_image_public_id) = storage_service
+                .upload_image(&image_data, &user_id, &img_ext)
+                .await
+                .ok()
+                .map(|(url, public_id)| (Some(url), Some(public_id)))
+                .unwrap_or((None, None));
+
             let duration = 0;
+            let size = video_data.len() as i64;
 
             // Create post with both image and video
-            Post::new_text_image_post(
+            // Use new_text_video_post but also store image data
+            let mut post = Post::new_text_video_post(
                 user_id.clone(),
                 user_name.clone(),
-                caption.unwrap_or_else(|| "".to_string()),
-                image_url,
-                cloudinary_public_id,
-                img_ext,
-            )
+                caption.clone().unwrap_or_default(),
+                video_url,
+                firebase_public_id,
+                thumbnail_url,
+                Some(duration),
+                Some(size),
+            );
+
+            // Add image data to the post
+            post.image_url = Some(image_url);
+            post.cloudinary_public_id = Some(cloudinary_public_id);
+            post.image_format = Some(img_ext);
+            post.firebase_image_url = firebase_image_url;
+            post.firebase_image_public_id = firebase_image_public_id;
+
+            post
         }
-        // IMAGE ONLY (Cloudinary)
+
+        // IMAGE ONLY (Cloudinary + Firebase)
         (Some(image_data), None) => {
             let ext = image_extension.unwrap_or("jpg".to_string());
             let public_id = format!("post_{}_{}", user_id, Uuid::new_v4());
@@ -501,6 +525,14 @@ pub async fn create_post(
                     .map_err(|e| AppError::invalid_data(format!("Image upload failed: {}", e)))?,
             };
 
+            // ✅ Upload image to Firebase as well
+            let (firebase_image_url, firebase_image_public_id) = storage_service
+                .upload_image(&image_data, &user_id, &ext)
+                .await
+                .ok()
+                .map(|(url, public_id)| (Some(url), Some(public_id)))
+                .unwrap_or((None, None));
+
             match caption {
                 Some(caption_text) => Post::new_text_image_post(
                     user_id.clone(),
@@ -509,6 +541,8 @@ pub async fn create_post(
                     image_url,
                     cloudinary_public_id,
                     ext,
+                    firebase_image_url,
+                    firebase_image_public_id,
                 ),
                 None => Post::new_image_post(
                     user_id.clone(),
@@ -516,9 +550,12 @@ pub async fn create_post(
                     image_url,
                     cloudinary_public_id,
                     ext,
+                    firebase_image_url,
+                    firebase_image_public_id,
                 ),
             }
         }
+
         // TEXT ONLY
         (None, None) => Post::new_text_post(
             user_id.clone(),
@@ -779,16 +816,18 @@ pub async fn delete_post(
     // Delete image from Cloudinary if exists
     if post.has_image() {
         let cloudinary_service = &state.cloudinary;
-        // ✅ FIX: Use "ref" to borrow instead of move
         if let Some(ref public_id) = post.cloudinary_public_id {
             let _ = cloudinary_service.delete_image(public_id).await;
+        }
+        // Also delete from Firebase if exists
+        if let Some(ref public_id) = post.firebase_image_public_id {
+            let _ = state.storage_service.delete_file(public_id).await;
         }
     }
 
     // Delete video from Firebase Storage if exists
     if post.has_video() {
         let storage_service = &state.storage_service;
-        // ✅ FIX: Use "ref" to borrow instead of move
         if let Some(ref public_id) = post.firebase_public_id {
             let _ = storage_service.delete_file(public_id).await;
         }
@@ -806,6 +845,7 @@ pub async fn delete_post(
         "post_id": post_id
     })))
 }
+
 // ========== LIKE POST ==========
 pub async fn like_post(
     State(state): State<AppState>,
@@ -1047,7 +1087,6 @@ pub async fn create_comment(
 
                 let all_user_ids = get_all_user_ids(&state_clone, Some(&payload.user_id)).await;
 
-                // ✅ FIX: comment_preview is cloned here once
                 let comment_preview = if comment_text.len() > 100 {
                     format!("{}...", &comment_text[0..100])
                 } else {
@@ -1074,7 +1113,6 @@ pub async fn create_comment(
                         )
                     };
 
-                    // ✅ FIX: Use &comment_preview (reference) in json! macro
                     let _ = fcm_service
                         .send_to_multiple_users(
                             &state_clone,
@@ -1086,7 +1124,7 @@ pub async fn create_comment(
                                 "comment_id": comment_id_hex,
                                 "commenter_id": payload.user_id,
                                 "commenter_name": commenter_name,
-                                "comment_preview": &comment_preview,  // ✅ Reference
+                                "comment_preview": &comment_preview,
                                 "parent_comment_id": parent_comment_id,
                                 "parent_author_id": parent_author_id,
                                 "is_reply": parent_comment_id.is_some(),
@@ -1101,19 +1139,18 @@ pub async fn create_comment(
                 // Send specific notification to parent comment author if reply
                 if let Some(parent_author_id) = parent_author_id {
                     if parent_author_id != payload.user_id {
-                        // ✅ FIX: Use &comment_preview (reference)
                         let _ = fcm_service
                             .send_to_user(
                                 &state_clone,
                                 &parent_author_id,
                                 &format!("💬 {} replied to your comment", commenter_name),
-                                &comment_preview, // ✅ Reference
+                                &comment_preview,
                                 serde_json::json!({
                                     "post_id": post_id_clone,
                                     "comment_id": comment_id_hex,
                                     "commenter_id": payload.user_id,
                                     "commenter_name": commenter_name,
-                                    "comment_preview": &comment_preview,  // ✅ Reference
+                                    "comment_preview": &comment_preview,
                                     "parent_comment_id": parent_comment_id,
                                     "type": "comment_reply",
                                     "timestamp": Utc::now().to_rfc3339(),
@@ -1542,6 +1579,11 @@ pub async fn delete_posts_by_user(
             if let Some(public_id) = &post.cloudinary_public_id {
                 let _ = cloudinary_service.delete_image(public_id).await;
                 deleted_from_cloudinary += 1;
+            }
+            // Also delete Firebase image if exists
+            if let Some(public_id) = &post.firebase_image_public_id {
+                let _ = storage_service.delete_file(public_id).await;
+                deleted_from_firebase += 1;
             }
         }
         if post.has_video() {

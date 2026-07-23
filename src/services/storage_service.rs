@@ -28,6 +28,9 @@ impl StorageService {
         })
     }
 
+    // ============================================================================
+    // VIDEO UPLOAD
+    // ============================================================================
     pub async fn upload_video(
         &self,
         data: &[u8],
@@ -54,13 +57,13 @@ impl StorageService {
             .body(data.to_vec())
             .send()
             .await
-            .map_err(|e| AppError::InternalServerError(format!("Upload failed: {}", e)))?;
+            .map_err(|e| AppError::InternalServerError(format!("Video upload failed: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             return Err(AppError::InternalServerError(format!(
-                "Upload failed: {} - {}",
+                "Video upload failed: {} - {}",
                 status, text
             )));
         }
@@ -71,6 +74,55 @@ impl StorageService {
         Ok((download_url, public_id))
     }
 
+    // ============================================================================
+    // IMAGE UPLOAD (NEW)
+    // ============================================================================
+    pub async fn upload_image(
+        &self,
+        data: &[u8],
+        user_id: &str,
+        file_extension: &str,
+    ) -> Result<(String, String), AppError> {
+        let filename = format!(
+            "images/{}/{}_{}",
+            user_id,
+            Uuid::new_v4(),
+            Utc::now().timestamp()
+        );
+        let path = format!("{}.{}", filename, file_extension);
+
+        let url = format!(
+            "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?uploadType=media&key={}",
+            self.bucket_name, &path, self.api_key
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .body(data.to_vec())
+            .send()
+            .await
+            .map_err(|e| AppError::InternalServerError(format!("Image upload failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(AppError::InternalServerError(format!(
+                "Image upload failed: {} - {}",
+                status, text
+            )));
+        }
+
+        let download_url = self.get_download_url(&path).await?;
+        let public_id: String = path;
+
+        Ok((download_url, public_id))
+    }
+
+    // ============================================================================
+    // THUMBNAIL UPLOAD
+    // ============================================================================
     pub async fn upload_thumbnail(&self, data: &[u8], user_id: &str) -> Result<String, AppError> {
         let path = format!("videos/{}/thumb_{}", user_id, Uuid::new_v4());
 
@@ -91,15 +143,21 @@ impl StorageService {
             })?;
 
         if !response.status().is_success() {
-            return Err(AppError::InternalServerError(
-                "Thumbnail upload failed".to_string(),
-            ));
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(AppError::InternalServerError(format!(
+                "Thumbnail upload failed: {} - {}",
+                status, text
+            )));
         }
 
         let download_url = self.get_download_url(&path).await?;
         Ok(download_url)
     }
 
+    // ============================================================================
+    // GET DOWNLOAD URL
+    // ============================================================================
     pub async fn get_download_url(&self, path: &str) -> Result<String, AppError> {
         let url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?alt=media&key={}",
@@ -108,6 +166,9 @@ impl StorageService {
         Ok(url)
     }
 
+    // ============================================================================
+    // DELETE FILE
+    // ============================================================================
     pub async fn delete_file(&self, public_id: &str) -> Result<(), AppError> {
         let url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?key={}",
@@ -122,7 +183,12 @@ impl StorageService {
             .map_err(|e| AppError::InternalServerError(format!("Delete failed: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(AppError::InternalServerError("Delete failed".to_string()));
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(AppError::InternalServerError(format!(
+                "Delete failed: {} - {}",
+                status, text
+            )));
         }
 
         Ok(())

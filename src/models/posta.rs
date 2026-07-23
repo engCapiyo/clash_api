@@ -20,6 +20,10 @@ pub struct Post {
     pub cloudinary_public_id: Option<String>,
     pub image_format: Option<String>,
 
+    // ✅ NEW: Image (Firebase Storage) - for backup/storage
+    pub firebase_image_url: Option<String>,
+    pub firebase_image_public_id: Option<String>,
+
     // Video (Firebase Storage)
     pub video_url: Option<String>,
     pub video_thumbnail_url: Option<String>,
@@ -65,6 +69,8 @@ impl Post {
             image_url: None,
             cloudinary_public_id: None,
             image_format: None,
+            firebase_image_url: None,
+            firebase_image_public_id: None,
             video_url: None,
             video_thumbnail_url: None,
             video_duration: None,
@@ -88,6 +94,8 @@ impl Post {
         image_url: String,
         cloudinary_public_id: String,
         image_format: String,
+        firebase_image_url: Option<String>,
+        firebase_image_public_id: Option<String>,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -98,6 +106,8 @@ impl Post {
             image_url: Some(image_url),
             cloudinary_public_id: Some(cloudinary_public_id),
             image_format: Some(image_format),
+            firebase_image_url,
+            firebase_image_public_id,
             video_url: None,
             video_thumbnail_url: None,
             video_duration: None,
@@ -122,6 +132,8 @@ impl Post {
         image_url: String,
         cloudinary_public_id: String,
         image_format: String,
+        firebase_image_url: Option<String>,
+        firebase_image_public_id: Option<String>,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -132,6 +144,8 @@ impl Post {
             image_url: Some(image_url),
             cloudinary_public_id: Some(cloudinary_public_id),
             image_format: Some(image_format),
+            firebase_image_url,
+            firebase_image_public_id,
             video_url: None,
             video_thumbnail_url: None,
             video_duration: None,
@@ -167,6 +181,8 @@ impl Post {
             image_url: None,
             cloudinary_public_id: None,
             image_format: None,
+            firebase_image_url: None,
+            firebase_image_public_id: None,
             video_url: Some(video_url),
             video_thumbnail_url,
             video_duration,
@@ -203,6 +219,8 @@ impl Post {
             image_url: None,
             cloudinary_public_id: None,
             image_format: None,
+            firebase_image_url: None,
+            firebase_image_public_id: None,
             video_url: Some(video_url),
             video_thumbnail_url,
             video_duration,
@@ -315,6 +333,8 @@ pub struct PostResponse {
     pub image_url: Option<String>,
     pub cloudinary_public_id: Option<String>,
     pub image_format: Option<String>,
+    pub firebase_image_url: Option<String>,
+    pub firebase_image_public_id: Option<String>,
     pub video_url: Option<String>,
     pub video_thumbnail_url: Option<String>,
     pub video_duration: Option<i32>,
@@ -350,6 +370,8 @@ impl From<Post> for PostResponse {
             image_url: post.image_url,
             cloudinary_public_id: post.cloudinary_public_id,
             image_format: post.image_format,
+            firebase_image_url: post.firebase_image_url,
+            firebase_image_public_id: post.firebase_image_public_id,
             video_url: post.video_url,
             video_thumbnail_url: post.video_thumbnail_url,
             video_duration: post.video_duration,
