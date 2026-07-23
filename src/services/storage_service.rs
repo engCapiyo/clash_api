@@ -22,11 +22,11 @@ impl StorageService {
         let api_key = env::var("FIREBASE_API_KEY")
             .map_err(|_| AppError::InternalServerError("FIREBASE_API_KEY not set".to_string()))?;
 
-        // Without an explicit timeout, reqwest will wait indefinitely on a
-        // stalled connection — no error, no log, just a hang. This bounds
-        // every request so failures surface instead of disappearing.
+        // Without an explicit timeout, reqwest waits indefinitely on a stalled
+        // connection — no error, no log, just a hang. This bounds every
+        // request so failures surface instead of disappearing silently.
         let client = Client::builder()
-            .timeout(Duration::from_secs(60)) // whole request, covers large video bodies
+            .timeout(Duration::from_secs(60)) // covers large video bodies
             .connect_timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| {
@@ -60,8 +60,11 @@ impl StorageService {
         let path = format!("{}.{}", filename, file_extension);
         let encoded_path = urlencoding::encode(&path);
 
+        // Firebase Storage's own REST API (v0) — no `uploadType` param.
+        // That param belongs to the raw GCS JSON API and mixing conventions
+        // causes "Invalid HTTP method/URL pair." on this host.
         let url = format!(
-            "https://firebasestorage.googleapis.com/v0/b/{}/o?uploadType=media&name={}&key={}",
+            "https://firebasestorage.googleapis.com/v0/b/{}/o?name={}&key={}",
             self.bucket_name, encoded_path, self.api_key
         );
 
@@ -71,10 +74,17 @@ impl StorageService {
             data.len()
         );
 
+        let content_type = match file_extension.to_lowercase().as_str() {
+            "mov" => "video/quicktime",
+            "avi" => "video/x-msvideo",
+            "mkv" => "video/x-matroska",
+            _ => "video/mp4",
+        };
+
         let response = self
             .client
             .post(&url)
-            .header("Content-Type", "application/octet-stream")
+            .header("Content-Type", content_type)
             .body(data.to_vec())
             .send()
             .await
@@ -98,7 +108,7 @@ impl StorageService {
             )));
         }
 
-        let response_json: serde_json::Value = response.json().await.map_err(|e| {
+        let _response_json: serde_json::Value = response.json().await.map_err(|e| {
             eprintln!("❌ [upload_video] Failed to parse response JSON: {}", e);
             AppError::InternalServerError(format!("Failed to parse response: {}", e))
         })?;
@@ -109,10 +119,6 @@ impl StorageService {
         );
 
         println!("✅ [upload_video] Upload complete: {}", download_url);
-
-        // mediaLink from the response is an alternative if you need the raw GCS link;
-        // the constructed Firebase-style URL above works for public-read objects.
-        let _ = response_json; // keep for future use / debugging if needed
 
         Ok((download_url, path))
     }
@@ -136,7 +142,7 @@ impl StorageService {
         let encoded_path = urlencoding::encode(&path);
 
         let url = format!(
-            "https://firebasestorage.googleapis.com/v0/b/{}/o?uploadType=media&name={}&key={}",
+            "https://firebasestorage.googleapis.com/v0/b/{}/o?name={}&key={}",
             self.bucket_name, encoded_path, self.api_key
         );
 
@@ -146,10 +152,16 @@ impl StorageService {
             data.len()
         );
 
+        let content_type = match file_extension.to_lowercase().as_str() {
+            "png" => "image/png",
+            "gif" => "image/gif",
+            _ => "image/jpeg",
+        };
+
         let response = self
             .client
             .post(&url)
-            .header("Content-Type", "application/octet-stream")
+            .header("Content-Type", content_type)
             .body(data.to_vec())
             .send()
             .await
@@ -173,11 +185,10 @@ impl StorageService {
             )));
         }
 
-        let response_json: serde_json::Value = response.json().await.map_err(|e| {
+        let _response_json: serde_json::Value = response.json().await.map_err(|e| {
             eprintln!("❌ [upload_image] Failed to parse response JSON: {}", e);
             AppError::InternalServerError(format!("Failed to parse response: {}", e))
         })?;
-        let _ = response_json;
 
         let download_url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?alt=media",
@@ -193,11 +204,13 @@ impl StorageService {
     // THUMBNAIL UPLOAD
     // ============================================================================
     pub async fn upload_thumbnail(&self, data: &[u8], user_id: &str) -> Result<String, AppError> {
-        let path = format!("videos/{}/thumb_{}", user_id, Uuid::new_v4());
+        // Kept under videos/ with a thumb_ prefix to match the Storage Rules
+        // that use fileName.matches('thumb_.*') to allow image content here.
+        let path = format!("videos/{}/thumb_{}.jpg", user_id, Uuid::new_v4());
         let encoded_path = urlencoding::encode(&path);
 
         let url = format!(
-            "https://firebasestorage.googleapis.com/v0/b/{}/o?uploadType=media&name={}&key={}",
+            "https://firebasestorage.googleapis.com/v0/b/{}/o?name={}&key={}",
             self.bucket_name, encoded_path, self.api_key
         );
 
@@ -234,11 +247,10 @@ impl StorageService {
             )));
         }
 
-        let response_json: serde_json::Value = response.json().await.map_err(|e| {
+        let _response_json: serde_json::Value = response.json().await.map_err(|e| {
             eprintln!("❌ [upload_thumbnail] Failed to parse response JSON: {}", e);
             AppError::InternalServerError(format!("Failed to parse response: {}", e))
         })?;
-        let _ = response_json;
 
         let download_url = format!(
             "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?alt=media",
