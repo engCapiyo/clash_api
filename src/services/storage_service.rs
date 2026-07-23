@@ -1,6 +1,7 @@
 use chrono::Utc;
 use reqwest::Client;
 use std::env;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::errors::AppError;
@@ -21,10 +22,21 @@ impl StorageService {
         let api_key = env::var("FIREBASE_API_KEY")
             .map_err(|_| AppError::InternalServerError("FIREBASE_API_KEY not set".to_string()))?;
 
+        // Without an explicit timeout, reqwest will wait indefinitely on a
+        // stalled connection — no error, no log, just a hang. This bounds
+        // every request so failures surface instead of disappearing.
+        let client = Client::builder()
+            .timeout(Duration::from_secs(60)) // whole request, covers large video bodies
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| {
+                AppError::InternalServerError(format!("Failed to build HTTP client: {}", e))
+            })?;
+
         println!("✅ StorageService initialized with bucket: {}", bucket_name);
 
         Ok(Self {
-            client: Client::new(),
+            client,
             bucket_name,
             api_key,
         })
@@ -49,8 +61,14 @@ impl StorageService {
         let encoded_path = urlencoding::encode(&path);
 
         let url = format!(
-            "https://firebasestorage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&key={}&name={}",
-            self.bucket_name, self.api_key, encoded_path
+            "https://firebasestorage.googleapis.com/v0/b/{}/o?uploadType=media&name={}&key={}",
+            self.bucket_name, encoded_path, self.api_key
+        );
+
+        println!(
+            "🔍 [upload_video] Starting upload: path={}, size={} bytes",
+            path,
+            data.len()
         );
 
         let response = self
@@ -60,11 +78,20 @@ impl StorageService {
             .body(data.to_vec())
             .send()
             .await
-            .map_err(|e| AppError::InternalServerError(format!("Video upload failed: {}", e)))?;
+            .map_err(|e| {
+                eprintln!("❌ [upload_video] Request failed: {}", e);
+                AppError::InternalServerError(format!("Video upload failed: {}", e))
+            })?;
+
+        println!(
+            "🔍 [upload_video] Response received, status: {}",
+            response.status()
+        );
 
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
+            eprintln!("❌ [upload_video] Upload failed: {} - {}", status, text);
             return Err(AppError::InternalServerError(format!(
                 "Video upload failed: {} - {}",
                 status, text
@@ -72,13 +99,20 @@ impl StorageService {
         }
 
         let response_json: serde_json::Value = response.json().await.map_err(|e| {
+            eprintln!("❌ [upload_video] Failed to parse response JSON: {}", e);
             AppError::InternalServerError(format!("Failed to parse response: {}", e))
         })?;
 
-        let download_url = response_json["mediaLink"]
-            .as_str()
-            .ok_or_else(|| AppError::InternalServerError("No mediaLink in response".to_string()))?
-            .to_string();
+        let download_url = format!(
+            "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?alt=media",
+            self.bucket_name, encoded_path
+        );
+
+        println!("✅ [upload_video] Upload complete: {}", download_url);
+
+        // mediaLink from the response is an alternative if you need the raw GCS link;
+        // the constructed Firebase-style URL above works for public-read objects.
+        let _ = response_json; // keep for future use / debugging if needed
 
         Ok((download_url, path))
     }
@@ -102,8 +136,14 @@ impl StorageService {
         let encoded_path = urlencoding::encode(&path);
 
         let url = format!(
-            "https://firebasestorage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&key={}&name={}",
-            self.bucket_name, self.api_key, encoded_path
+            "https://firebasestorage.googleapis.com/v0/b/{}/o?uploadType=media&name={}&key={}",
+            self.bucket_name, encoded_path, self.api_key
+        );
+
+        println!(
+            "🔍 [upload_image] Starting upload: path={}, size={} bytes",
+            path,
+            data.len()
         );
 
         let response = self
@@ -113,11 +153,20 @@ impl StorageService {
             .body(data.to_vec())
             .send()
             .await
-            .map_err(|e| AppError::InternalServerError(format!("Image upload failed: {}", e)))?;
+            .map_err(|e| {
+                eprintln!("❌ [upload_image] Request failed: {}", e);
+                AppError::InternalServerError(format!("Image upload failed: {}", e))
+            })?;
+
+        println!(
+            "🔍 [upload_image] Response received, status: {}",
+            response.status()
+        );
 
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
+            eprintln!("❌ [upload_image] Upload failed: {} - {}", status, text);
             return Err(AppError::InternalServerError(format!(
                 "Image upload failed: {} - {}",
                 status, text
@@ -125,13 +174,17 @@ impl StorageService {
         }
 
         let response_json: serde_json::Value = response.json().await.map_err(|e| {
+            eprintln!("❌ [upload_image] Failed to parse response JSON: {}", e);
             AppError::InternalServerError(format!("Failed to parse response: {}", e))
         })?;
+        let _ = response_json;
 
-        let download_url = response_json["mediaLink"]
-            .as_str()
-            .ok_or_else(|| AppError::InternalServerError("No mediaLink in response".to_string()))?
-            .to_string();
+        let download_url = format!(
+            "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?alt=media",
+            self.bucket_name, encoded_path
+        );
+
+        println!("✅ [upload_image] Upload complete: {}", download_url);
 
         Ok((download_url, path))
     }
@@ -144,8 +197,14 @@ impl StorageService {
         let encoded_path = urlencoding::encode(&path);
 
         let url = format!(
-            "https://firebasestorage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&key={}&name={}",
-            self.bucket_name, self.api_key, encoded_path
+            "https://firebasestorage.googleapis.com/v0/b/{}/o?uploadType=media&name={}&key={}",
+            self.bucket_name, encoded_path, self.api_key
+        );
+
+        println!(
+            "🔍 [upload_thumbnail] Starting upload: path={}, size={} bytes",
+            path,
+            data.len()
         );
 
         let response = self
@@ -156,12 +215,19 @@ impl StorageService {
             .send()
             .await
             .map_err(|e| {
+                eprintln!("❌ [upload_thumbnail] Request failed: {}", e);
                 AppError::InternalServerError(format!("Thumbnail upload failed: {}", e))
             })?;
+
+        println!(
+            "🔍 [upload_thumbnail] Response received, status: {}",
+            response.status()
+        );
 
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
+            eprintln!("❌ [upload_thumbnail] Upload failed: {} - {}", status, text);
             return Err(AppError::InternalServerError(format!(
                 "Thumbnail upload failed: {} - {}",
                 status, text
@@ -169,13 +235,17 @@ impl StorageService {
         }
 
         let response_json: serde_json::Value = response.json().await.map_err(|e| {
+            eprintln!("❌ [upload_thumbnail] Failed to parse response JSON: {}", e);
             AppError::InternalServerError(format!("Failed to parse response: {}", e))
         })?;
+        let _ = response_json;
 
-        let download_url = response_json["mediaLink"]
-            .as_str()
-            .ok_or_else(|| AppError::InternalServerError("No mediaLink in response".to_string()))?
-            .to_string();
+        let download_url = format!(
+            "https://firebasestorage.googleapis.com/v0/b/{}/o/{}?alt=media",
+            self.bucket_name, encoded_path
+        );
+
+        println!("✅ [upload_thumbnail] Upload complete: {}", download_url);
 
         Ok(download_url)
     }
@@ -202,21 +272,29 @@ impl StorageService {
             self.bucket_name, encoded_id, self.api_key
         );
 
-        let response = self
-            .client
-            .delete(&url)
-            .send()
-            .await
-            .map_err(|e| AppError::InternalServerError(format!("Delete failed: {}", e)))?;
+        println!("🔍 [delete_file] Deleting: {}", public_id);
+
+        let response = self.client.delete(&url).send().await.map_err(|e| {
+            eprintln!("❌ [delete_file] Request failed: {}", e);
+            AppError::InternalServerError(format!("Delete failed: {}", e))
+        })?;
+
+        println!(
+            "🔍 [delete_file] Response received, status: {}",
+            response.status()
+        );
 
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
+            eprintln!("❌ [delete_file] Delete failed: {} - {}", status, text);
             return Err(AppError::InternalServerError(format!(
                 "Delete failed: {} - {}",
                 status, text
             )));
         }
+
+        println!("✅ [delete_file] Deleted: {}", public_id);
 
         Ok(())
     }
