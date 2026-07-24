@@ -1,4 +1,5 @@
 use axum::{
+    extract::DefaultBodyLimit, // ✅ add this
     routing::{delete, get, post, put},
     Router,
 };
@@ -54,7 +55,7 @@ use crate::handlers::channel::{
     // ✅ Like handlers
     toggle_like_handler,
     // ✅ Chat media upload
-    upload_chat_media_handler, // ✅ ADD THIS
+    upload_chat_media_handler,
 };
 use crate::handlers::ws_handler::ws_comments_handler;
 use crate::AppState;
@@ -123,9 +124,10 @@ pub fn channel_routes() -> Router<AppState> {
         // ====================================================================
         // ✅ CHAT MEDIA UPLOAD
         // ====================================================================
-        //.route("/media/upload/:user_id", post(upload_chat_media_handler))
-        // In routes/channel.rs
-        .route("/media/upload", post(upload_chat_media_handler))
+        .route(
+            "/media/upload",
+            post(upload_chat_media_handler).layer(DefaultBodyLimit::max(60 * 1024 * 1024)), // ✅ 60MB, matches video cap
+        )
         // ====================================================================
         // MESSAGES - FULL CRUD WITH CAPTION & MEDIA SUPPORT
         // ====================================================================
