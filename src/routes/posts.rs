@@ -1,4 +1,5 @@
 use axum::{
+    extract::DefaultBodyLimit, // ✅ add this
     routing::{delete, get, post, put},
     Router,
 };
@@ -12,7 +13,7 @@ pub fn routes() -> Router<AppState> {
         .route("/", get(posta::get_posts))
         .route(
             "/",
-            post(create_post).layer(DefaultBodyLimit::max(60 * 1024 * 1024)),
+            post(posta::create_post).layer(DefaultBodyLimit::max(60 * 1024 * 1024)), // ✅ add posta:: prefix
         )
         .route("/search", get(posta::search_posts))
         .route("/stats", get(posta::get_post_stats))
