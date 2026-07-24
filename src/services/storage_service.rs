@@ -1,8 +1,7 @@
 use chrono::Utc;
-use gcp_auth::{AuthenticationManager, CustomServiceAccount};
+use gcp_auth::{CustomServiceAccount, TokenProvider};
 use reqwest::Client;
 use std::env;
-use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -14,7 +13,7 @@ const STORAGE_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_wri
 pub struct StorageService {
     pub client: Client,
     pub bucket_name: String,
-    pub auth: Arc<AuthenticationManager>,
+    pub service_account: std::sync::Arc<CustomServiceAccount>,
 }
 
 impl StorageService {
@@ -25,20 +24,19 @@ impl StorageService {
 
         // Read the service account JSON directly from an env var (pasted as
         // its value on Render) instead of expecting a mounted file path.
-        // No API key involved — auth is via OAuth2 Bearer token, which is
-        // what the real GCS JSON API expects.
         let credentials_json = env::var("GOOGLE_SERVICE_ACCOUNT_JSON").map_err(|_| {
             AppError::InternalServerError("GOOGLE_SERVICE_ACCOUNT_JSON not set".to_string())
         })?;
 
+        // CustomServiceAccount implements TokenProvider directly in current
+        // gcp_auth versions — there is no separate AuthenticationManager
+        // wrapper anymore, that API was removed.
         let service_account = CustomServiceAccount::from_json(&credentials_json).map_err(|e| {
             AppError::InternalServerError(format!(
                 "Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON: {}",
                 e
             ))
         })?;
-
-        let auth = AuthenticationManager::from(service_account);
 
         let client = Client::builder()
             .timeout(Duration::from_secs(60))
@@ -56,15 +54,19 @@ impl StorageService {
         Ok(Self {
             client,
             bucket_name,
-            auth: Arc::new(auth),
+            service_account: std::sync::Arc::new(service_account),
         })
     }
 
     async fn access_token(&self) -> Result<String, AppError> {
-        let token = self.auth.get_token(&[STORAGE_SCOPE]).await.map_err(|e| {
-            eprintln!("❌ Failed to get GCP access token: {}", e);
-            AppError::InternalServerError(format!("Failed to get access token: {}", e))
-        })?;
+        let token = self
+            .service_account
+            .token(&[STORAGE_SCOPE])
+            .await
+            .map_err(|e| {
+                eprintln!("❌ Failed to get GCP access token: {}", e);
+                AppError::InternalServerError(format!("Failed to get access token: {}", e))
+            })?;
         Ok(token.as_str().to_string())
     }
 
@@ -95,9 +97,9 @@ impl StorageService {
         let encoded_path = urlencoding::encode(path);
         let token = self.access_token().await?;
 
-        // Real GCS JSON API "simple upload" endpoint. This is IAM-authenticated
-        // (via the Bearer token), so it bypasses Firebase Storage Rules and
-        // Firebase's client-SDK-only resumable upload protocol entirely.
+        // Real GCS JSON API "simple upload" endpoint. IAM-authenticated via
+        // the Bearer token — bypasses Firebase Storage Rules and Firebase's
+        // client-SDK-only resumable upload protocol entirely.
         let url = format!(
             "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=media&name={}&predefinedAcl=publicRead",
             self.bucket_name, encoded_path

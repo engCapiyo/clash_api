@@ -51,7 +51,9 @@ async fn create_directories() {
 
 async fn initialize_app_state(client: mongodb::Client, db: mongodb::Database) -> AppState {
     // Initialize AppState - no more JWT secret or SMS config needed
-    let mut app_state = match AppState::new(client, db) {
+    // ⚠️ AppState::new is now async (StorageService::new fetches a GCP
+    // token at construction time), so this must be awaited.
+    let mut app_state = match AppState::new(client, db).await {
         Ok(state) => {
             tracing::info!("✅ AppState initialized successfully");
             state
