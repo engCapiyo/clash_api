@@ -46,6 +46,10 @@ fn calculate_points(selection: &str, result: &str) -> i32 {
 // CHAT MEDIA UPLOAD HANDLER - ✅ FIXED
 // ============================================================================
 
+// ============================================================================
+// CHAT MEDIA UPLOAD HANDLER - ✅ FIXED (userId now comes from form data, not path)
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct ChatMediaUploadRequest {
     pub caption: Option<String>,
@@ -53,14 +57,14 @@ pub struct ChatMediaUploadRequest {
 
 pub async fn upload_chat_media_handler(
     State(state): State<AppState>,
-    Path(user_id): Path<String>, // ✅ Path extractor
-    mut multipart: Multipart,
+    mut multipart: Multipart, // ✅ No more Path<String> extractor
 ) -> Result<Json<serde_json::Value>> {
     let mut caption: Option<String> = None;
     let mut file_data: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
     let mut mime_type: Option<String> = None;
     let mut thumbnail_data: Option<Vec<u8>> = None;
+    let mut user_id: Option<String> = None; // ✅ now read from form data
 
     while let Some(field) = multipart
         .next_field()
@@ -70,6 +74,12 @@ pub async fn upload_chat_media_handler(
         let field_name = field.name().unwrap_or("").to_string();
 
         match field_name.as_str() {
+            "userId" => {
+                user_id =
+                    Some(field.text().await.map_err(|e| {
+                        AppError::Multipart(format!("Failed to read userId: {}", e))
+                    })?);
+            }
             "caption" => {
                 caption =
                     Some(field.text().await.map_err(|e| {
@@ -78,7 +88,6 @@ pub async fn upload_chat_media_handler(
             }
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
-                // ✅ Get content_type BEFORE moving field with bytes()
                 mime_type = field.content_type().map(|s| s.to_string());
                 file_data = Some(
                     field
@@ -105,12 +114,15 @@ pub async fn upload_chat_media_handler(
         }
     }
 
-    let file_data = file_data.ok_or(AppError::ValidationError("No file provided".to_string()))?;
-    let file_name = file_name.ok_or(AppError::ValidationError("No file name".to_string()))?;
+    let user_id =
+        user_id.ok_or_else(|| AppError::ValidationError("userId is required".to_string()))?;
 
-    if user_id.is_empty() {
+    if user_id.trim().is_empty() {
         return Err(AppError::ValidationError("User ID is required".to_string()));
     }
+
+    let file_data = file_data.ok_or(AppError::ValidationError("No file provided".to_string()))?;
+    let file_name = file_name.ok_or(AppError::ValidationError("No file name".to_string()))?;
 
     let ext = std::path::Path::new(&file_name)
         .extension()

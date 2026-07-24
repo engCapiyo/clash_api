@@ -10,7 +10,10 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         // Post routes - root level
         .route("/", get(posta::get_posts))
-        .route("/", post(posta::create_post))
+        .route(
+            "/",
+            post(create_post).layer(DefaultBodyLimit::max(60 * 1024 * 1024)),
+        )
         .route("/search", get(posta::search_posts))
         .route("/stats", get(posta::get_post_stats))
         // Post-specific routes
