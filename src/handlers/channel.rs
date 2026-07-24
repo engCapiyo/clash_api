@@ -57,46 +57,70 @@ pub struct ChatMediaUploadRequest {
 
 pub async fn upload_chat_media_handler(
     State(state): State<AppState>,
-    mut multipart: Multipart, // ✅ No more Path<String> extractor
+    mut multipart: Multipart,
 ) -> Result<Json<serde_json::Value>> {
+    let request_id = uuid::Uuid::new_v4();
+    println!("🔍 [{}] upload_chat_media_handler called", request_id);
+
     let mut caption: Option<String> = None;
     let mut file_data: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
     let mut mime_type: Option<String> = None;
     let mut thumbnail_data: Option<Vec<u8>> = None;
-    let mut user_id: Option<String> = None; // ✅ now read from form data
+    let mut user_id: Option<String> = None;
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| AppError::Multipart(format!("Failed to read multipart field: {}", e)))?
-    {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("❌ [{}] Failed to read multipart field: {}", request_id, e);
+                return Err(AppError::Multipart(format!(
+                    "Failed to read multipart field: {}",
+                    e
+                )));
+            }
+        };
+
         let field_name = field.name().unwrap_or("").to_string();
+        println!("🔍 [{}] Processing field: {}", request_id, field_name);
 
         match field_name.as_str() {
             "userId" => {
-                user_id =
-                    Some(field.text().await.map_err(|e| {
-                        AppError::Multipart(format!("Failed to read userId: {}", e))
-                    })?);
+                user_id = Some(field.text().await.map_err(|e| {
+                    eprintln!("❌ [{}] Failed to read userId: {}", request_id, e);
+                    AppError::Multipart(format!("Failed to read userId: {}", e))
+                })?);
+                println!("🔍 [{}] userId: {:?}", request_id, user_id);
             }
             "caption" => {
-                caption =
-                    Some(field.text().await.map_err(|e| {
-                        AppError::Multipart(format!("Failed to read caption: {}", e))
-                    })?);
+                caption = Some(field.text().await.map_err(|e| {
+                    eprintln!("❌ [{}] Failed to read caption: {}", request_id, e);
+                    AppError::Multipart(format!("Failed to read caption: {}", e))
+                })?);
+                println!("🔍 [{}] caption: {:?}", request_id, caption);
             }
             "file" => {
                 file_name = field.file_name().map(|s| s.to_string());
                 mime_type = field.content_type().map(|s| s.to_string());
+                println!(
+                    "🔍 [{}] file field: file_name={:?}, mime_type={:?}",
+                    request_id, file_name, mime_type
+                );
                 file_data = Some(
                     field
                         .bytes()
                         .await
                         .map_err(|e| {
+                            eprintln!("❌ [{}] Failed to read file data: {}", request_id, e);
                             AppError::Multipart(format!("Failed to read file data: {}", e))
                         })?
                         .to_vec(),
+                );
+                println!(
+                    "🔍 [{}] file bytes received: {} bytes",
+                    request_id,
+                    file_data.as_ref().map(|d| d.len()).unwrap_or(0)
                 );
             }
             "videoThumbnail" => {
@@ -105,24 +129,54 @@ pub async fn upload_chat_media_handler(
                         .bytes()
                         .await
                         .map_err(|e| {
+                            eprintln!("❌ [{}] Failed to read thumbnail data: {}", request_id, e);
                             AppError::Multipart(format!("Failed to read thumbnail data: {}", e))
                         })?
                         .to_vec(),
                 );
+                println!(
+                    "🔍 [{}] videoThumbnail bytes received: {} bytes",
+                    request_id,
+                    thumbnail_data.as_ref().map(|d| d.len()).unwrap_or(0)
+                );
             }
-            _ => {}
+            other => {
+                println!("🔍 [{}] Unknown field ignored: {}", request_id, other);
+            }
         }
     }
 
-    let user_id =
-        user_id.ok_or_else(|| AppError::ValidationError("userId is required".to_string()))?;
+    let user_id = user_id.ok_or_else(|| {
+        eprintln!(
+            "❌ [{}] Validation failed: userId is required (no userId field received)",
+            request_id
+        );
+        AppError::ValidationError("userId is required".to_string())
+    })?;
 
     if user_id.trim().is_empty() {
+        eprintln!(
+            "❌ [{}] Validation failed: userId field was present but empty",
+            request_id
+        );
         return Err(AppError::ValidationError("User ID is required".to_string()));
     }
 
-    let file_data = file_data.ok_or(AppError::ValidationError("No file provided".to_string()))?;
-    let file_name = file_name.ok_or(AppError::ValidationError("No file name".to_string()))?;
+    let file_data = file_data.ok_or_else(|| {
+        eprintln!(
+            "❌ [{}] Validation failed: no file provided (no 'file' field received)",
+            request_id
+        );
+        AppError::ValidationError("No file provided".to_string())
+    })?;
+
+    let file_name = file_name.ok_or_else(|| {
+        eprintln!(
+            "❌ [{}] Validation failed: file field had no filename attached",
+            request_id
+        );
+        AppError::ValidationError("No file name".to_string())
+    })?;
 
     let ext = std::path::Path::new(&file_name)
         .extension()
@@ -130,28 +184,71 @@ pub async fn upload_chat_media_handler(
         .unwrap_or("")
         .to_lowercase();
 
+    println!(
+        "🔍 [{}] Resolved extension: '{}' from file_name '{}'",
+        request_id, ext, file_name
+    );
+
     let storage_service = &state.storage_service;
 
-    let (url, public_id) =
-        if ext == "mp4" || ext == "mov" || ext == "avi" || ext == "mkv" || ext == "webm" {
-            storage_service
-                .upload_video(&file_data, &user_id, &ext)
-                .await?
-        } else {
-            storage_service
-                .upload_image(&file_data, &user_id, &ext)
-                .await?
-        };
+    let is_video = ext == "mp4" || ext == "mov" || ext == "avi" || ext == "mkv" || ext == "webm";
+    println!(
+        "🔍 [{}] Upload type resolved as: {}",
+        request_id,
+        if is_video { "video" } else { "image" }
+    );
 
-    // ✅ Upload thumbnail if provided
-    let thumbnail_url = if let Some(thumb_data) = thumbnail_data {
+    let (url, public_id) = if is_video {
         storage_service
+            .upload_video(&file_data, &user_id, &ext)
+            .await
+            .map_err(|e| {
+                eprintln!(
+                    "❌ [{}] Video upload to storage failed: {:?}",
+                    request_id, e
+                );
+                e
+            })?
+    } else {
+        storage_service
+            .upload_image(&file_data, &user_id, &ext)
+            .await
+            .map_err(|e| {
+                eprintln!(
+                    "❌ [{}] Image upload to storage failed: {:?}",
+                    request_id, e
+                );
+                e
+            })?
+    };
+
+    println!("✅ [{}] Upload to storage succeeded: {}", request_id, url);
+
+    let thumbnail_url = if let Some(thumb_data) = thumbnail_data {
+        match storage_service
             .upload_thumbnail(&thumb_data, &user_id)
             .await
-            .ok()
+        {
+            Ok(u) => {
+                println!("✅ [{}] Thumbnail upload succeeded: {}", request_id, u);
+                Some(u)
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠️ [{}] Thumbnail upload failed (non-fatal, continuing): {:?}",
+                    request_id, e
+                );
+                None
+            }
+        }
     } else {
         None
     };
+
+    println!(
+        "✅ [{}] upload_chat_media_handler completed successfully",
+        request_id
+    );
 
     Ok(Json(json!({
         "success": true,
