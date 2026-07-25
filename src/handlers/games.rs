@@ -83,9 +83,18 @@ async fn find_game_tolerant(
     }
 }
 
-async fn find_games_tolerant(collection: &Collection<Game>, filter: Document) -> Result<Vec<Game>> {
+async fn find_games_tolerant(
+    collection: &Collection<Game>,
+    filter: Document,
+    sort: Option<Document>,
+) -> Result<Vec<Game>> {
     let raw_collection: Collection<Document> = collection.clone_with_type();
-    let mut cursor = raw_collection.find(filter).await?;
+
+    let mut find = raw_collection.find(filter);
+    if let Some(s) = sort {
+        find = find.sort(s);
+    }
+    let mut cursor = find.await?;
 
     let mut games: Vec<Game> = Vec::new();
     let mut skipped = 0;
@@ -199,13 +208,24 @@ async fn find_history_games_tolerant(
 // COMBINED READ HELPERS
 // ============================================================================
 
-async fn find_games_tolerant_all(state: &AppState, filter: Document) -> Result<Vec<Game>> {
+async fn find_games_tolerant_all(
+    state: &AppState,
+    filter: Document,
+    sort: Option<Document>,
+) -> Result<Vec<Game>> {
     let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
     let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
 
-    let mut games = find_games_tolerant(&games_col, filter.clone()).await?;
-    let mut fixtures = find_games_tolerant(&fixtures_col, filter).await?;
+    let mut games = find_games_tolerant(&games_col, filter.clone(), sort.clone()).await?;
+    let mut fixtures = find_games_tolerant(&fixtures_col, filter, sort).await?;
     games.append(&mut fixtures);
+
+    // games/fixtures are each already sorted by kickoff_utc from Mongo, but
+    // the two collections still need to be merged into one global order --
+    // this is a cheap sort over two pre-sorted small runs, not a full
+    // unindexed collection scan+sort.
+    games.sort_by(|a, b| a.kickoff_utc.cmp(&b.kickoff_utc));
+
     Ok(games)
 }
 
@@ -428,7 +448,7 @@ pub async fn get_pending_resolution(
         "kickoffUtc": { "$lte": now },
     };
 
-    let games = find_games_tolerant_all(&state, filter).await?;
+    let games = find_games_tolerant_all(&state, filter, None).await?;
     tracing::info!(
         "✅ {} fixture(s) pending resolution (source={})",
         games.len(),
@@ -685,7 +705,6 @@ pub async fn get_games(
     if query.status.is_none() && query.is_live.is_none() {
         filter.insert("status", doc! { "$ne": "completed" });
     }
-
     if let Some(status) = &query.status {
         filter.insert("status", status);
     }
@@ -696,9 +715,8 @@ pub async fn get_games(
         filter.insert("isLive", is_live);
     }
 
-    let mut games = find_games_tolerant_all(&state, filter).await?;
+    let mut games = find_games_tolerant_all(&state, filter, Some(doc! { "kickoffUtc": 1 })).await?;
 
-    games.sort_by(|a, b| a.kickoff_utc.cmp(&b.kickoff_utc));
     let limit = query.limit.unwrap_or(100).max(0) as usize;
     games.truncate(limit);
 
@@ -733,8 +751,8 @@ pub async fn get_game_by_match_id(
 pub async fn get_live_games(State(state): State<AppState>) -> Result<Json<Vec<Game>>> {
     let filter = doc! { "status": "live", "isLive": true };
 
-    let mut live_games = find_games_tolerant_all(&state, filter).await?;
-    live_games.sort_by(|a, b| a.kickoff_utc.cmp(&b.kickoff_utc));
+    let live_games =
+        find_games_tolerant_all(&state, filter, Some(doc! { "kickoffUtc": 1 })).await?;
 
     tracing::info!("✅ Fetched {} live games", live_games.len());
     Ok(Json(live_games))
@@ -743,45 +761,13 @@ pub async fn get_live_games(State(state): State<AppState>) -> Result<Json<Vec<Ga
 pub async fn get_upcoming_games(State(state): State<AppState>) -> Result<Json<Vec<Game>>> {
     let filter = doc! { "status": "upcoming" };
 
-    let games = find_games_tolerant_all(&state, filter).await?;
+    let games = find_games_tolerant_all(&state, filter, Some(doc! { "kickoffUtc": 1 })).await?;
 
-    let now = Utc::now();
-    const MATCH_DURATION_MINS: i64 = 120;
-
-    let mut not_started: Vec<Game> = Vec::new();
-    let mut likely_over: Vec<Game> = Vec::new();
-
-    for game in games {
-        match parse_kickoff_utc(&game.date_iso, &game.time) {
-            Some(kickoff) => {
-                let end_estimate = kickoff + chrono::Duration::minutes(MATCH_DURATION_MINS);
-                if end_estimate < now {
-                    likely_over.push(game);
-                } else {
-                    not_started.push(game);
-                }
-            }
-            None => not_started.push(game),
-        }
-    }
-
-    not_started.sort_by(|a, b| {
-        let ka = format!("{} {}", a.date_iso, a.time);
-        let kb = format!("{} {}", b.date_iso, b.time);
-        ka.cmp(&kb)
-    });
-
-    likely_over.sort_by(|a, b| {
-        let ka = format!("{} {}", a.date_iso, a.time);
-        let kb = format!("{} {}", b.date_iso, b.time);
-        kb.cmp(&ka)
-    });
-
-    let mut sorted: Vec<Game> = not_started;
-    sorted.extend(likely_over);
-
-    tracing::info!("✅ Returning {} upcoming games", sorted.len());
-    Ok(Json(sorted))
+    tracing::info!(
+        "✅ Returning {} upcoming games (sorted by kickoff_utc)",
+        games.len()
+    );
+    Ok(Json(games))
 }
 
 // ============================================================================
@@ -2079,8 +2065,8 @@ pub async fn cleanup_stale_completed_games(
     let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
     let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
 
-    let stale_games = find_games_tolerant(&games_col, stale_filter.clone()).await?;
-    let stale_fixtures = find_games_tolerant(&fixtures_col, stale_filter).await?;
+    let stale_games = find_games_tolerant(&games_col, stale_filter.clone(), None).await?;
+    let stale_fixtures = find_games_tolerant(&fixtures_col, stale_filter, None).await?;
 
     let mut moved_count = 0;
 

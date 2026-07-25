@@ -1,3 +1,7 @@
+// ============================================================================
+// websocket.rs - Complete WebSocket Handler with Dedicated Minute Updates
+// ============================================================================
+
 use crate::errors::{AppError, Result};
 use crate::models::channel::{Channel, ChannelFixture, Message, ReplyToData};
 use crate::models::user::User;
@@ -9,7 +13,7 @@ use axum::{
     response::IntoResponse,
 };
 use bson::{doc, oid::ObjectId};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,9 +37,90 @@ pub struct WsQuery {
 }
 
 // ============================================================================
-// BROADCAST FUNCTION
+// BROADCAST FUNCTIONS
 // ============================================================================
 
+/// Broadcast a dedicated minute update to all clients in a fixture room
+pub async fn broadcast_minute_update(
+    state: &AppState,
+    channel_id: &str,
+    fixture_id: &str,
+    minute: f64,
+    status: &str,       // "live", "half_time", "injury_time", "full_time"
+    display_text: &str, // "45'", "45+2'", "HT", "FT"
+) {
+    let room_key = format!("{}_{}", channel_id, fixture_id);
+    let tx = state.get_or_create_broadcaster(&room_key);
+
+    let ws_message = serde_json::json!({
+        "type": "minute.update",
+        "payload": {
+            "fixture_id": fixture_id,
+            "channel_id": channel_id,
+            "minute": minute,
+            "minute_display": display_text,
+            "status": status,
+            "timestamp": Utc::now().to_rfc3339(),
+        }
+    });
+
+    if let Ok(json) = serde_json::to_string(&ws_message) {
+        let _ = tx.send(json);
+        tracing::info!("📡 Broadcasted minute.update to room: {}", room_key);
+    }
+}
+
+/// Broadcast minute update with elapsed time
+pub async fn broadcast_time_elapsed(
+    state: &AppState,
+    channel_id: &str,
+    fixture_id: &str,
+    time_elapsed: f64,
+    is_half_time: bool,
+    is_full_time: bool,
+    is_injury_time: bool,
+    injury_minutes: Option<u32>,
+) {
+    let display_text = if is_full_time {
+        "FT".to_string()
+    } else if is_half_time {
+        "HT".to_string()
+    } else if is_injury_time {
+        let minutes = time_elapsed.floor();
+        let injury = injury_minutes.unwrap_or(0);
+        format!("{}' +{}", minutes, injury)
+    } else {
+        let minutes = time_elapsed.floor();
+        let seconds = ((time_elapsed % 1.0) * 60.0).round();
+        if seconds > 0.0 {
+            format!("{}{}", minutes, seconds)
+        } else {
+            format!("{}'", minutes)
+        }
+    };
+
+    let status = if is_full_time {
+        "full_time"
+    } else if is_half_time {
+        "half_time"
+    } else if is_injury_time {
+        "injury_time"
+    } else {
+        "live"
+    };
+
+    broadcast_minute_update(
+        state,
+        channel_id,
+        fixture_id,
+        time_elapsed,
+        status,
+        &display_text,
+    )
+    .await;
+}
+
+/// Broadcast a live match update (goal, card, substitution, etc.)
 pub async fn broadcast_live_match_update(
     state: &AppState,
     channel_id: &str,
@@ -327,7 +412,128 @@ async fn handle_incoming_message(
         }
 
         // ============================================================================
-        // GET COMMENTARY - For live commentary from poller (just acknowledge)
+        // GET CURRENT MINUTE - DEDICATED MINUTE REQUEST
+        // ============================================================================
+
+        // ============================================================================
+        // GET CURRENT MINUTE - From games collection
+        // ============================================================================
+        Some("get.minute") => {
+            tracing::info!("📖 Getting current minute for fixture");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ get.minute missing payload");
+                    return;
+                }
+            };
+
+            let fixture_id = payload
+                .get("fixtureId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if fixture_id.is_empty() {
+                tracing::error!("❌ get.minute missing fixtureId");
+                return;
+            }
+
+            // Get the channel_id from the connection context
+            let current_room_lock = current_room.lock().await;
+            let channel_id = current_room_lock
+                .split('_')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            drop(current_room_lock);
+
+            if channel_id.is_empty() {
+                tracing::error!("❌ get.minute: Could not determine channel_id");
+                return;
+            }
+
+            // Query the game from the games collection (not channel_fixtures)
+            let games_col = state.db.collection::<crate::models::game::Game>("games");
+
+            match games_col
+                .find_one(doc! {
+                    "matchId": &fixture_id,
+                })
+                .await
+            {
+                Ok(Some(game)) => {
+                    // Get time_elapsed from the Game model
+                    let time_elapsed = game.time_elapsed.unwrap_or(0.0);
+                    let status = game.status.clone();
+
+                    let is_half_time = time_elapsed >= 44.0 && time_elapsed <= 46.0;
+                    let is_full_time = time_elapsed >= 90.0;
+                    let is_injury_time = time_elapsed > 90.0 && time_elapsed < 100.0;
+
+                    let display_text = if is_full_time {
+                        "FT".to_string()
+                    } else if is_half_time {
+                        "HT".to_string()
+                    } else if is_injury_time {
+                        let injury = (time_elapsed - 90.0).floor() as u32;
+                        format!("90+{}'", injury)
+                    } else {
+                        let minutes = time_elapsed.floor();
+                        let seconds = ((time_elapsed % 1.0) * 60.0).round();
+                        if seconds > 0.0 {
+                            format!("{}{}", minutes, seconds)
+                        } else {
+                            format!("{}'", minutes)
+                        }
+                    };
+
+                    let response = serde_json::json!({
+                        "type": "minute.response",
+                        "payload": {
+                            "fixture_id": fixture_id,
+                            "channel_id": channel_id,
+                            "minute": time_elapsed,
+                            "minute_display": display_text,
+                            "status": if is_half_time { "half_time" } else if is_full_time { "full_time" } else { "live" },
+                            "timestamp": Utc::now().to_rfc3339(),
+                        },
+                    });
+
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        let mut guard = sender.lock().await;
+                        let _ = guard.send(WsMessage::Text(json)).await;
+                        tracing::info!("📤 Sent minute response for fixture: {}", fixture_id);
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!("⚠️ Game not found: {}", fixture_id);
+                    // Send a default response
+                    let response = serde_json::json!({
+                        "type": "minute.response",
+                        "payload": {
+                            "fixture_id": fixture_id,
+                            "channel_id": channel_id,
+                            "minute": 0.0,
+                            "minute_display": "0'",
+                            "status": "upcoming",
+                            "timestamp": Utc::now().to_rfc3339(),
+                        },
+                    });
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        let mut guard = sender.lock().await;
+                        let _ = guard.send(WsMessage::Text(json)).await;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("❌ Failed to fetch game: {}", e);
+                }
+            }
+        }
+
+        // ============================================================================
+        // GET COMMENTARY - For live commentary from poller
         // ============================================================================
         Some("get.commentary") => {
             tracing::info!("📖 get.commentary received");
@@ -346,21 +552,26 @@ async fn handle_incoming_message(
                 .unwrap_or("")
                 .to_string();
 
-            // Just acknowledge - poller sends signals separately
-            let response = serde_json::json!({
-                "type": "commentary.response",
-                "payload": {
-                    "fixture_id": fixture_id,
-                    "commentary": [],
-                },
-                "timestamp": Utc::now().to_rfc3339(),
-            });
+            // Get channel_id from current room
+            let current_room_lock = current_room.lock().await;
+            let channel_id = current_room_lock
+                .split('_')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            drop(current_room_lock);
 
-            if let Ok(json) = serde_json::to_string(&response) {
-                let mut guard = sender.lock().await;
-                let _ = guard.send(WsMessage::Text(json)).await;
-                tracing::info!("📤 Sent commentary response (poller handles signals)");
-            }
+            // Query commentary from database
+
+            let filter = doc! {
+                "fixture_id": &fixture_id,
+                "channel_id": &channel_id,
+            };
+
+            let options = mongodb::options::FindOptions::builder()
+                .sort(doc! { "created_at": -1 })
+                .limit(1)
+                .build();
         }
 
         // ============================================================================
@@ -477,6 +688,9 @@ async fn handle_incoming_message(
             }
         }
 
+        // ============================================================================
+        // CHAT MESSAGE - Standard chat message handler
+        // ============================================================================
         Some("chat.message") => {
             tracing::info!("✅ Matched chat.message");
 
@@ -598,6 +812,9 @@ async fn handle_incoming_message(
             }
         }
 
+        // ============================================================================
+        // TYPING INDICATOR
+        // ============================================================================
         Some("typing") => {
             let sender_clone = sender.clone();
 
@@ -634,6 +851,9 @@ async fn handle_incoming_message(
             }
         }
 
+        // ============================================================================
+        // PING / PONG - Keep alive
+        // ============================================================================
         Some("ping") => {
             let pong = serde_json::json!({
                 "type": "pong",
@@ -645,6 +865,9 @@ async fn handle_incoming_message(
             }
         }
 
+        // ============================================================================
+        // JOIN REQUEST - Channel join request
+        // ============================================================================
         Some("join.request") => {
             tracing::info!("📨 Join request via WebSocket");
 
@@ -1373,6 +1596,9 @@ async fn handle_incoming_message(
             }
         }
 
+        // ============================================================================
+        // UNKNOWN MESSAGE TYPE
+        // ============================================================================
         _ => {
             tracing::warn!("⚠️ UNMATCHED type: {:?}", message_type);
         }
