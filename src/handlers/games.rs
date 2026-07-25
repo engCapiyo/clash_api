@@ -260,6 +260,204 @@ async fn update_one_in_either(
 
     Err(AppError::DocumentNotFound)
 }
+// ============================================================================
+// FRIENDLY-FIXTURES RESOLUTION HANDLERS
+// (seed / pending-resolution / resolve / abandon)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct SeedFixtureRequest {
+    #[serde(rename = "matchId")]
+    pub match_id: String,
+    #[serde(rename = "homeTeam")]
+    pub home_team: String,
+    #[serde(rename = "awayTeam")]
+    pub away_team: String,
+    pub league: String,
+    #[serde(rename = "kickoffUtc")]
+    pub kickoff_utc: chrono::DateTime<Utc>,
+    pub date: String,
+    pub time: String,
+    #[serde(rename = "dateIso")]
+    pub date_iso: String,
+    pub source: String,
+}
+
+pub async fn seed_fixture(
+    State(state): State<AppState>,
+    Json(payload): Json<SeedFixtureRequest>,
+) -> Result<Json<serde_json::Value>> {
+    tracing::info!("🌱 Seed request for {}", payload.match_id);
+
+    let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
+
+    // Idempotency check -- mirrors main.py's old get_fixture()-before-
+    // upsert_fixture() guard, now enforced server-side instead of by the
+    // caller. If it already exists (in either collection -- a fixture
+    // could have been promoted into `games` by a status/score update
+    // path elsewhere), this is a no-op.
+    if find_game_tolerant(&fixtures_col, doc! { "matchId": &payload.match_id })
+        .await?
+        .is_some()
+    {
+        tracing::info!("⏭️ {} already seeded, skipping", payload.match_id);
+        return Ok(Json(json!({
+            "success": true,
+            "created": false,
+            "match_id": payload.match_id,
+        })));
+    }
+
+    let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
+    if find_game_tolerant(&games_col, doc! { "matchId": &payload.match_id })
+        .await?
+        .is_some()
+    {
+        tracing::info!("⏭️ {} already exists in games, skipping", payload.match_id);
+        return Ok(Json(json!({
+            "success": true,
+            "created": false,
+            "match_id": payload.match_id,
+        })));
+    }
+
+    let mut game = Game::new(
+        payload.match_id.clone(),
+        payload.home_team,
+        payload.away_team,
+        payload.league,
+        payload.date,
+        payload.time,
+        payload.date_iso,
+        payload.kickoff_utc,
+        payload.source,
+    );
+    // _id == matchId by convention -- see the note in mongo_store.py's
+    // old upsert_fixture() docstring about why this matters for Rust
+    // deserialization (Option<String> vs ObjectId).
+    game.id = Some(payload.match_id.clone());
+
+    fixtures_col.insert_one(&game).await?;
+    tracing::info!("✅ Seeded new fixture {}", payload.match_id);
+
+    Ok(Json(json!({
+        "success": true,
+        "created": true,
+        "match_id": payload.match_id,
+    })))
+}
+
+pub async fn get_pending_resolution(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<Game>>> {
+    let source = query
+        .get("source")
+        .cloned()
+        .unwrap_or_else(|| "friendly_hardcoded".to_string());
+
+    let now = BsonDateTime::from_chrono(Utc::now());
+    let filter = doc! {
+        "source": &source,
+        "threesixtyfiveGameId": null,
+        "resolutionAbandoned": { "$ne": true },
+        "kickoffUtc": { "$lte": now },
+    };
+
+    let games = find_games_tolerant_all(&state, filter).await?;
+    tracing::info!(
+        "✅ {} fixture(s) pending resolution (source={})",
+        games.len(),
+        source
+    );
+    Ok(Json(games))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResolveFixtureRequest {
+    #[serde(rename = "threesixtyfiveGameId")]
+    pub threesixtyfive_game_id: Option<String>,
+    pub home_competitor_id: Option<String>,
+    pub away_competitor_id: Option<String>,
+    pub competition_id: Option<i64>,
+}
+
+pub async fn resolve_fixture(
+    State(state): State<AppState>,
+    Path(match_id): Path<String>,
+    Json(payload): Json<ResolveFixtureRequest>,
+) -> Result<Json<serde_json::Value>> {
+    tracing::info!("🔗 Resolving fixture {}", match_id);
+
+    let filter = doc! { "matchId": &match_id };
+    let mut set_doc = doc! {
+        "scrapedAt": BsonDateTime::from_chrono(Utc::now()),
+    };
+
+    if let Some(game_id) = &payload.threesixtyfive_game_id {
+        set_doc.insert("threesixtyfiveGameId", game_id);
+    }
+    if let Some(home_id) = &payload.home_competitor_id {
+        set_doc.insert("home_competitor_id", home_id);
+    }
+    if let Some(away_id) = &payload.away_competitor_id {
+        set_doc.insert("away_competitor_id", away_id);
+    }
+    if let Some(comp_id) = payload.competition_id {
+        set_doc.insert("competition_id", comp_id);
+    }
+
+    let source = update_one_in_either(&state, filter, doc! { "$set": set_doc }).await?;
+
+    tracing::info!(
+        "✅ Resolved {} ({:?}) -> 365Scores game {:?}",
+        match_id,
+        source,
+        payload.threesixtyfive_game_id
+    );
+
+    // Auto-create default sub-fixture markets now that this friendly is
+    // resolved and has a real 365Scores game behind it. Failure here
+    // doesn't block resolution succeeding -- betting-side setup shouldn't
+    // be able to fail the core resolve path the poller depends on.
+    if let Err(e) =
+        crate::handlers::sub_fixture_handler::create_default_markets_for_match(&state, &match_id)
+            .await
+    {
+        tracing::error!(
+            "❌ Failed to create default markets for {}: {:?}",
+            match_id,
+            e
+        );
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "match_id": match_id,
+        "source_collection": source.collection_name(),
+    })))
+}
+pub async fn abandon_fixture(
+    State(state): State<AppState>,
+    Path(match_id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    tracing::info!("🚫 Abandoning resolution for {}", match_id);
+
+    let filter = doc! { "matchId": &match_id };
+    let update = doc! { "$set": { "resolutionAbandoned": true } };
+
+    match update_one_in_either_opt(&state, filter, update).await? {
+        Some(source) => {
+            tracing::info!("✅ Abandoned {} ({:?})", match_id, source);
+            Ok(Json(json!({
+                "success": true,
+                "match_id": match_id,
+                "source_collection": source.collection_name(),
+            })))
+        }
+        None => Err(AppError::DocumentNotFound),
+    }
+}
 
 async fn update_one_in_either_opt(
     state: &AppState,
@@ -1571,6 +1769,9 @@ pub async fn move_completed_to_history(
         id: game.id.clone(),
         match_id: game.match_id.clone(),
         threesixtyfive_game_id: game.threesixtyfive_game_id.clone(),
+        home_competitor_id: game.home_competitor_id.clone(),
+        away_competitor_id: game.away_competitor_id.clone(),
+        competition_id: game.competition_id,
         home_team: game.home_team.clone(),
         away_team: game.away_team.clone(),
         league: game.league.clone(),
@@ -1624,6 +1825,32 @@ pub async fn move_completed_to_history(
     source_col
         .delete_one(doc! { "matchId": &match_id_clone })
         .await?;
+
+    // Refund/expire any unsettled sub-fixture markets before finishing up --
+    // sub_fixture_markets/sub_fixture_bets have no foreign-key relationship
+    // to Game/HistoryGame, so nothing else in the system will ever revisit
+    // them once this match is archived. See cleanup_sub_fixtures_for_match's
+    // docstring for why refunding (rather than guessing a winner) is the
+    // right default here.
+    let state_arc = std::sync::Arc::new(state.clone());
+    match crate::handlers::sub_fixture_handler::cleanup_sub_fixtures_for_match(
+        &state_arc,
+        &match_id_clone,
+    )
+    .await
+    {
+        Ok(n) if n > 0 => tracing::info!(
+            "🧹 Refunded {} sub-fixture market(s) for {}",
+            n,
+            match_id_clone
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::error!(
+            "❌ Sub-fixture cleanup failed for {}: {:?}",
+            match_id_clone,
+            e
+        ),
+    }
 
     tracing::info!("✅ Game {} moved to {}", match_id, history_col_name);
 
@@ -1804,6 +2031,9 @@ pub async fn cleanup_stale_completed_games(
                 id: game.id.clone(),
                 match_id: game.match_id.clone(),
                 threesixtyfive_game_id: game.threesixtyfive_game_id.clone(),
+                home_competitor_id: game.home_competitor_id.clone(),
+                away_competitor_id: game.away_competitor_id.clone(),
+                competition_id: game.competition_id,
                 home_team: game.home_team.clone(),
                 away_team: game.away_team.clone(),
                 league: game.league.clone(),
@@ -1842,6 +2072,22 @@ pub async fn cleanup_stale_completed_games(
 
             let collection = source.collection(&state);
             collection.delete_one(doc! { "matchId": &match_id }).await?;
+
+            let state_arc = std::sync::Arc::new(state.clone());
+            match crate::handlers::sub_fixture_handler::cleanup_sub_fixtures_for_match(
+                &state_arc, &match_id,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => {
+                    tracing::info!("🧹 Refunded {} sub-fixture market(s) for {}", n, match_id)
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!("❌ Sub-fixture cleanup failed for {}: {:?}", match_id, e)
+                }
+            }
+
             moved_count += 1;
         }
     }

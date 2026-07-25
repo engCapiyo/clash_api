@@ -20,6 +20,9 @@ pub fn routes() -> Router<AppState> {
             "/test-notification",
             post(games::send_test_notification_from_poller),
         )
+        // ── Friendly-fixtures resolution (seed / midnight-surrender) ──────────
+        .route("/seed", post(games::seed_fixture))
+        .route("/pending-resolution", get(games::get_pending_resolution))
         // ── Lineups ─────────────────────────────────────────────────────────────
         .route("/lineups", post(games::store_lineups))
         // ── Statistics ──────────────────────────────────────────────────────────
@@ -86,6 +89,9 @@ pub fn routes() -> Router<AppState> {
             "/:match_id/move-to-history",
             post(games::move_completed_to_history),
         )
+        // ── Friendly-fixtures resolve / abandon ────────────────────────────────
+        .route("/:match_id/resolve", post(games::resolve_fixture))
+        .route("/:match_id/abandon", post(games::abandon_fixture))
         // ── Get by ID (must come last) ──────────────────────────────────────
         .route("/:id", get(games::get_game_by_id))
 }

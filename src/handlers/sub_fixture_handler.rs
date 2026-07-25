@@ -1175,6 +1175,149 @@ pub async fn get_market_details_handler(
 }
 
 // ============================================================================
+// 10. CLEANUP / AUTO-SETTLE ON MATCH ARCHIVAL
+// ============================================================================
+// Called from games.rs's move_completed_to_history / cleanup_stale_completed_games
+// right before a match is archived. sub_fixture_markets/sub_fixture_bets have
+// no foreign-key relationship to Game/HistoryGame -- nothing else in the
+// system ever revisits them once the parent match is gone, so any market
+// that never got an explicit /sub-fixture/settle call (e.g. the poller
+// never classified a clean first_goal/first_card/first_corner event) would
+// otherwise sit "open" forever with real money locked in it.
+//
+// Policy: refund everyone. We deliberately do NOT try to guess a winner
+// here -- by the time a match is being archived, whatever signal would
+// have let us settle it correctly (a captured first-event) either already
+// fired (and the market is no longer "open") or never fired at all, in
+// which case there's no reliable winner to declare. Refunding via the
+// existing settle_sub_fixture_bets_for_market(..., None) path is the same
+// no-winner/draw behavior it already uses elsewhere.
+pub async fn cleanup_sub_fixtures_for_match(
+    state: &Arc<AppState>,
+    match_id: &str,
+) -> Result<usize, AppError> {
+    let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
+
+    let mut cursor = markets_col
+        .find(doc! { "matchId": match_id, "status": "open" })
+        .await
+        .map_err(AppError::MongoDB)?;
+
+    let mut open_markets = Vec::new();
+    while let Some(market) = cursor.next().await {
+        open_markets.push(market.map_err(AppError::MongoDB)?);
+    }
+
+    if open_markets.is_empty() {
+        return Ok(0);
+    }
+
+    tracing::info!(
+        "🧹 {} unsettled sub-fixture market(s) found for {} at archival -- refunding",
+        open_markets.len(),
+        match_id
+    );
+
+    let mut cleaned = 0;
+    for market in open_markets {
+        let _ = settle_sub_fixture_bets_for_market(state, match_id, &market.market_id, None)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "❌ Failed to refund sub-fixture market {} for {}: {:?}",
+                    market.market_id,
+                    match_id,
+                    e
+                );
+                e
+            });
+
+        markets_col
+            .update_one(
+                doc! { "matchId": match_id, "marketId": &market.market_id },
+                doc! { "$set": { "status": "expired", "updatedAt": BsonDateTime::now() } },
+            )
+            .await
+            .map_err(AppError::MongoDB)?;
+
+        cleaned += 1;
+    }
+
+    Ok(cleaned)
+}
+
+// ============================================================================
+// 11. AUTO-CREATE DEFAULT SUB-FIXTURE MARKETS (called on friendly resolution)
+// ============================================================================
+// Idempotent -- reuses the same existence check create_sub_fixture_market_handler
+// does, so calling this twice for the same match_id is harmless.
+pub async fn create_default_markets_for_match(
+    state: &AppState,
+    match_id: &str,
+) -> Result<usize, AppError> {
+    let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
+
+    const DEFAULT_MARKET_TYPES: [&str; 3] = ["first_goal", "first_card", "first_corner"];
+    let options = vec!["home".to_string(), "away".to_string()];
+
+    let mut created = 0;
+    for market_type in DEFAULT_MARKET_TYPES {
+        let market_id = format!("{}_{}", match_id, market_type);
+
+        let existing = markets_col
+            .find_one(doc! { "matchId": match_id, "marketId": &market_id })
+            .await
+            .map_err(AppError::MongoDB)?;
+
+        if existing.is_some() {
+            continue;
+        }
+
+        let now = BsonDateTime::now();
+        let mut pledge_counts: HashMap<String, i32> = HashMap::new();
+        let mut pledge_totals: HashMap<String, i32> = HashMap::new();
+        for opt in &options {
+            pledge_counts.insert(opt.clone(), 0);
+            pledge_totals.insert(opt.clone(), 0);
+        }
+
+        let market = SubFixtureMarket {
+            id: None,
+            match_id: match_id.to_string(),
+            market_id: market_id.clone(),
+            market_type: market_type.to_string(),
+            options: options.clone(),
+            line: None,
+            status: "open".to_string(),
+            lock_at: None,
+            pledge_counts,
+            pledge_totals,
+            result: None,
+            is_visible: true,
+            created_at: now,
+            updated_at: now,
+            settled_at: None,
+        };
+
+        markets_col
+            .insert_one(&market)
+            .await
+            .map_err(AppError::MongoDB)?;
+        created += 1;
+    }
+
+    if created > 0 {
+        tracing::info!(
+            "📊 Created {} default sub-fixture market(s) for {}",
+            created,
+            match_id
+        );
+    }
+
+    Ok(created)
+}
+
+// ============================================================================
 // 9. CREATE SUB-FIXTURE MARKET
 // ============================================================================
 pub async fn create_sub_fixture_market_handler(

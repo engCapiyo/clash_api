@@ -166,6 +166,22 @@ pub struct Game {
     #[serde(default)]
     pub threesixtyfive_game_id: Option<String>,
 
+    // NEW — needed so the poller/resolver can get these back from the
+    // Rust API instead of reading Mongo directly. Written once by the
+    // friendly-fixtures resolver on match, then read on every
+    // subsequent live-detail call (365Scores requires these ids on
+    // every request, not just the initial lookup). Field names left
+    // snake_case (no #[serde(rename)]) to match what mongo_store.py
+    // has already been writing to existing documents.
+    #[serde(default)]
+    pub home_competitor_id: Option<String>,
+
+    #[serde(default)]
+    pub away_competitor_id: Option<String>,
+
+    #[serde(default)]
+    pub competition_id: Option<i64>,
+
     #[serde(rename = "homeTeam")]
     pub home_team: String,
 
@@ -284,6 +300,18 @@ pub struct HistoryGame {
     #[serde(rename = "threesixtyfiveGameId")]
     #[serde(default)]
     pub threesixtyfive_game_id: Option<String>,
+
+    // NEW — mirrors Game. Kept so a resolved friendly fixture's
+    // competitor/competition ids survive the move into history instead
+    // of being silently dropped on archival.
+    #[serde(default)]
+    pub home_competitor_id: Option<String>,
+
+    #[serde(default)]
+    pub away_competitor_id: Option<String>,
+
+    #[serde(default)]
+    pub competition_id: Option<i64>,
 
     #[serde(rename = "homeTeam")]
     pub home_team: String,
@@ -505,6 +533,9 @@ impl Game {
             id: None,
             match_id,
             threesixtyfive_game_id: None,
+            home_competitor_id: None,
+            away_competitor_id: None,
+            competition_id: None,
             home_team,
             away_team,
             league,
