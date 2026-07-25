@@ -1,60 +1,27 @@
 use axum::{
-    extract::DefaultBodyLimit, // ✅ add this
+    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
     Router,
 };
 
 use crate::handlers::channel::{
-    add_members_to_channel_handler,
-    approve_join_request_handler,
-    cast_vote_handler,
-    check_user_liked_handler,
-    check_user_vote_handler,
-    check_user_vote_in_channel_handler,
-    compute_admin_payout_handler,
-    compute_admin_reward_score_handler,
-    compute_all_admin_payouts_handler,
-    compute_all_admin_reward_scores_handler,
-    create_channel_handler,
-    create_pledge_with_vote_handler,
-    // ✅ Message handlers
-    delete_message_handler,
-    finalize_fixture_result_handler,
-    get_admin_reward_leaderboard_handler,
-    get_all_channels_handler,
-    get_channel_fixtures_handler,
-    get_channel_handler,
-    get_channel_invite_code_handler,
-    get_channel_leaderboard_handler,
-    get_channel_votes_handler,
-    get_fixture_comment_count_handler,
-    get_fixture_latest_comment_handler,
-    get_fixture_likes_handler,
-    get_fixture_pledgers_handler,
-    get_invite_channel_handler,
-    get_message_thread_handler,
-    get_messages_handler,
-    get_pending_requests_handler,
-    get_single_fixture_handler,
-    get_single_message_handler,
-    get_user_channel_count_handler,
-    get_user_channel_votes_handler,
-    get_user_channels_handler,
-    get_user_liked_fixtures_handler,
-    get_user_unread_count_handler,
-    get_user_votes_handler,
-    get_weekly_top_channel_handler,
-    initialize_fixture_chat_handler,
-    join_channel_by_code_handler,
-    leave_channel_handler,
-    mark_chat_as_read_handler,
-    reject_join_request_handler,
-    request_join_channel_handler,
-    reset_weekly_messages_handler,
-    send_message_handler,
-    // ✅ Like handlers
-    toggle_like_handler,
-    // ✅ Chat media upload
+    add_members_to_channel_handler, approve_join_request_handler, cast_vote_handler,
+    check_user_liked_handler, check_user_vote_handler, check_user_vote_in_channel_handler,
+    compute_admin_payout_handler, compute_admin_reward_score_handler,
+    compute_all_admin_payouts_handler, compute_all_admin_reward_scores_handler,
+    create_channel_handler, create_pledge_with_vote_handler, delete_message_handler,
+    finalize_fixture_result_handler, get_admin_reward_leaderboard_handler,
+    get_all_channels_handler, get_channel_fixtures_handler, get_channel_handler,
+    get_channel_invite_code_handler, get_channel_leaderboard_handler, get_channel_votes_handler,
+    get_fixture_comment_count_handler, get_fixture_latest_comment_handler,
+    get_fixture_likes_handler, get_fixture_pledgers_handler, get_invite_channel_handler,
+    get_message_thread_handler, get_messages_handler, get_pending_requests_handler,
+    get_single_fixture_handler, get_single_message_handler, get_user_channel_count_handler,
+    get_user_channel_votes_handler, get_user_channels_handler, get_user_liked_fixtures_handler,
+    get_user_unread_count_handler, get_user_votes_handler, get_weekly_top_channel_handler,
+    initialize_fixture_chat_handler, join_channel_by_code_handler, leave_channel_handler,
+    mark_chat_as_read_handler, reject_join_request_handler, request_join_channel_handler,
+    reset_weekly_messages_handler, send_message_handler, toggle_like_handler,
     upload_chat_media_handler,
 };
 use crate::handlers::ws_handler::ws_comments_handler;
@@ -122,11 +89,11 @@ pub fn channel_routes() -> Router<AppState> {
             get(get_single_fixture_handler),
         )
         // ====================================================================
-        // ✅ CHAT MEDIA UPLOAD
+        // ✅ CHAT MEDIA UPLOAD - WITH 60MB LIMIT
         // ====================================================================
         .route(
             "/media/upload",
-            post(upload_chat_media_handler).layer(DefaultBodyLimit::max(60 * 1024 * 1024)), // ✅ 60MB, matches video cap
+            post(upload_chat_media_handler).layer(DefaultBodyLimit::max(60 * 1024 * 1024)),
         )
         // ====================================================================
         // MESSAGES - FULL CRUD WITH CAPTION & MEDIA SUPPORT
@@ -240,4 +207,14 @@ pub fn channel_routes() -> Router<AppState> {
             "/likes/user/:user_id/channel/:channel_id",
             get(get_user_liked_fixtures_handler),
         )
+}
+
+// ============================================================================
+// COMBINED ROUTES (Optional - if you want to combine everything)
+// ============================================================================
+
+pub fn combined_routes() -> Router<AppState> {
+    Router::new()
+        .nest("/api/ws", ws_channel_routes())
+        .nest("/api/channels", channel_routes())
 }

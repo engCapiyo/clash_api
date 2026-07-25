@@ -50,6 +50,8 @@ fn calculate_points(selection: &str, result: &str) -> i32 {
 // CHAT MEDIA UPLOAD HANDLER - ✅ FIXED (userId now comes from form data, not path)
 // ============================================================================
 
+// handlers/channel.rs
+
 #[derive(Debug, Deserialize)]
 pub struct ChatMediaUploadRequest {
     pub caption: Option<String>,
@@ -123,7 +125,7 @@ pub async fn upload_chat_media_handler(
                     file_data.as_ref().map(|d| d.len()).unwrap_or(0)
                 );
             }
-            "videoThumbnail" => {
+            "thumbnail" | "videoThumbnail" => {
                 thumbnail_data = Some(
                     field
                         .bytes()
@@ -135,7 +137,7 @@ pub async fn upload_chat_media_handler(
                         .to_vec(),
                 );
                 println!(
-                    "🔍 [{}] videoThumbnail bytes received: {} bytes",
+                    "🔍 [{}] thumbnail bytes received: {} bytes",
                     request_id,
                     thumbnail_data.as_ref().map(|d| d.len()).unwrap_or(0)
                 );
@@ -146,6 +148,7 @@ pub async fn upload_chat_media_handler(
         }
     }
 
+    // ✅ Validate required fields
     let user_id = user_id.ok_or_else(|| {
         eprintln!(
             "❌ [{}] Validation failed: userId is required (no userId field received)",
@@ -400,6 +403,8 @@ async fn broadcast_to_channel(
     }
 }
 
+// handlers/channel.rs
+
 async fn notify_channel_members(
     state: &AppState,
     actor_id: &str,
@@ -481,7 +486,6 @@ async fn notify_channel_members(
 
     Ok(())
 }
-
 // ============================================================================
 // CREATE CHANNEL
 // ============================================================================
@@ -2534,6 +2538,8 @@ pub async fn initialize_fixture_chat_handler(
 // MESSAGE HANDLERS
 // ============================================================================
 
+// handlers/channel.rs
+
 #[derive(Debug, Deserialize)]
 pub struct SendMessageRequest {
     pub user_id: String,
@@ -2545,6 +2551,9 @@ pub struct SendMessageRequest {
     pub selection: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
+    // ✅ NEW: temp_id for pending message tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2576,6 +2585,8 @@ pub struct SendMessageRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reply_to_selection: Option<String>,
 }
+
+// handlers/channel.rs
 
 pub async fn send_message_handler(
     State(state): State<AppState>,
@@ -2620,7 +2631,7 @@ pub async fn send_message_handler(
         None
     };
 
-    // Build the message
+    // ✅ Build the message with temp_id
     let mut message = Message {
         id: Some(ObjectId::new()),
         channel_id: channel_id.clone(),
@@ -2632,6 +2643,8 @@ pub async fn send_message_handler(
         sent_at: now,
         message_id: Some(message_id.clone()),
         selection: payload.selection.clone(),
+        // ✅ Store temp_id if provided
+        temp_id: payload.temp_id.clone(),
         image_url: payload.image_url.clone(),
         image_public_id: payload.image_public_id.clone(),
         image_caption: payload.image_caption.clone(),
@@ -2690,7 +2703,6 @@ pub async fn send_message_handler(
 
         // If fixture doesn't exist, create it
         if update_result.matched_count == 0 {
-            // Try to get fixture info from global fixtures
             let fixtures_col = state.db.collection::<Fixture>("fixtures");
             let games_col = state.db.collection::<Game>("games");
 
@@ -2726,7 +2738,6 @@ pub async fn send_message_handler(
                 unread_counts.insert(member.user_id.clone(), 0);
             }
 
-            // Create the channel fixture
             let new_fixture = ChannelFixture {
                 id: None,
                 channel_id: channel_id.clone(),
@@ -2786,7 +2797,6 @@ pub async fn send_message_handler(
     let mut session = state.client.start_session().await?;
     session.start_transaction().await?;
 
-    // Get current unread counts
     let channel_fixture = channel_fixtures_col
         .find_one(doc! {
             "channel_id": &channel_id,
@@ -2816,10 +2826,8 @@ pub async fn send_message_handler(
 
     session.commit_transaction().await?;
 
-    // ============================================================
-    // ✅ SEND NOTIFICATIONS FOR NEW MESSAGE
-    // ============================================================
-    let message_payload = serde_json::json!({
+    // ✅ Build message payload with temp_id
+    let mut message_payload = serde_json::json!({
         "messageId": message_id,
         "channel_id": channel_id,
         "fixture_id": payload.fixture_id,
@@ -2835,6 +2843,11 @@ pub async fn send_message_handler(
         "reply_to": message.reply_to,
         "sent_at": now.to_rfc3339_string(),
     });
+
+    // ✅ Include temp_id in WebSocket broadcast if present
+    if let Some(temp_id) = &payload.temp_id {
+        message_payload["tempId"] = serde_json::Value::String(temp_id.clone());
+    }
 
     let display_name = payload.username.clone();
     let preview = if payload.is_image {
@@ -2870,6 +2883,8 @@ pub async fn send_message_handler(
 // ============================================================================
 // GET MESSAGES HANDLER
 // ============================================================================
+
+// handlers/channel.rs
 
 #[derive(Debug, Deserialize)]
 pub struct MessagesQuery {

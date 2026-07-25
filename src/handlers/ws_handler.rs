@@ -1,5 +1,5 @@
 use crate::errors::{AppError, Result};
-use crate::models::channel::{Channel, ChannelFixture, Message, ReplyToData, Vote};
+use crate::models::channel::{Channel, ChannelFixture, Message, ReplyToData};
 use crate::models::user::User;
 use axum::{
     extract::{
@@ -8,7 +8,7 @@ use axum::{
     },
     response::IntoResponse,
 };
-use bson::{doc, oid::ObjectId, DateTime as BsonDateTime};
+use bson::{doc, oid::ObjectId};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -103,7 +103,7 @@ async fn handle_socket(
     username: String,
     state: AppState,
 ) {
-    // ✅ Mark user as online
+    // Mark user as online
     state.set_user_online(&user_id);
 
     let initial_room_key = match &fixture_id {
@@ -188,7 +188,7 @@ async fn handle_socket(
         handle.abort();
     }
 
-    // ✅ Mark user as offline
+    // Mark user as offline
     state.set_user_offline(&user_id);
 
     tracing::info!(
@@ -342,7 +342,8 @@ async fn handle_incoming_message(
             let channel_id = payload
                 .get("channelId")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_string();
 
             let fixture_id = payload
                 .get("fixtureId")
@@ -350,12 +351,17 @@ async fn handle_incoming_message(
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
 
-            let user_id = payload.get("userId").and_then(|v| v.as_str()).unwrap_or("");
+            let user_id = payload
+                .get("userId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
             let username = payload
                 .get("username")
                 .and_then(|v| v.as_str())
-                .unwrap_or("Anonymous");
+                .unwrap_or("Anonymous")
+                .to_string();
 
             if channel_id.is_empty() {
                 tracing::error!("❌ Missing channelId in message payload");
@@ -598,7 +604,7 @@ async fn handle_incoming_message(
         }
 
         // ============================================================================
-        // ✅ VOTE EVENTS
+        // VOTE EVENTS
         // ============================================================================
         Some("vote.cast") => {
             tracing::info!("🗳️ Vote cast via WebSocket");
@@ -646,7 +652,7 @@ async fn handle_incoming_message(
                 tracing::info!("📡 Broadcasted vote.cast to room: {}", room_key);
             }
 
-            // ✅ Send to user's personal room for online check
+            // Send to user's personal room for online check
             let user_room = format!("user_{}", user_id);
             let user_tx = state.get_or_create_broadcaster(&user_room);
             if let Ok(json) = serde_json::to_string(&broadcast_msg) {
@@ -696,7 +702,7 @@ async fn handle_incoming_message(
         }
 
         // ============================================================================
-        // ✅ PLEDGE / BET EVENTS
+        // PLEDGE / BET EVENTS
         // ============================================================================
         Some("pledge.create") => {
             tracing::info!("💰 Pledge created via WebSocket");
@@ -863,7 +869,7 @@ async fn handle_incoming_message(
         }
 
         // ============================================================================
-        // ✅ SUB-FIXTURE EVENTS
+        // SUB-FIXTURE EVENTS
         // ============================================================================
         Some("sub_fixture.pledge") => {
             tracing::info!("📊 Sub-fixture pledge via WebSocket");
@@ -989,7 +995,7 @@ async fn handle_incoming_message(
         }
 
         // ============================================================================
-        // ✅ POST / SOCIAL EVENTS
+        // POST / SOCIAL EVENTS
         // ============================================================================
         Some("post.like") => {
             tracing::info!("❤️ Post like via WebSocket");
@@ -1129,7 +1135,7 @@ async fn handle_incoming_message(
         }
 
         // ============================================================================
-        // ✅ CHANNEL JOIN EVENTS
+        // CHANNEL JOIN EVENTS
         // ============================================================================
         Some("join.approved") => {
             tracing::info!("✅ Join approved via WebSocket");
@@ -1223,7 +1229,7 @@ async fn handle_incoming_message(
 }
 
 // ============================================================================
-// SAVE MESSAGE TO DATABASE
+// SAVE MESSAGE TO DATABASE - FIXED
 // ============================================================================
 
 async fn save_message_to_database(
@@ -1275,7 +1281,7 @@ async fn save_message_to_database(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // ✅ FIXED: Properly parse reply_to from payload
+    // ✅ Parse reply_to from payload
     let reply_to = payload
         .get("replyTo")
         .and_then(|v| v.as_object())
@@ -1314,36 +1320,40 @@ async fn save_message_to_database(
             }
         });
 
-    let now = chrono::Utc::now();
-    let now_bson = bson::DateTime::from_chrono(now);
+    // ✅ FIXED: Use bson::DateTime instead of chrono
+    let now_bson = bson::DateTime::now();
 
+    // ✅ FIXED: Properly build the Message struct with all fields
     let message = Message {
-        id: None,
+        id: Some(ObjectId::new()),
         channel_id: channel_id.to_string(),
         fixture_id: fixture_id.clone(),
         sender_id: user_id.to_string(),
         sender_name: username.to_string(),
-        text,
+        text: text.clone(),
         caption: None,
         sent_at: now_bson,
-        message_id: Some(message_id),
-        selection,
-        image_url: image_url.clone(),
+        message_id: Some(message_id.clone()),
+        selection: selection,
+        temp_id: None, // ✅ Added missing temp_id field
+        image_url: image_url,
         image_public_id: None,
         image_caption: None,
-        is_image,
-        video_url: video_url.clone(),
+        is_image: is_image,
+        video_url: video_url,
         video_public_id: None,
         video_thumbnail_url: None,
         video_caption: None,
         video_duration: None,
         video_size: None,
-        is_video,
-        reply_to: reply_to.clone(),
-        reply_to_id: reply_to.as_ref().map(|r| r.message_id.clone()),
+        is_video: is_video,
+        reply_to: reply_to,
+        reply_to_id: None,
     };
+
     messages_col.insert_one(&message).await?;
 
+    // Update channel fixture counts
     if let Some(fixture_id) = fixture_id {
         let update_result = channel_fixtures_col
             .update_one(
@@ -1373,7 +1383,9 @@ async fn save_message_to_database(
         }
     }
 
+    // Update channel activity
     let now_chrono = chrono::Utc::now();
+    let now_bson_update = bson::DateTime::from_chrono(now_chrono);
 
     channels_col
         .update_one(
@@ -1384,12 +1396,13 @@ async fn save_message_to_database(
                     "activity.messages_this_week": 1,
                 },
                 "$set": {
-                    "activity.last_message_at": bson::DateTime::from_chrono(now_chrono),
+                    "activity.last_message_at": now_bson_update,
                 },
             },
         )
         .await?;
 
+    // Update member message count
     channels_col
         .update_one(
             doc! {
@@ -1398,7 +1411,7 @@ async fn save_message_to_database(
             },
             doc! {
                 "$inc": { "members.$.msg_count": 1 },
-                "$set": { "members.$.last_active_at": bson::DateTime::from_chrono(now_chrono) },
+                "$set": { "members.$.last_active_at": now_bson_update },
             },
         )
         .await?;

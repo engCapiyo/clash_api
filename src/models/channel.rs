@@ -68,14 +68,15 @@ pub struct ChannelActivity {
 // FIXTURE (Global - Master Data Only)
 // ============================================================================
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Fixture {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub id: Option<ObjectId>,
     #[serde(rename = "match_id")]
     pub fixture_id: String,
     pub home_team: String,
     pub away_team: String,
+    pub league: String,
     #[serde(rename = "date_iso")]
     pub date_iso: String,
     #[serde(rename = "time")]
@@ -84,13 +85,38 @@ pub struct Fixture {
     pub result: Option<String>,
     pub home_score: Option<i32>,
     pub away_score: Option<i32>,
+    pub home_win: f64,
+    pub away_win: f64,
+    pub draw: f64,
+    pub is_live: bool,
+    pub available_for_voting: bool,
+    pub source: String,
+    pub scraped_at: DateTime,
+    pub time_elapsed: f64,
+    pub sub_fixtures: Vec<SubFixture>,
+}
+
+// ============================================================================
+// SUB FIXTURE (Prop Bets)
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SubFixture {
+    pub id: String,
+    pub parent_fixture_id: String,
+    pub question: String,
+    pub options: Vec<String>,
+    pub icon: Option<String>,
+    pub is_active: bool,
+    pub vote_counts: VoteCounts,
+    pub created_at: DateTime,
 }
 
 // ============================================================================
 // VOTE COUNTS
 // ============================================================================
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct VoteCounts {
     pub home: i32,
     pub away: i32,
@@ -137,66 +163,6 @@ pub struct ChannelFixture {
 }
 
 // ============================================================================
-// MESSAGE - FULL WITH CAPTION, IMAGES, VIDEOS, REPLY SUPPORT
-// ============================================================================
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Message {
-    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    pub id: Option<ObjectId>,
-    pub channel_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fixture_id: Option<String>,
-    pub sender_id: String,
-    pub sender_name: String,
-
-    // Text content
-    pub text: String,
-
-    // ✅ NEW: Caption for media (separate from text)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub caption: Option<String>,
-
-    pub sent_at: DateTime,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selection: Option<String>,
-
-    // ✅ Image fields
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_public_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_caption: Option<String>,
-    #[serde(default)]
-    pub is_image: bool,
-
-    // ✅ Video fields
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub video_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub video_public_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub video_thumbnail_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub video_caption: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub video_duration: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub video_size: Option<i64>,
-    #[serde(default)]
-    pub is_video: bool,
-
-    // ✅ Reply support
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<ReplyToData>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to_id: Option<String>,
-}
-
-// ============================================================================
 // REPLY TO DATA
 // ============================================================================
 
@@ -221,6 +187,70 @@ pub struct ReplyToData {
 }
 
 // ============================================================================
+// MESSAGE - FULL WITH CAPTION, IMAGES, VIDEOS, REPLY SUPPORT, temp_id
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Message {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub channel_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixture_id: Option<String>,
+    pub sender_id: String,
+    pub sender_name: String,
+
+    // Text content
+    pub text: String,
+
+    // Caption for media (separate from text)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+
+    pub sent_at: DateTime,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
+
+    // ✅ NEW: temp_id for pending message tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_id: Option<String>,
+
+    // Image fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_public_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_caption: Option<String>,
+    #[serde(default)]
+    pub is_image: bool,
+
+    // Video fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_public_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_thumbnail_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_duration: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_size: Option<i64>,
+    #[serde(default)]
+    pub is_video: bool,
+
+    // Reply support
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyToData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_id: Option<String>,
+}
+
+// ============================================================================
 // MESSAGE REQUEST (For creating new messages)
 // ============================================================================
 
@@ -235,6 +265,9 @@ pub struct CreateMessageRequest {
     pub selection: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
+    // ✅ NEW: temp_id for pending message tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -287,6 +320,9 @@ pub struct MessageResponse {
     pub message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selection: Option<String>,
+    // ✅ NEW: temp_id for pending message tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temp_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -326,6 +362,7 @@ impl From<Message> for MessageResponse {
             sent_at: msg.sent_at.to_string(),
             message_id: msg.message_id,
             selection: msg.selection,
+            temp_id: msg.temp_id, // ✅ Include temp_id in response
             image_url: msg.image_url,
             image_public_id: msg.image_public_id,
             image_caption: msg.image_caption,
@@ -462,6 +499,154 @@ impl Like {
 }
 
 // ============================================================================
+// CHAT MEDIA UPLOAD REQUEST
+// ============================================================================
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatMediaUploadRequest {
+    pub file: Vec<u8>,
+    pub file_name: String,
+    pub mime_type: String,
+    pub media_type: String, // "image" or "video"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+}
+
+// ============================================================================
+// CHAT MEDIA UPLOAD RESPONSE
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChatMediaUploadResponse {
+    pub url: String,
+    pub public_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<i64>,
+}
+
+// ============================================================================
+// PLEDGE
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Pledge {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub _id: Option<ObjectId>,
+    pub username: String,
+    pub phone: String,
+    pub selection: String,
+    pub amount: f64,
+    pub time: chrono::DateTime<chrono::Utc>,
+    pub fan: String,
+    pub home_team: String,
+    pub away_team: String,
+    pub starter_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixture_id: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+// ============================================================================
+// GAME (Legacy support)
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Game {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub game_id: String,
+    pub match_id: String,
+    pub home_team: String,
+    pub away_team: String,
+    pub league: String,
+    pub date_iso: String,
+    pub time: String,
+    pub status: String,
+    pub result: Option<String>,
+    pub home_score: Option<i32>,
+    pub away_score: Option<i32>,
+    pub home_win: f64,
+    pub away_win: f64,
+    pub draw: f64,
+    pub is_live: bool,
+    pub available_for_voting: bool,
+    pub source: String,
+    pub scraped_at: DateTime,
+    pub time_elapsed: f64,
+    pub sub_fixtures: Vec<SubFixture>,
+}
+
+// ============================================================================
+// BET
+// ============================================================================
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Bet {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub fixture_id: String,
+    pub starter_id: String,
+    pub starter_name: String,
+    pub starter_selection: String,
+    pub starter_amount: f64,
+    pub finisher_id: Option<String>,
+    pub finisher_name: Option<String>,
+    pub finisher_selection: Option<String>,
+    pub finisher_amount: Option<f64>,
+    pub vote_id: String,
+    pub status: String, // "open" | "matched" | "settled"
+    pub winner_id: Option<String>,
+    pub starter_result: Option<String>,
+    pub finisher_result: Option<String>,
+    pub created_at: DateTime,
+    pub matched_at: Option<DateTime>,
+    pub settled_at: Option<DateTime>,
+}
+
+impl Bet {
+    pub fn new_open(
+        fixture_id: String,
+        starter_id: String,
+        starter_name: String,
+        starter_selection: String,
+        starter_amount: f64,
+        vote_id: String,
+    ) -> Self {
+        Self {
+            id: None,
+            fixture_id,
+            starter_id,
+            starter_name,
+            starter_selection,
+            starter_amount,
+            finisher_id: None,
+            finisher_name: None,
+            finisher_selection: None,
+            finisher_amount: None,
+            vote_id,
+            status: "open".to_string(),
+            winner_id: None,
+            starter_result: None,
+            finisher_result: None,
+            created_at: DateTime::now(),
+            matched_at: None,
+            settled_at: None,
+        }
+    }
+
+    pub fn total_pot(&self) -> f64 {
+        self.starter_amount + self.finisher_amount.unwrap_or(0.0)
+    }
+}
+
+// ============================================================================
 // CONSTRUCTORS
 // ============================================================================
 
@@ -543,6 +728,7 @@ impl Message {
             sent_at: now,
             message_id: None,
             selection: None,
+            temp_id: None, // ✅ Initialize temp_id
             image_url: None,
             image_public_id: None,
             image_caption: None,
@@ -567,6 +753,7 @@ impl Message {
         image_url: String,
         image_public_id: String,
         caption: Option<String>,
+        temp_id: Option<String>,
     ) -> Self {
         let now = DateTime::now();
         Self {
@@ -580,6 +767,7 @@ impl Message {
             sent_at: now,
             message_id: None,
             selection: None,
+            temp_id,
             image_url: Some(image_url),
             image_public_id: Some(image_public_id),
             image_caption: caption,
@@ -607,6 +795,7 @@ impl Message {
         caption: Option<String>,
         duration: Option<i32>,
         size: Option<i64>,
+        temp_id: Option<String>,
     ) -> Self {
         let now = DateTime::now();
         Self {
@@ -620,6 +809,7 @@ impl Message {
             sent_at: now,
             message_id: None,
             selection: None,
+            temp_id,
             image_url: None,
             image_public_id: None,
             image_caption: None,
@@ -645,6 +835,7 @@ impl Message {
         reply_to_text: String,
         reply_to_username: String,
         reply_to_selection: Option<String>,
+        temp_id: Option<String>,
     ) -> Self {
         let now = DateTime::now();
         Self {
@@ -658,6 +849,7 @@ impl Message {
             sent_at: now,
             message_id: None,
             selection: None,
+            temp_id,
             image_url: None,
             image_public_id: None,
             image_caption: None,
@@ -670,7 +862,7 @@ impl Message {
             video_size: None,
             is_video: false,
             reply_to: Some(ReplyToData {
-                message_id: reply_to_id.clone(), // ✅ Clone here
+                message_id: reply_to_id.clone(),
                 text: reply_to_text,
                 username: reply_to_username,
                 selection: reply_to_selection,
@@ -680,39 +872,7 @@ impl Message {
                 is_image: false,
                 is_video: false,
             }),
-            reply_to_id: Some(reply_to_id), // ✅ Use original here
+            reply_to_id: Some(reply_to_id),
         }
     }
-}
-
-// ============================================================================
-// CHAT MEDIA UPLOAD REQUEST
-// ============================================================================
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct ChatMediaUploadRequest {
-    pub file: Vec<u8>,
-    pub file_name: String,
-    pub mime_type: String,
-    pub media_type: String, // "image" or "video"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub caption: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
-}
-
-// ============================================================================
-// CHAT MEDIA UPLOAD RESPONSE
-// ============================================================================
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ChatMediaUploadResponse {
-    pub url: String,
-    pub public_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub thumbnail_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size: Option<i64>,
 }
