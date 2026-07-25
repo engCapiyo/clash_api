@@ -265,6 +265,20 @@ async fn update_one_in_either(
 // (seed / pending-resolution / resolve / abandon)
 // ============================================================================
 
+// ============================================================================
+// REPLACE the existing `SeedFixtureRequest` struct AND the existing
+// `pub async fn seed_fixture(...)` function with the two blocks below.
+// Everything else in the file (move_completed_to_history, GameSource,
+// find_game_tolerant, etc.) stays exactly as-is -- no other changes needed.
+// ============================================================================
+
+// ============================================================================
+// REPLACE the existing `SeedFixtureRequest` struct AND the existing
+// `pub async fn seed_fixture(...)` function with the two blocks below.
+// Everything else in the file (move_completed_to_history, GameSource,
+// find_game_tolerant, etc.) stays exactly as-is -- no other changes needed.
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct SeedFixtureRequest {
     #[serde(rename = "matchId")]
@@ -281,22 +295,36 @@ pub struct SeedFixtureRequest {
     #[serde(rename = "dateIso")]
     pub date_iso: String,
     pub source: String,
+    // NEW: "games" (domestic league/club friendlies) or "fixtures"
+    // (internationals). Defaults to "fixtures" via serde's `default` so any
+    // existing caller that doesn't send this field keeps its old behavior.
+    #[serde(rename = "targetCollection", default = "default_target_collection")]
+    pub target_collection: String,
+}
+
+fn default_target_collection() -> String {
+    "fixtures".to_string()
 }
 
 pub async fn seed_fixture(
     State(state): State<AppState>,
     Json(payload): Json<SeedFixtureRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    tracing::info!("🌱 Seed request for {}", payload.match_id);
+    tracing::info!(
+        "🌱 Seed request for {} -> target={}",
+        payload.match_id,
+        payload.target_collection
+    );
 
-    let fixtures_col: Collection<Game> = state.db.collection(FIXTURES_COLLECTION);
+    let (live_collection_name, history_collection_name) = match payload.target_collection.as_str() {
+        "games" => (GAMES_COLLECTION, "games_history"),
+        _ => (FIXTURES_COLLECTION, "fixtures_history"),
+    };
 
-    // Idempotency check -- mirrors main.py's old get_fixture()-before-
-    // upsert_fixture() guard, now enforced server-side instead of by the
-    // caller. If it already exists (in either collection -- a fixture
-    // could have been promoted into `games` by a status/score update
-    // path elsewhere), this is a no-op.
-    if find_game_tolerant(&fixtures_col, doc! { "matchId": &payload.match_id })
+    let live_col: Collection<Game> = state.db.collection(live_collection_name);
+
+    // Idempotency: already live in the target collection?
+    if find_game_tolerant(&live_col, doc! { "matchId": &payload.match_id })
         .await?
         .is_some()
     {
@@ -308,16 +336,25 @@ pub async fn seed_fixture(
         })));
     }
 
-    let games_col: Collection<Game> = state.db.collection(GAMES_COLLECTION);
-    if find_game_tolerant(&games_col, doc! { "matchId": &payload.match_id })
+    // Already archived to history? Don't resurrect it. This is what stops
+    // a completed match still sitting in a caller's hardcoded list from
+    // coming back to life on the next seed pass.
+    let history_col: Collection<HistoryGame> = state.db.collection(history_collection_name);
+    if history_col
+        .find_one(doc! { "matchId": &payload.match_id })
         .await?
         .is_some()
     {
-        tracing::info!("⏭️ {} already exists in games, skipping", payload.match_id);
+        tracing::info!(
+            "⏭️ {} already archived in {}, skipping (not resurrecting)",
+            payload.match_id,
+            history_collection_name
+        );
         return Ok(Json(json!({
             "success": true,
             "created": false,
             "match_id": payload.match_id,
+            "reason": "already_in_history",
         })));
     }
 
@@ -337,13 +374,40 @@ pub async fn seed_fixture(
     // deserialization (Option<String> vs ObjectId).
     game.id = Some(payload.match_id.clone());
 
-    fixtures_col.insert_one(&game).await?;
-    tracing::info!("✅ Seeded new fixture {}", payload.match_id);
+    live_col.insert_one(&game).await?;
+    tracing::info!(
+        "✅ Seeded new fixture {} into {}",
+        payload.match_id,
+        live_collection_name
+    );
+
+    // NEW: create default sub-fixture markets (first_goal/first_card/
+    // first_corner) as soon as the fixture is seeded, rather than waiting
+    // for resolve_fixture(). create_default_markets_for_match only needs
+    // match_id -- it doesn't touch threesixtyfiveGameId/competitor ids --
+    // so there's no dependency on resolution having happened first.
+    // Idempotent: if resolve_fixture() later calls this again for the same
+    // match_id, create_default_markets_for_match's own existence check
+    // (per market_id) makes the second call a no-op. Failure here doesn't
+    // block the seed response succeeding, same as resolve_fixture's call.
+    if let Err(e) = crate::handlers::sub_fixture_handler::create_default_markets_for_match(
+        &state,
+        &payload.match_id,
+    )
+    .await
+    {
+        tracing::error!(
+            "❌ Failed to create default markets for {} at seed time: {:?}",
+            payload.match_id,
+            e
+        );
+    }
 
     Ok(Json(json!({
         "success": true,
         "created": true,
         "match_id": payload.match_id,
+        "collection": live_collection_name,
     })))
 }
 

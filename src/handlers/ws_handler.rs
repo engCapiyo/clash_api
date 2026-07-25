@@ -326,6 +326,157 @@ async fn handle_incoming_message(
             }
         }
 
+        // ============================================================================
+        // GET COMMENTARY - For live commentary from poller (just acknowledge)
+        // ============================================================================
+        Some("get.commentary") => {
+            tracing::info!("📖 get.commentary received");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ get.commentary missing payload");
+                    return;
+                }
+            };
+
+            let fixture_id = payload
+                .get("fixtureId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            // Just acknowledge - poller sends signals separately
+            let response = serde_json::json!({
+                "type": "commentary.response",
+                "payload": {
+                    "fixture_id": fixture_id,
+                    "commentary": [],
+                },
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&response) {
+                let mut guard = sender.lock().await;
+                let _ = guard.send(WsMessage::Text(json)).await;
+                tracing::info!("📤 Sent commentary response (poller handles signals)");
+            }
+        }
+
+        // ============================================================================
+        // GET LATEST COMMENT - For client chat messages
+        // ============================================================================
+        Some("get.latest.comment") => {
+            tracing::info!("📖 Getting latest client chat message for fixture");
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p.clone(),
+                None => {
+                    tracing::error!("❌ get.latest.comment missing payload");
+                    return;
+                }
+            };
+
+            let fixture_id = payload
+                .get("fixtureId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if fixture_id.is_empty() {
+                tracing::error!("❌ get.latest.comment missing fixtureId");
+                return;
+            }
+
+            // Get the channel_id from the connection context
+            let current_room_lock = current_room.lock().await;
+            let channel_id = current_room_lock
+                .split('_')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            drop(current_room_lock);
+
+            if channel_id.is_empty() {
+                tracing::error!("❌ get.latest.comment: Could not determine channel_id");
+                return;
+            }
+
+            // Query latest chat message from messages collection
+            let messages_col = state.db.collection::<Message>("messages");
+
+            let filter = doc! {
+                "channel_id": &channel_id,
+                "fixture_id": &fixture_id,
+            };
+
+            let options = mongodb::options::FindOptions::builder()
+                .sort(doc! { "sent_at": -1 })
+                .limit(1)
+                .build();
+
+            match messages_col.find_one(filter).await {
+                Ok(Some(msg)) => {
+                    let latest_comment = serde_json::json!({
+                        "id": msg.message_id,
+                        "sender_id": msg.sender_id,
+                        "sender_name": msg.sender_name,
+                        "text": msg.text,
+                        "selection": msg.selection,
+                        "image_url": msg.image_url,
+                        "video_url": msg.video_url,
+                        "is_image": msg.is_image,
+                        "is_video": msg.is_video,
+                        "timestamp": msg.sent_at.to_chrono().to_rfc3339(),
+                        "reply_to": msg.reply_to.map(|r| serde_json::json!({
+                            "messageId": r.message_id,
+                            "text": r.text,
+                            "username": r.username,
+                            "selection": r.selection,
+                            "isMe": r.is_me,
+                        })),
+                    });
+
+                    let response = serde_json::json!({
+                        "type": "latest.comment.response",
+                        "payload": {
+                            "fixture_id": fixture_id,
+                            "channel_id": channel_id,
+                            "comment": latest_comment,
+                        },
+                        "timestamp": Utc::now().to_rfc3339(),
+                    });
+
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        let mut guard = sender.lock().await;
+                        let _ = guard.send(WsMessage::Text(json)).await;
+                        tracing::info!("📤 Sent latest client comment response");
+                    }
+                }
+                Ok(None) => {
+                    // No comments found - send empty response
+                    let response = serde_json::json!({
+                        "type": "latest.comment.response",
+                        "payload": {
+                            "fixture_id": fixture_id,
+                            "channel_id": channel_id,
+                            "comment": null,
+                        },
+                        "timestamp": Utc::now().to_rfc3339(),
+                    });
+
+                    if let Ok(json) = serde_json::to_string(&response) {
+                        let mut guard = sender.lock().await;
+                        let _ = guard.send(WsMessage::Text(json)).await;
+                        tracing::info!("📤 Sent empty latest client comment response");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("❌ Failed to fetch latest client comment: {}", e);
+                }
+            }
+        }
+
         Some("chat.message") => {
             tracing::info!("✅ Matched chat.message");
 
@@ -1229,7 +1380,7 @@ async fn handle_incoming_message(
 }
 
 // ============================================================================
-// SAVE MESSAGE TO DATABASE - FIXED
+// SAVE MESSAGE TO DATABASE
 // ============================================================================
 
 async fn save_message_to_database(
@@ -1281,7 +1432,6 @@ async fn save_message_to_database(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // ✅ Parse reply_to from payload
     let reply_to = payload
         .get("replyTo")
         .and_then(|v| v.as_object())
@@ -1320,10 +1470,8 @@ async fn save_message_to_database(
             }
         });
 
-    // ✅ FIXED: Use bson::DateTime instead of chrono
     let now_bson = bson::DateTime::now();
 
-    // ✅ FIXED: Properly build the Message struct with all fields
     let message = Message {
         id: Some(ObjectId::new()),
         channel_id: channel_id.to_string(),
@@ -1335,7 +1483,7 @@ async fn save_message_to_database(
         sent_at: now_bson,
         message_id: Some(message_id.clone()),
         selection: selection,
-        temp_id: None, // ✅ Added missing temp_id field
+        temp_id: None,
         image_url: image_url,
         image_public_id: None,
         image_caption: None,
