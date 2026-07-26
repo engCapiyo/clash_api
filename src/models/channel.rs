@@ -359,10 +359,10 @@ impl From<Message> for MessageResponse {
             sender_name: msg.sender_name,
             text: msg.text,
             caption: msg.caption,
-            sent_at: msg.sent_at.to_string(),
+            sent_at: msg.sent_at.to_chrono().to_rfc3339(), // ✅ FIXED
             message_id: msg.message_id,
             selection: msg.selection,
-            temp_id: msg.temp_id, // ✅ Include temp_id in response
+            temp_id: msg.temp_id,
             image_url: msg.image_url,
             image_public_id: msg.image_public_id,
             image_caption: msg.image_caption,
