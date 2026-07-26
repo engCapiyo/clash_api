@@ -440,12 +440,12 @@ pub async fn get_pending_resolution(
         .cloned()
         .unwrap_or_else(|| "friendly_hardcoded".to_string());
 
-    let now = BsonDateTime::from_chrono(Utc::now());
+    let today = Utc::now().format("%Y-%m-%d").to_string();
     let filter = doc! {
         "source": &source,
         "threesixtyfiveGameId": null,
         "resolutionAbandoned": { "$ne": true },
-        "kickoffUtc": { "$lte": now },
+        "date": { "$lte": &today },
     };
 
     let games = find_games_tolerant_all(&state, filter, None).await?;
