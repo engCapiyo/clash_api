@@ -21,8 +21,8 @@ use crate::models::posta::{
 };
 use crate::state::AppState;
 
-const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
-const MAX_VIDEO_SIZE: u64 = 50 * 1024 * 1024; // 50MB
+const MAX_FILE_SIZE: u64 = 40 * 1024 * 1024; // 10MB
+const MAX_VIDEO_SIZE: u64 = 100 * 1024 * 1024; // 100MB
 const ALLOWED_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "gif"];
 const ALLOWED_VIDEO_EXTENSIONS: [&str; 4] = ["mp4", "mov", "avi", "mkv"];
 const DEFAULT_PAGE_SIZE: i64 = 20;
@@ -290,6 +290,7 @@ pub async fn get_user_post_stats(
 
 // ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
 // ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
+// ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
 pub async fn create_post(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -471,15 +472,29 @@ pub async fn create_post(
             let duration = 0;
             let size = video_data.len() as i64;
 
-            Post::new_video_post(
-                user_id.clone(),
-                user_name.clone(),
-                video_url,
-                firebase_public_id,
-                thumbnail_url,
-                Some(duration),
-                Some(size),
-            )
+            // ✅ FIX: preserve caption on video-only uploads instead of
+            // always calling new_video_post (which hard-codes caption: None)
+            match caption.clone() {
+                Some(caption_text) => Post::new_text_video_post(
+                    user_id.clone(),
+                    user_name.clone(),
+                    caption_text,
+                    video_url,
+                    firebase_public_id,
+                    thumbnail_url,
+                    Some(duration),
+                    Some(size),
+                ),
+                None => Post::new_video_post(
+                    user_id.clone(),
+                    user_name.clone(),
+                    video_url,
+                    firebase_public_id,
+                    thumbnail_url,
+                    Some(duration),
+                    Some(size),
+                ),
+            }
         }
         (Some(image_data), Some(video_data)) => {
             let ext = video_extension.unwrap_or("mp4".to_string());

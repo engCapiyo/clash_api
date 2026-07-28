@@ -1,5 +1,5 @@
 use axum::{
-    extract::DefaultBodyLimit, // ✅ add this
+    extract::DefaultBodyLimit,
     routing::{delete, get, post, put},
     Router,
 };
@@ -7,13 +7,15 @@ use axum::{
 use crate::handlers::posta;
 use crate::state::AppState;
 
+const MAX_UPLOAD_BODY_SIZE: usize = 100 * 1024 * 1024; // 100MB
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         // Post routes - root level
         .route("/", get(posta::get_posts))
         .route(
             "/",
-            post(posta::create_post).layer(DefaultBodyLimit::max(60 * 1024 * 1024)), // ✅ add posta:: prefix
+            post(posta::create_post).layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_SIZE)),
         )
         .route("/search", get(posta::search_posts))
         .route("/stats", get(posta::get_post_stats))
@@ -48,5 +50,8 @@ pub fn comment_routes() -> Router<AppState> {
 }
 
 pub fn upload_routes() -> Router<AppState> {
-    Router::new().route("/upload", post(posta::create_post))
+    Router::new().route(
+        "/upload",
+        post(posta::create_post).layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_SIZE)),
+    )
 }
