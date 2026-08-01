@@ -1,5 +1,5 @@
 // ============================================================================
-// websocket.rs - Complete WebSocket Handler with Dedicated Minute Updates
+// websocket.rs - Complete WebSocket Handler with Multi-Room Support
 // ============================================================================
 
 use crate::errors::{AppError, Result};
@@ -17,6 +17,7 @@ use chrono::{Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing;
@@ -35,6 +36,13 @@ pub struct WsQuery {
     pub channel_id: String,
     pub fixture_id: Option<String>,
 }
+
+// ============================================================================
+// TYPE ALIASES — one connection can now be a member of many rooms
+// ============================================================================
+
+type RoomSet = Arc<Mutex<HashSet<String>>>;
+type ForwarderMap = Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>;
 
 // ============================================================================
 // BROADCAST FUNCTIONS
@@ -224,16 +232,25 @@ async fn handle_socket(
         initial_room_key
     );
 
-    let current_room: Arc<Mutex<String>> = Arc::new(Mutex::new(initial_room_key.clone()));
-    let forwarder: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+    // ✅ MULTI-ROOM: a connection can now belong to any number of rooms.
+    let joined_rooms: RoomSet = Arc::new(Mutex::new(HashSet::new()));
+    let forwarders: ForwarderMap = Arc::new(Mutex::new(HashMap::new()));
 
-    let initial_handle = spawn_room_forwarder(&state, &initial_room_key, sender.clone());
-    *forwarder.lock().await = Some(initial_handle);
+    // Join the initial room (from the query-string connect call) the same
+    // way any other room.join would.
+    {
+        let handle = spawn_room_forwarder(&state, &initial_room_key, sender.clone());
+        joined_rooms.lock().await.insert(initial_room_key.clone());
+        forwarders
+            .lock()
+            .await
+            .insert(initial_room_key.clone(), handle);
+    }
 
     let sender_clone = sender.clone();
     let state_clone = state.clone();
-    let current_room_clone = current_room.clone();
-    let forwarder_clone = forwarder.clone();
+    let joined_rooms_clone = joined_rooms.clone();
+    let forwarders_clone = forwarders.clone();
     let user_id_clone = user_id.clone();
 
     let mut recv_task = tokio::spawn(async move {
@@ -244,8 +261,8 @@ async fn handle_socket(
                         text,
                         &state_clone,
                         &sender_clone,
-                        &current_room_clone,
-                        &forwarder_clone,
+                        &joined_rooms_clone,
+                        &forwarders_clone,
                         &user_id_clone,
                     )
                     .await;
@@ -269,17 +286,22 @@ async fn handle_socket(
     let _ = &mut recv_task;
     recv_task.await.ok();
 
-    if let Some(handle) = forwarder.lock().await.take() {
-        handle.abort();
+    // Abort every forwarder this connection had open, for every room it was in.
+    {
+        let mut map = forwarders.lock().await;
+        for (_, handle) in map.drain() {
+            handle.abort();
+        }
     }
 
     // Mark user as offline
     state.set_user_offline(&user_id);
 
+    let final_rooms = joined_rooms.lock().await.clone();
     tracing::info!(
-        "🔌 WS disconnected: user {} from room {}",
+        "🔌 WS disconnected: user {} from rooms {:?}",
         user_id,
-        current_room.lock().await
+        final_rooms
     );
 }
 
@@ -321,8 +343,8 @@ async fn handle_incoming_message(
     text: String,
     state: &AppState,
     sender: &Arc<Mutex<futures_util::stream::SplitSink<WebSocket, WsMessage>>>,
-    current_room: &Arc<Mutex<String>>,
-    forwarder: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    joined_rooms: &RoomSet,
+    forwarders: &ForwarderMap,
     connection_user_id: &str,
 ) {
     tracing::info!("🔥 RAW WS MESSAGE: {}", text);
@@ -338,6 +360,17 @@ async fn handle_incoming_message(
     let message_type = json_msg.get("type").and_then(|t| t.as_str());
 
     match message_type {
+        // ============================================================================
+        // ROOM.JOIN — ✅ ADDS a room to the set, never replaces the others.
+        //
+        // Two payload shapes are supported:
+        //   1. Explicit channel/fixture: { "channel_id": "...", "fixture_id": "..." }
+        //      (used by ChatScreen — same shape as before)
+        //   2. Bare room id: { "roomId": "wc26_4627864" }
+        //      (used by FixturesPage to join a specific fixture's room
+        //       without needing to know the exact channel_id/fixture_id
+        //       split — the client already knows the composed room key)
+        // ============================================================================
         Some("room.join") => {
             let sender_clone = sender.clone();
 
@@ -349,28 +382,39 @@ async fn handle_incoming_message(
                 }
             };
 
-            let new_channel_id = payload
-                .get("channel_id")
+            // Shape 2: bare roomId
+            let bare_room_id = payload
+                .get("roomId")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let new_fixture_id = payload
-                .get("fixture_id")
-                .and_then(|v| if v.is_null() { None } else { v.as_str() })
                 .filter(|s| !s.is_empty());
 
-            if new_channel_id.is_empty() {
-                tracing::error!("❌ room.join missing channel_id");
-                return;
-            }
+            let new_room_key = if let Some(room_id) = bare_room_id {
+                room_id.to_string()
+            } else {
+                // Shape 1: channel_id (+ optional fixture_id)
+                let new_channel_id = payload
+                    .get("channel_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
 
-            let new_room_key = match new_fixture_id {
-                Some(f) => format!("{}_{}", new_channel_id, f),
-                None => format!("{}_overall", new_channel_id),
+                let new_fixture_id = payload
+                    .get("fixture_id")
+                    .and_then(|v| if v.is_null() { None } else { v.as_str() })
+                    .filter(|s| !s.is_empty());
+
+                if new_channel_id.is_empty() {
+                    tracing::error!("❌ room.join missing channel_id and roomId");
+                    return;
+                }
+
+                match new_fixture_id {
+                    Some(f) => format!("{}_{}", new_channel_id, f),
+                    None => format!("{}_overall", new_channel_id),
+                }
             };
 
-            let mut current = current_room.lock().await;
-            if *current == new_room_key {
+            let already_in_room = joined_rooms.lock().await.contains(&new_room_key);
+            if already_in_room {
                 let ack = serde_json::json!({
                     "type": "room.joined",
                     "payload": { "room_id": new_room_key },
@@ -384,21 +428,19 @@ async fn handle_incoming_message(
             }
 
             tracing::info!(
-                "🔀 User {} switching room: {} → {}",
+                "🔀 User {} joining room: {} (additive — existing rooms kept)",
                 connection_user_id,
-                current,
                 new_room_key
             );
 
-            if let Some(old_handle) = forwarder.lock().await.take() {
-                old_handle.abort();
-            }
-
             let sender_for_forwarder = sender.clone();
             let new_handle = spawn_room_forwarder(state, &new_room_key, sender_for_forwarder);
-            *forwarder.lock().await = Some(new_handle);
-            *current = new_room_key.clone();
-            drop(current);
+
+            joined_rooms.lock().await.insert(new_room_key.clone());
+            forwarders
+                .lock()
+                .await
+                .insert(new_room_key.clone(), new_handle);
 
             let ack = serde_json::json!({
                 "type": "room.joined",
@@ -412,8 +454,72 @@ async fn handle_incoming_message(
         }
 
         // ============================================================================
-        // GET CURRENT MINUTE - DEDICATED MINUTE REQUEST
+        // ROOM.LEAVE — ✅ NEW. Removes a single room without touching the others.
+        // Same two payload shapes as room.join: { "roomId": "..." } or
+        // { "channel_id": "...", "fixture_id": "..." }.
         // ============================================================================
+        Some("room.leave") => {
+            let sender_clone = sender.clone();
+
+            let payload = match json_msg.get("payload") {
+                Some(p) => p,
+                None => {
+                    tracing::error!("❌ room.leave missing payload");
+                    return;
+                }
+            };
+
+            let bare_room_id = payload
+                .get("roomId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty());
+
+            let room_key = if let Some(room_id) = bare_room_id {
+                room_id.to_string()
+            } else {
+                let channel_id = payload
+                    .get("channel_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let fixture_id = payload
+                    .get("fixture_id")
+                    .and_then(|v| if v.is_null() { None } else { v.as_str() })
+                    .filter(|s| !s.is_empty());
+
+                if channel_id.is_empty() {
+                    tracing::error!("❌ room.leave missing channel_id and roomId");
+                    return;
+                }
+
+                match fixture_id {
+                    Some(f) => format!("{}_{}", channel_id, f),
+                    None => format!("{}_overall", channel_id),
+                }
+            };
+
+            let removed = joined_rooms.lock().await.remove(&room_key);
+            if removed {
+                if let Some(handle) = forwarders.lock().await.remove(&room_key) {
+                    handle.abort();
+                }
+                tracing::info!(
+                    "🚪 User {} left room: {}",
+                    connection_user_id,
+                    room_key
+                );
+            }
+
+            let ack = serde_json::json!({
+                "type": "room.left",
+                "payload": { "room_id": room_key },
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+            if let Ok(ack_json) = serde_json::to_string(&ack) {
+                let mut guard = sender_clone.lock().await;
+                let _ = guard.send(WsMessage::Text(ack_json)).await;
+            }
+        }
 
         // ============================================================================
         // GET CURRENT MINUTE - From games collection
@@ -440,21 +546,28 @@ async fn handle_incoming_message(
                 return;
             }
 
-            // Get the channel_id from the connection context
-            let current_room_lock = current_room.lock().await;
-            let channel_id = current_room_lock
-                .split('_')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            drop(current_room_lock);
+            // Best-effort: pull channel_id out of any joined room whose
+            // suffix matches this fixture_id (multi-room aware).
+            let channel_id = {
+                let rooms = joined_rooms.lock().await;
+                rooms
+                    .iter()
+                    .find_map(|room| {
+                        let suffix = format!("_{}", fixture_id);
+                        if room.ends_with(&suffix) {
+                            Some(room[..room.len() - suffix.len()].to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default()
+            };
 
             if channel_id.is_empty() {
                 tracing::error!("❌ get.minute: Could not determine channel_id");
                 return;
             }
 
-            // Query the game from the games collection (not channel_fixtures)
             let games_col = state.db.collection::<crate::models::game::Game>("games");
 
             match games_col
@@ -464,9 +577,7 @@ async fn handle_incoming_message(
                 .await
             {
                 Ok(Some(game)) => {
-                    // Get time_elapsed from the Game model
                     let time_elapsed = game.time_elapsed.unwrap_or(0.0);
-                    let status = game.status.clone();
 
                     let is_half_time = time_elapsed >= 44.0 && time_elapsed <= 46.0;
                     let is_full_time = time_elapsed >= 90.0;
@@ -509,7 +620,6 @@ async fn handle_incoming_message(
                 }
                 Ok(None) => {
                     tracing::warn!("⚠️ Game not found: {}", fixture_id);
-                    // Send a default response
                     let response = serde_json::json!({
                         "type": "minute.response",
                         "payload": {
@@ -552,16 +662,20 @@ async fn handle_incoming_message(
                 .unwrap_or("")
                 .to_string();
 
-            // Get channel_id from current room
-            let current_room_lock = current_room.lock().await;
-            let channel_id = current_room_lock
-                .split('_')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            drop(current_room_lock);
-
-            // Query commentary from database
+            let channel_id = {
+                let rooms = joined_rooms.lock().await;
+                rooms
+                    .iter()
+                    .find_map(|room| {
+                        let suffix = format!("_{}", fixture_id);
+                        if room.ends_with(&suffix) {
+                            Some(room[..room.len() - suffix.len()].to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default()
+            };
 
             let filter = doc! {
                 "fixture_id": &fixture_id,
@@ -599,21 +713,26 @@ async fn handle_incoming_message(
                 return;
             }
 
-            // Get the channel_id from the connection context
-            let current_room_lock = current_room.lock().await;
-            let channel_id = current_room_lock
-                .split('_')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            drop(current_room_lock);
+            let channel_id = {
+                let rooms = joined_rooms.lock().await;
+                rooms
+                    .iter()
+                    .find_map(|room| {
+                        let suffix = format!("_{}", fixture_id);
+                        if room.ends_with(&suffix) {
+                            Some(room[..room.len() - suffix.len()].to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default()
+            };
 
             if channel_id.is_empty() {
                 tracing::error!("❌ get.latest.comment: Could not determine channel_id");
                 return;
             }
 
-            // Query latest chat message from messages collection
             let messages_col = state.db.collection::<Message>("messages");
 
             let filter = doc! {
@@ -665,7 +784,6 @@ async fn handle_incoming_message(
                     }
                 }
                 Ok(None) => {
-                    // No comments found - send empty response
                     let response = serde_json::json!({
                         "type": "latest.comment.response",
                         "payload": {
@@ -693,8 +811,6 @@ async fn handle_incoming_message(
         // ============================================================================
         Some("chat.message") => {
             tracing::info!("✅ Matched chat.message");
-
-            let sender_clone = sender.clone();
 
             let payload = match json_msg.get("payload") {
                 Some(p) => p.clone(),
@@ -816,8 +932,6 @@ async fn handle_incoming_message(
         // TYPING INDICATOR
         // ============================================================================
         Some("typing") => {
-            let sender_clone = sender.clone();
-
             if let Some(payload) = json_msg.get("payload") {
                 let channel_id = payload
                     .get("channelId")
@@ -1011,7 +1125,6 @@ async fn handle_incoming_message(
                 return;
             }
 
-            // Broadcast to channel room
             let room_key = format!("{}_{}", channel_id, fixture_id);
             let room_broadcaster = state.get_or_create_broadcaster(&room_key);
 
@@ -1026,7 +1139,6 @@ async fn handle_incoming_message(
                 tracing::info!("📡 Broadcasted vote.cast to room: {}", room_key);
             }
 
-            // Send to user's personal room for online check
             let user_room = format!("user_{}", user_id);
             let user_tx = state.get_or_create_broadcaster(&user_room);
             if let Ok(json) = serde_json::to_string(&broadcast_msg) {
@@ -1492,7 +1604,6 @@ async fn handle_incoming_message(
                 return;
             }
 
-            // Send to target user's personal room
             let user_room = format!("user_{}", target_user_id);
             let user_tx = state.get_or_create_broadcaster(&user_room);
 
@@ -1537,7 +1648,6 @@ async fn handle_incoming_message(
                 return;
             }
 
-            // Send to user's personal room
             let user_room = format!("user_{}", user_id);
             let user_tx = state.get_or_create_broadcaster(&user_room);
 
@@ -1552,7 +1662,6 @@ async fn handle_incoming_message(
                 tracing::info!("📡 Broadcasted join.approved to user: {}", user_id);
             }
 
-            // Also broadcast to channel room
             let channel_room = format!("channel_{}", channel_id);
             let channel_tx = state.get_or_create_broadcaster(&channel_room);
             if let Ok(json) = serde_json::to_string(&broadcast_msg) {
