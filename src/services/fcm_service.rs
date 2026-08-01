@@ -38,15 +38,18 @@ impl FCMService {
         println!("📖 Reading Firebase credentials from environment variables...");
 
         // Get credentials from .env
-        let client_email = env::var("FIREBASE_CLIENT_EMAIL")
-            .map_err(|_| anyhow!("FIREBASE_CLIENT_EMAIL not set in environment"))?;
+      let client_email = env::var("FIREBASE_CLIENT_EMAIL")
+    .map_err(|_| anyhow!("FIREBASE_CLIENT_EMAIL not set in environment"))?;
 
-        let private_key = env::var("FIREBASE_PRIVATE_KEY")
-            .map_err(|_| anyhow!("FIREBASE_PRIVATE_KEY not set in environment"))?;
+let private_key = env::var("FIREBASE_PRIVATE_KEY")
+    .map_err(|_| anyhow!("FIREBASE_PRIVATE_KEY not set in environment"))?;
 
-        let project_id =
-            env::var("FIREBASE_PROJECT_ID").unwrap_or_else(|_| "clash-66865".to_string());
+// ADD THIS:
+let private_key_id = env::var("FIREBASE_PRIVATE_KEY_ID")
+    .map_err(|_| anyhow!("FIREBASE_PRIVATE_KEY_ID not set in environment"))?;
 
+let project_id =
+    env::var("FIREBASE_PROJECT_ID").unwrap_or_else(|_| "clash-66865".to_string());
         println!("✅ FIREBASE_CLIENT_EMAIL found: {}", client_email);
         println!(
             "✅ FIREBASE_PRIVATE_KEY found (length: {} chars)",
@@ -67,19 +70,18 @@ impl FCMService {
             .trim_matches('"')
             .to_string();
 
-        let service_account_value = json!({
-            "type": "service_account",
-            "project_id": project_id,
-            "private_key_id": "",
-            "private_key": cleaned_private_key,
-            "client_email": client_email,
-            "client_id": "",
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_x509_cert_url": format!("https://www.googleapis.com/robot/v1/metadata/x509/{}", client_email.replace("@", "%40"))
-        });
-
+       let service_account_value = json!({
+    "type": "service_account",
+    "project_id": project_id,
+    "private_key_id": private_key_id,   // was: ""
+    "private_key": cleaned_private_key,
+    "client_email": client_email,
+    "client_id": "",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_x509_cert_url": format!("https://www.googleapis.com/robot/v1/metadata/x509/{}", client_email.replace("@", "%40"))
+});
         let service_account_json = serde_json::to_string(&service_account_value)
             .map_err(|e| anyhow!("Failed to serialize service account JSON: {}", e))?;
 
