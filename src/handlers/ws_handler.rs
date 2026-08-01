@@ -644,48 +644,14 @@ async fn handle_incoming_message(
 
         // ============================================================================
         // GET COMMENTARY - For live commentary from poller
+        // Not implemented yet — the schema for the commentary collection
+        // hasn't been finalized, so this just acknowledges the request
+        // instead of guessing at field names. Client relies on
+        // commentary.new / commentary.bulk pushes and the HTTP polling
+        // fallback (_startCommentaryPolling) in the meantime.
         // ============================================================================
         Some("get.commentary") => {
-            tracing::info!("📖 get.commentary received");
-
-            let payload = match json_msg.get("payload") {
-                Some(p) => p.clone(),
-                None => {
-                    tracing::error!("❌ get.commentary missing payload");
-                    return;
-                }
-            };
-
-            let fixture_id = payload
-                .get("fixtureId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let channel_id = {
-                let rooms = joined_rooms.lock().await;
-                rooms
-                    .iter()
-                    .find_map(|room| {
-                        let suffix = format!("_{}", fixture_id);
-                        if room.ends_with(&suffix) {
-                            Some(room[..room.len() - suffix.len()].to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default()
-            };
-
-            let filter = doc! {
-                "fixture_id": &fixture_id,
-                "channel_id": &channel_id,
-            };
-
-            let options = mongodb::options::FindOptions::builder()
-                .sort(doc! { "created_at": -1 })
-                .limit(1)
-                .build();
+            tracing::warn!("⚠️ get.commentary requested but not implemented");
         }
 
         // ============================================================================
@@ -1797,7 +1763,7 @@ async fn save_message_to_database(
                 text: reply_to_text,
                 username: reply_to_username,
                 selection: reply_to_selection,
-                is_me: false,
+                is_me,  // ✅ was hardcoded `false` — now uses the parsed value
                 image_url: None,
                 video_url: None,
                 is_image: false,
