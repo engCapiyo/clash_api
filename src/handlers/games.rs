@@ -1702,96 +1702,46 @@ pub async fn add_commentary_bulk(
     )
     .await?;
 
-    // Fan-out is now decoupled from the HTTP response: the poller gets its
-    // 200 back as soon as Mongo is written, regardless of how many entries
-    // there are or how many channels are watching this fixture. Nothing
-    // downstream of this point can slow down the poller's own loop.
-    //
-    // Sends are also staggered (150ms apart per entry) rather than fired
-    // in the same tick. Without this, a reconnect-gap burst of N entries
-    // hits every connected client's _onCommentaryNew in the same event-loop
-    // turn -- N inserts + N setState + N scrollToBottom back-to-back --
-    // which is what actually causes visible jank on the client, not the
-    // raw frame count itself. 150ms/entry means even a 20-entry burst
-    // finishes trickling in under 3s, which reads as "live" rather than
-    // "dumped", while still being far faster than any human reads text.
-    let state_bg = state.clone();
-    let match_id_bg = payload.match_id.clone();
-    tokio::spawn(async move {
-        use crate::models::channel::ChannelFixture;
-
-        let channel_fixtures_col: Collection<ChannelFixture> =
-            state_bg.db.collection("channel_fixtures");
-
-        let mut room_keys = Vec::new();
-        match channel_fixtures_col.find(doc! { "fixture_id": &match_id_bg }).await {
-            Ok(mut cursor) => loop {
-                match cursor.advance().await {
-                    Ok(true) => {
-                        if let Ok(cf) = cursor.deserialize_current() {
-                            room_keys.push(format!("{}_{}", cf.channel_id, match_id_bg));
-                        }
-                    }
-                    Ok(false) => break,
-                    Err(e) => {
-                        tracing::error!(
-                            "❌ Failed to advance channel_fixtures cursor for {}: {}",
-                            match_id_bg, e
-                        );
-                        break;
-                    }
-                }
-            },
-            Err(e) => {
-                tracing::error!(
-                    "❌ Failed to query channel_fixtures for {}: {}",
-                    match_id_bg, e
-                );
-                return;
-            }
-        }
-
-        if room_keys.is_empty() {
-            return;
-        }
-
-        let total = broadcast_entries.len();
-        for (i, entry) in broadcast_entries.iter().enumerate() {
-            let broadcast_msg = json!({
-                "type": "commentary.new",
-                "payload": entry,
-                "timestamp": Utc::now().to_rfc3339(),
-            });
-            let broadcast_json = match serde_json::to_string(&broadcast_msg) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("❌ Failed to serialize commentary broadcast: {}", e);
-                    continue;
-                }
-            };
-
-            for room_key in &room_keys {
-                let tx = state_bg.get_or_create_broadcaster(room_key);
-                let _ = tx.send(broadcast_json.clone());
-            }
-
-            if i + 1 < total {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            }
-        }
-
-        tracing::info!(
-            "✅ {} commentary.new broadcasts trickled to {} channel(s) for {}",
-            total, room_keys.len(), match_id_bg
-        );
+    // Single broadcast carrying all entries as an array, matching the
+    // client's dedicated _onCommentaryBulk handler (listens for
+    // "commentary.bulk", reads payload as a List, dedupes + inserts all
+    // entries, then does ONE setState + ONE scrollToBottom for the whole
+    // batch). No need to split into per-entry "commentary.new" sends or
+    // stagger them -- the client already batches the UI update for us.
+    let broadcast_msg = json!({
+        "type": "commentary.bulk",
+        "payload": broadcast_entries,
+        "timestamp": Utc::now().to_rfc3339(),
     });
+
+    use crate::models::channel::ChannelFixture;
+    let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
+    let mut cursor = channel_fixtures_col
+        .find(doc! { "fixture_id": &payload.match_id })
+        .await?;
+
+    let broadcast_json = serde_json::to_string(&broadcast_msg).unwrap();
+    let mut channel_count = 0;
+
+    while cursor.advance().await? {
+        let cf = cursor.deserialize_current()?;
+        let room_key = format!("{}_{}", cf.channel_id, payload.match_id);
+        let tx = state.get_or_create_broadcaster(&room_key);
+        let _ = tx.send(broadcast_json.clone());
+        channel_count += 1;
+    }
+
+    tracing::info!(
+        "✅ Bulk commentary stored in {:?} ({} entries), broadcasted to {} channel(s) for {}",
+        source, count, channel_count, payload.match_id
+    );
 
     Ok(Json(json!({
         "success": true,
         "message": "Bulk commentary added",
         "source_collection": source.collection_name(),
         "count": count,
-        "channels_notified_async": true,
+        "channels_notified": channel_count,
     })))
 }
 
