@@ -524,6 +524,9 @@ async fn handle_incoming_message(
         // ============================================================================
         // GET CURRENT MINUTE - From games collection
         // ============================================================================
+        // ============================================================================
+        // GET CURRENT MINUTE - From games collection
+        // ============================================================================
         Some("get.minute") => {
             tracing::info!("📖 Getting current minute for fixture");
 
@@ -546,21 +549,31 @@ async fn handle_incoming_message(
                 return;
             }
 
-            // Best-effort: pull channel_id out of any joined room whose
-            // suffix matches this fixture_id (multi-room aware).
-            let channel_id = {
-                let rooms = joined_rooms.lock().await;
-                rooms
-                    .iter()
-                    .find_map(|room| {
-                        let suffix = format!("_{}", fixture_id);
-                        if room.ends_with(&suffix) {
-                            Some(room[..room.len() - suffix.len()].to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default()
+            // ✅ Prefer the explicit channelId the client sends. Only fall
+            // back to scanning joined_rooms if it's missing — a one-shot
+            // minute lookup shouldn't require the room to already be joined.
+            let explicit_channel_id = payload
+                .get("channelId")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+
+            let channel_id = match explicit_channel_id {
+                Some(id) => id,
+                None => {
+                    let rooms = joined_rooms.lock().await;
+                    rooms
+                        .iter()
+                        .find_map(|room| {
+                            let suffix = format!("_{}", fixture_id);
+                            if room.ends_with(&suffix) {
+                                Some(room[..room.len() - suffix.len()].to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default()
+                }
             };
 
             if channel_id.is_empty() {
