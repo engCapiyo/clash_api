@@ -1024,6 +1024,9 @@ pub async fn fill_bet_handler(
 // ============================================================================
 // 5. SETTLE BETS — Updates channel_fixtures status only
 // ============================================================================
+// ============================================================================
+// 5. SETTLE BETS — Updates channel_fixtures status only
+// ============================================================================
 pub async fn settle_bets_handler(
     State(state): State<AppState>,
     Json(payload): Json<SettleBetRequest>,
@@ -1370,23 +1373,22 @@ pub async fn settle_bets_handler(
     // ========================================================================
     // PART 3: UPDATE FIXTURE STATUS
     // ========================================================================
-    games_col
-        .update_one(
-            doc! { "match_id": &payload.fixture_id },
-            doc! {
-                "$set": {
-                    "status": "completed",
-                    "result": &payload.result,
-                    "settled_at": now,
-                }
-            },
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to update game: {}", e);
-            AppError::MongoDB(e)
-        })?;
-
+   games_col
+    .update_one(
+        doc! { "matchId": &payload.fixture_id },
+        doc! {
+            "$set": {
+                "status": "completed",
+                "result": &payload.result,
+                "settled_at": now,
+            }
+        },
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("❌ Failed to update game: {}", e);
+        AppError::MongoDB(e)
+    })?;
     // Update ALL channel_fixtures with this fixture_id
     channel_fixtures_col
         .update_many(
@@ -1400,7 +1402,7 @@ pub async fn settle_bets_handler(
         })?;
 
     // ========================================================================
-    // PART 4: MARK VOTES CORRECT/INCORRECT
+    // PART 4: MARK VOTES CORRECT/INCORRECT (winner +3, loser -3, no draw case)
     // ========================================================================
     votes_col
         .update_many(
@@ -1409,7 +1411,7 @@ pub async fn settle_bets_handler(
                 "selection": &payload.result,
                 "is_correct": null,
             },
-            doc! { "$set": { "is_correct": true, "points_awarded": 1 } },
+            doc! { "$set": { "is_correct": true, "points_awarded": 3 } },
         )
         .await
         .map_err(|e| {
@@ -1424,7 +1426,7 @@ pub async fn settle_bets_handler(
                 "selection": { "$ne": &payload.result },
                 "is_correct": null,
             },
-            doc! { "$set": { "is_correct": false, "points_awarded": 0 } },
+            doc! { "$set": { "is_correct": false, "points_awarded": -3 } },
         )
         .await
         .map_err(|e| {
@@ -1433,7 +1435,7 @@ pub async fn settle_bets_handler(
         })?;
 
     // ========================================================================
-    // PART 5: UPDATE CHANNEL MEMBERS
+    // PART 5: UPDATE CHANNEL MEMBERS (winner +3, loser -3)
     // ========================================================================
     let mut correct_cursor = votes_col
         .find(doc! { "fixture_id": &payload.fixture_id, "is_correct": true })
@@ -1464,12 +1466,12 @@ pub async fn settle_bets_handler(
     }
 
     if !correct_ids.is_empty() {
-        tracing::debug!("✅ Updating {} correct voters", correct_ids.len());
+        tracing::debug!("✅ Awarding +3 to {} correct voters", correct_ids.len());
         channels_col
             .update_many(
                 doc! { "members.user_id": { "$in": &correct_ids } },
                 doc! { "$inc": {
-                    "members.$[m].season_points": 1,
+                    "members.$[m].season_points": 3,
                     "members.$[m].correct_votes": 1,
                     "members.$[m].total_votes": 1,
                 }},
@@ -1483,11 +1485,14 @@ pub async fn settle_bets_handler(
     }
 
     if !incorrect_ids.is_empty() {
-        tracing::debug!("✅ Updating {} incorrect voters", incorrect_ids.len());
+        tracing::debug!("✅ Deducting 3 from {} incorrect voters", incorrect_ids.len());
         channels_col
             .update_many(
                 doc! { "members.user_id": { "$in": &incorrect_ids } },
-                doc! { "$inc": { "members.$[m].total_votes": 1 } },
+                doc! { "$inc": {
+                    "members.$[m].season_points": -3,
+                    "members.$[m].total_votes": 1,
+                }},
             )
             .array_filters(vec![doc! { "m.user_id": { "$in": &incorrect_ids } }])
             .await
@@ -1527,7 +1532,7 @@ pub async fn settle_bets_handler(
     }
 
     tracing::info!(
-        "✅ Settlement complete: {} settled, {} refunded, {} correct, {} incorrect",
+        "✅ Settlement complete: {} settled, {} refunded, {} correct (+3 each), {} incorrect (-3 each)",
         settled_count,
         refund_count,
         correct_ids.len(),
