@@ -20,5 +20,6 @@ pub mod actions;
 pub(crate) mod channel;
 pub(crate) mod comrade;
 pub(crate) mod statistics;
+pub(crate) mod comments_model;
 pub(crate) mod vote;
 pub(crate) mod votes_visibility; // Now just a simple declaration // Now just a simple declaration // Now just a simple declaration // Now just a simple declaration

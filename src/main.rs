@@ -147,7 +147,7 @@ async fn build_router(app_state: AppState) -> Router {
         .nest("/api/chats", routes::chat::routes())
         .nest("/api/visibility", routes::visibility::visibility_routes())
         .nest("/ws/channel", routes::channel::ws_channel_routes())
-        .nest("/comments", routes::posts::comment_routes())
+        .nest("api/comments", routes::comments_routes::comments_routes())
         .nest("/api/channels", routes::channel::channel_routes())
         .nest("/api/profile", routes::user_profile::user_profile_routes())
         .nest("/api", routes::posts::upload_routes())

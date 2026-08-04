@@ -41,13 +41,7 @@ pub fn routes() -> Router<AppState> {
         .route("/stats/user/:user_id", get(posta::get_user_post_stats))
 }
 
-pub fn comment_routes() -> Router<AppState> {
-    Router::new()
-        .route("/:comment_id", put(posta::update_comment))
-        .route("/:comment_id", delete(posta::delete_comment))
-        .route("/:comment_id/like", post(posta::like_comment))
-        .route("/:comment_id/unlike", post(posta::unlike_comment))
-}
+
 
 pub fn upload_routes() -> Router<AppState> {
     Router::new().route(
