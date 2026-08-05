@@ -220,10 +220,6 @@ async fn find_games_tolerant_all(
     let mut fixtures = find_games_tolerant(&fixtures_col, filter, sort).await?;
     games.append(&mut fixtures);
 
-    // games/fixtures are each already sorted by kickoff_utc from Mongo, but
-    // the two collections still need to be merged into one global order --
-    // this is a cheap sort over two pre-sorted small runs, not a full
-    // unindexed collection scan+sort.
     games.sort_by(|a, b| a.kickoff_utc.cmp(&b.kickoff_utc));
 
     Ok(games)
@@ -282,21 +278,6 @@ async fn update_one_in_either(
 }
 // ============================================================================
 // FRIENDLY-FIXTURES RESOLUTION HANDLERS
-// (seed / pending-resolution / resolve / abandon)
-// ============================================================================
-
-// ============================================================================
-// REPLACE the existing `SeedFixtureRequest` struct AND the existing
-// `pub async fn seed_fixture(...)` function with the two blocks below.
-// Everything else in the file (move_completed_to_history, GameSource,
-// find_game_tolerant, etc.) stays exactly as-is -- no other changes needed.
-// ============================================================================
-
-// ============================================================================
-// REPLACE the existing `SeedFixtureRequest` struct AND the existing
-// `pub async fn seed_fixture(...)` function with the two blocks below.
-// Everything else in the file (move_completed_to_history, GameSource,
-// find_game_tolerant, etc.) stays exactly as-is -- no other changes needed.
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -315,9 +296,6 @@ pub struct SeedFixtureRequest {
     #[serde(rename = "dateIso")]
     pub date_iso: String,
     pub source: String,
-    // NEW: "games" (domestic league/club friendlies) or "fixtures"
-    // (internationals). Defaults to "fixtures" via serde's `default` so any
-    // existing caller that doesn't send this field keeps its old behavior.
     #[serde(rename = "targetCollection", default = "default_target_collection")]
     pub target_collection: String,
 }
@@ -343,7 +321,6 @@ pub async fn seed_fixture(
 
     let live_col: Collection<Game> = state.db.collection(live_collection_name);
 
-    // Idempotency: already live in the target collection?
     if find_game_tolerant(&live_col, doc! { "matchId": &payload.match_id })
         .await?
         .is_some()
@@ -356,9 +333,6 @@ pub async fn seed_fixture(
         })));
     }
 
-    // Already archived to history? Don't resurrect it. This is what stops
-    // a completed match still sitting in a caller's hardcoded list from
-    // coming back to life on the next seed pass.
     let history_col: Collection<HistoryGame> = state.db.collection(history_collection_name);
     if history_col
         .find_one(doc! { "matchId": &payload.match_id })
@@ -389,9 +363,6 @@ pub async fn seed_fixture(
         payload.kickoff_utc,
         payload.source,
     );
-    // _id == matchId by convention -- see the note in mongo_store.py's
-    // old upsert_fixture() docstring about why this matters for Rust
-    // deserialization (Option<String> vs ObjectId).
     game.id = Some(payload.match_id.clone());
 
     live_col.insert_one(&game).await?;
@@ -401,15 +372,6 @@ pub async fn seed_fixture(
         live_collection_name
     );
 
-    // NEW: create default sub-fixture markets (first_goal/first_card/
-    // first_corner) as soon as the fixture is seeded, rather than waiting
-    // for resolve_fixture(). create_default_markets_for_match only needs
-    // match_id -- it doesn't touch threesixtyfiveGameId/competitor ids --
-    // so there's no dependency on resolution having happened first.
-    // Idempotent: if resolve_fixture() later calls this again for the same
-    // match_id, create_default_markets_for_match's own existence check
-    // (per market_id) makes the second call a no-op. Failure here doesn't
-    // block the seed response succeeding, same as resolve_fixture's call.
     if let Err(e) = crate::handlers::sub_fixture_handler::create_default_markets_for_match(
         &state,
         &payload.match_id,
@@ -500,10 +462,6 @@ pub async fn resolve_fixture(
         payload.threesixtyfive_game_id
     );
 
-    // Auto-create default sub-fixture markets now that this friendly is
-    // resolved and has a real 365Scores game behind it. Failure here
-    // doesn't block resolution succeeding -- betting-side setup shouldn't
-    // be able to fail the core resolve path the poller depends on.
     if let Err(e) =
         crate::handlers::sub_fixture_handler::create_default_markets_for_match(&state, &match_id)
             .await
@@ -771,7 +729,7 @@ pub async fn get_upcoming_games(State(state): State<AppState>) -> Result<Json<Ve
 }
 
 // ============================================================================
-// UPDATE GAME SCORE - UPDATED (timeElapsed only)
+// UPDATE GAME SCORE
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
@@ -964,7 +922,7 @@ pub async fn update_game_status(
 }
 
 // ============================================================================
-// RECEIVE LIVE UPDATE - UPDATED (timeElapsed only)
+// RECEIVE LIVE UPDATE
 // ============================================================================
 
 pub async fn receive_live_update(
@@ -996,7 +954,6 @@ pub async fn receive_live_update(
         "scrapedAt": BsonDateTime::from_chrono(Utc::now()),
     };
 
-    // ✅ Use time_elapsed if provided, otherwise use minute as fallback
     if let Some(time_elapsed) = update.time_elapsed {
         set_doc.insert("timeElapsed", time_elapsed);
     } else {
@@ -1077,7 +1034,7 @@ pub async fn receive_live_update(
 }
 
 // ============================================================================
-// LINEUPS HANDLERS
+// LINEUPS HANDLERS - FIXED (no silent data loss)
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1208,10 +1165,41 @@ pub async fn store_lineups(
     })))
 }
 
+// ============================================================================
+// FIXED: get_lineups - reads raw document to preserve lineups
+// ============================================================================
+
 pub async fn get_lineups(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    // First try to get the raw document directly to preserve lineups
+    let raw_collections = [
+        (GAMES_COLLECTION, "games"),
+        (FIXTURES_COLLECTION, "fixtures"),
+        ("games_history", "history_games"),
+        ("fixtures_history", "history_fixtures"),
+    ];
+
+    for (coll_name, _) in raw_collections {
+        let raw_col: Collection<Document> = state.db.collection(coll_name);
+        if let Ok(Some(raw_doc)) = raw_col.find_one(doc! { "matchId": &match_id }).await {
+            if let Some(lineups_bson) = raw_doc.get("lineups") {
+                match mongodb::bson::from_bson::<LineupsDocument>(lineups_bson.clone()) {
+                    Ok(lineups) => {
+                        let data = lineup_doc_to_json(&lineups);
+                        return Ok(Json(json!({ "success": true, "data": data })));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to deserialize lineups from {}: {}", coll_name, e);
+                        // Continue to next collection or fallback
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback to tolerant path (may return None if lineups were stripped)
     let game = find_game_tolerant_all(&state, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
@@ -1225,10 +1213,40 @@ pub async fn get_lineups(
     }
 }
 
+// ============================================================================
+// FIXED: get_simplified_lineups - reads raw document to preserve lineups
+// ============================================================================
+
 pub async fn get_simplified_lineups(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    // First try to get the raw document directly to preserve lineups
+    let raw_collections = [
+        (GAMES_COLLECTION, "games"),
+        (FIXTURES_COLLECTION, "fixtures"),
+        ("games_history", "history_games"),
+        ("fixtures_history", "history_fixtures"),
+    ];
+
+    for (coll_name, _) in raw_collections {
+        let raw_col: Collection<Document> = state.db.collection(coll_name);
+        if let Ok(Some(raw_doc)) = raw_col.find_one(doc! { "matchId": &match_id }).await {
+            if let Some(lineups_bson) = raw_doc.get("lineups") {
+                match mongodb::bson::from_bson::<LineupsDocument>(lineups_bson.clone()) {
+                    Ok(lineups) => {
+                        let data = lineup_doc_to_json_simplified(&lineups);
+                        return Ok(Json(json!({ "success": true, "data": data })));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to deserialize lineups from {}: {}", coll_name, e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback to tolerant path
     let game = find_game_tolerant_all(&state, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
@@ -1236,16 +1254,42 @@ pub async fn get_simplified_lineups(
     match game.lineups {
         Some(doc) => Ok(Json(json!({
             "success": true,
-            "data": lineup_doc_to_json(&doc),
+            "data": lineup_doc_to_json_simplified(&doc),
         }))),
         None => Ok(Json(json!({ "success": false, "data": null }))),
     }
 }
 
+// ============================================================================
+// FIXED: check_lineups_available - reads raw document
+// ============================================================================
+
 pub async fn check_lineups_available(
     State(state): State<AppState>,
     Path(match_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    // Check raw collections first
+    let raw_collections = [
+        GAMES_COLLECTION,
+        FIXTURES_COLLECTION,
+        "games_history",
+        "fixtures_history",
+    ];
+
+    for coll_name in raw_collections {
+        let raw_col: Collection<Document> = state.db.collection(coll_name);
+        if let Ok(Some(raw_doc)) = raw_col.find_one(doc! { "matchId": &match_id }).await {
+            if raw_doc.get("lineups").is_some() {
+                return Ok(Json(json!({
+                    "success": true,
+                    "available": true,
+                    "fixture_id": match_id,
+                })));
+            }
+        }
+    }
+
+    // Fallback to tolerant path
     let game = find_game_tolerant_all(&state, doc! { "matchId": &match_id })
         .await?
         .ok_or(AppError::DocumentNotFound)?;
@@ -1256,6 +1300,10 @@ pub async fn check_lineups_available(
         "fixture_id": match_id,
     })))
 }
+
+// ============================================================================
+// LINEUPS HELPER FUNCTIONS
+// ============================================================================
 
 fn lineup_doc_to_json(doc: &LineupsDocument) -> serde_json::Value {
     json!({
@@ -1287,6 +1335,30 @@ fn lineup_doc_to_json(doc: &LineupsDocument) -> serde_json::Value {
             "position": p.position,
             "captain": p.captain,
         })).collect::<Vec<_>>(),
+        "fetched_at": doc.fetched_at.to_chrono().to_rfc3339(),
+    })
+}
+
+fn lineup_doc_to_json_simplified(doc: &LineupsDocument) -> serde_json::Value {
+    json!({
+        "home": {
+            "formation": doc.home_lineup.formation,
+            "coach": doc.home_lineup.coach.name,
+            "players": doc.home_lineup.players.iter().map(|p| json!({
+                "name": p.name,
+                "number": p.jersey_number,
+                "position": p.position,
+            })).collect::<Vec<_>>(),
+        },
+        "away": {
+            "formation": doc.away_lineup.formation,
+            "coach": doc.away_lineup.coach.name,
+            "players": doc.away_lineup.players.iter().map(|p| json!({
+                "name": p.name,
+                "number": p.jersey_number,
+                "position": p.position,
+            })).collect::<Vec<_>>(),
+        },
         "fetched_at": doc.fetched_at.to_chrono().to_rfc3339(),
     })
 }
@@ -1702,12 +1774,6 @@ pub async fn add_commentary_bulk(
     )
     .await?;
 
-    // Single broadcast carrying all entries as an array, matching the
-    // client's dedicated _onCommentaryBulk handler (listens for
-    // "commentary.bulk", reads payload as a List, dedupes + inserts all
-    // entries, then does ONE setState + ONE scrollToBottom for the whole
-    // batch). No need to split into per-entry "commentary.new" sends or
-    // stagger them -- the client already batches the UI update for us.
     let broadcast_msg = json!({
         "type": "commentary.bulk",
         "payload": broadcast_entries,
@@ -1887,12 +1953,6 @@ pub async fn move_completed_to_history(
         .delete_one(doc! { "matchId": &match_id_clone })
         .await?;
 
-    // Refund/expire any unsettled sub-fixture markets before finishing up --
-    // sub_fixture_markets/sub_fixture_bets have no foreign-key relationship
-    // to Game/HistoryGame, so nothing else in the system will ever revisit
-    // them once this match is archived. See cleanup_sub_fixtures_for_match's
-    // docstring for why refunding (rather than guessing a winner) is the
-    // right default here.
     let state_arc = std::sync::Arc::new(state.clone());
     match crate::handlers::sub_fixture_handler::cleanup_sub_fixtures_for_match(
         &state_arc,
