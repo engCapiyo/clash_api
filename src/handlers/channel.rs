@@ -3699,6 +3699,8 @@ pub async fn add_members_to_channel_handler(
 pub struct LeaveChannelRequest {
     pub channel_id: String,
     pub user_id: String,
+    #[serde(default)]
+    pub removed_by: Option<String>, // Who is performing the removal
 }
 
 pub async fn leave_channel_handler(
@@ -3706,13 +3708,120 @@ pub async fn leave_channel_handler(
     Json(payload): Json<LeaveChannelRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
-
+    let users_col = state.db.collection::<User>("users");
+    let now = BsonDateTime::now();
+    
+    // ============================================================
+    // CHECK PERMISSIONS
+    // ============================================================
+    
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &payload.channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+    
+    // Check if user is a member
+    let is_member = channel.members.iter().any(|m| m.user_id == payload.user_id);
+    if !is_member {
+        return Err(AppError::ValidationError(
+            "User is not a member of this channel".to_string(),
+        ));
+    }
+    
+    // Check if user is an admin - FIXED: compare String with String
+    let is_admin = channel
+        .members
+        .iter()
+        .any(|m| m.user_id == payload.user_id && m.role == "admin");
+    
+    let is_self_removal = payload.removed_by.is_none() || payload.removed_by == Some(payload.user_id.clone());
+    
+    // If user is admin and trying to self-remove, prevent it (must transfer ownership first)
+    if is_admin && is_self_removal {
+        return Err(AppError::ValidationError(
+            "Admins cannot leave channels. Transfer ownership or assign another admin first.".to_string(),
+        ));
+    }
+    
+    // If removal is being done by someone else, verify they are an admin
+    if let Some(removed_by_user) = &payload.removed_by {
+        if removed_by_user != &payload.user_id {
+            // Someone else is trying to remove this user - must be admin
+            // FIXED: Dereference removed_by_user with *
+            let remover_is_admin = channel
+                .members
+                .iter()
+                .any(|m| m.user_id == *removed_by_user && m.role == "admin");
+            
+            if !remover_is_admin {
+                return Err(AppError::ValidationError(
+                    "Only admins can remove other members".to_string(),
+                ));
+            }
+            
+            // Cannot remove an admin (unless they're the only admin?)
+            let target_is_admin = channel
+                .members
+                .iter()
+                .any(|m| m.user_id == payload.user_id && m.role == "admin");
+            
+            if target_is_admin {
+                return Err(AppError::ValidationError(
+                    "Cannot remove an admin from the channel".to_string(),
+                ));
+            }
+        }
+    }
+    
+    // ============================================================
+    // DEDUCT 30 POINTS FROM USER (DISCOURAGE CHANNEL HOPPING)
+    // ============================================================
+    
+    // Deduct 30 season points from the leaving user
+    let user_obj_id = ObjectId::parse_str(&payload.user_id)?;
+    users_col
+        .update_one(
+            doc! { "_id": user_obj_id },
+            doc! {
+                "$inc": { "season_points": -30 },
+                "$set": { "updated_at": now }
+            },
+        )
+        .await?;
+    
+    // Also update the channel member's points
+    let mut updated_member_count = 0;
+    for member in &channel.members {
+        if member.user_id == payload.user_id {
+            let new_points = (member.season_points - 30).max(0); // Don't go below 0
+            channels_col
+                .update_one(
+                    doc! {
+                        "channel_id": &payload.channel_id,
+                        "members.user_id": &payload.user_id,
+                    },
+                    doc! {
+                        "$set": {
+                            "members.$.season_points": new_points,
+                            "members.$.last_active_at": now,
+                        }
+                    },
+                )
+                .await?;
+            updated_member_count = 1;
+            break;
+        }
+    }
+    
+    // ============================================================
+    // REMOVE USER FROM CHANNEL
+    // ============================================================
+    
     let result = channels_col
         .update_one(
             doc! {
                 "channel_id": &payload.channel_id,
                 "members.user_id": &payload.user_id,
-                "members.role": { "$ne": "admin" },
             },
             doc! {
                 "$pull": { "members": { "user_id": &payload.user_id } },
@@ -3720,16 +3829,106 @@ pub async fn leave_channel_handler(
             },
         )
         .await?;
-
+    
     if result.matched_count == 0 {
-        return Err(AppError::ValidationError(
-            "Cannot leave. Either not a member, or you are the admin".to_string(),
-        ));
+        // Rollback: If we couldn't remove, refund the points
+        users_col
+            .update_one(
+                doc! { "_id": user_obj_id },
+                doc! { "$inc": { "season_points": 30 } },
+            )
+            .await?;
+        return Err(AppError::DocumentNotFound);
     }
-
-    log_membership_event(&state, &payload.channel_id, &payload.user_id, "left").await;
-
-    Ok(Json(json!({ "success": true })))
+    
+    // ============================================================
+    // LOG MEMBERSHIP EVENT
+    // ============================================================
+    
+    let event_type = if is_self_removal {
+        "left"
+    } else {
+        "removed"
+    };
+    log_membership_event(&state, &payload.channel_id, &payload.user_id, event_type).await;
+    
+    // ============================================================
+    // SEND NOTIFICATION
+    // ============================================================
+    
+    let removed_by_name = if let Some(removed_by_id) = &payload.removed_by {
+        if removed_by_id != &payload.user_id {
+            // FIXED: Dereference removed_by_id with *
+            channel
+                .members
+                .iter()
+                .find(|m| m.user_id == *removed_by_id)
+                .map(|m| m.username.clone())
+                .unwrap_or_else(|| "Admin".to_string())
+        } else {
+            "Self".to_string()
+        }
+    } else {
+        "Self".to_string()
+    };
+    
+    // FIXED: Find member to remove - dereference payload.user_id
+    let member_to_remove = channel
+        .members
+        .iter()
+        .find(|m| m.user_id == payload.user_id)
+        .map(|m| m.username.clone())
+        .unwrap_or_else(|| payload.user_id.clone());
+    
+    let notification_title = if is_self_removal {
+        "🚪 Left Channel"
+    } else {
+        "👋 Removed from Channel"
+    };
+    
+    let notification_body = if is_self_removal {
+        format!("{} left the channel", member_to_remove)
+    } else {
+        format!("{} removed {} from the channel", removed_by_name, member_to_remove)
+    };
+    
+    let removal_payload = serde_json::json!({
+        "channel_id": payload.channel_id,
+        "user_id": payload.user_id,
+        "username": member_to_remove,
+        "removed_by": payload.removed_by,
+        "event_type": event_type,
+        "points_deducted": 30,
+    });
+    
+    let _ = notify_channel_members(
+        &state,
+        &payload.user_id,
+        &payload.channel_id,
+        "general",
+        "channel.member_removed",
+        notification_title,
+        &notification_body,
+        removal_payload,
+    )
+    .await;
+    
+    // ============================================================
+    // RETURN SUCCESS
+    // ============================================================
+    
+    Ok(Json(json!({
+        "success": true,
+        "message": format!(
+            "{} successfully {} the channel (30 points deducted)",
+            member_to_remove,
+            if is_self_removal { "left" } else { "was removed from" }
+        ),
+        "user_id": payload.user_id,
+        "channel_id": payload.channel_id,
+        "points_deducted": 30,
+        "event_type": event_type,
+    })))
 }
 
 pub async fn get_channel_invite_code_handler(
