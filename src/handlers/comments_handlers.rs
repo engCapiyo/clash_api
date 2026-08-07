@@ -111,29 +111,8 @@ pub async fn create_comment(
         }
     };
 
-    if payload.parent_comment_id.is_none() {
-        match comment_collection
-            .find_one(doc! {
-                "postId": &post_id,
-                "userId": &payload.user_id,
-                "parentCommentId": null,
-            })
-            .await
-        {
-            Ok(Some(_)) => {
-                log_error!("[{}] Rejected: user {} already commented on post {}",
-                    request_id, payload.user_id, post_id);
-                return Err(AppError::invalid_data(
-                    "You have already commented on this post. You can edit your existing comment.",
-                ));
-            }
-            Ok(None) => {}
-            Err(e) => {
-                log_error!("[{}] DB error checking existing comment: {}", request_id, e);
-                return Err(AppError::from(e));
-            }
-        }
-    }
+    // ✅ Removed: "one top-level comment per user per post" restriction.
+    // Users can now comment as many times as they want.
 
     if let Some(ref parent_id) = payload.parent_comment_id {
         let parent_object_id = match ObjectId::parse_str(parent_id) {
@@ -200,7 +179,7 @@ pub async fn create_comment(
             }
         }
 
-        // ... (notification tokio::spawn block unchanged) ...
+        // notification tokio::spawn block — unchanged, keep as you had it
 
         let comment_response = CommentResponse::from(comment);
         log_info!("[{}] Comment created successfully: {}", request_id, comment_id_hex);
