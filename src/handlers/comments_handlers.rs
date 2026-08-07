@@ -330,6 +330,9 @@ pub async fn create_comment(
 // ============================================================================
 // GET COMMENTS (WITH PAGINATION AND REPLIES)
 // ============================================================================
+// ============================================================================
+// GET COMMENTS (WITH PAGINATION AND REPLIES)
+// ============================================================================
 pub async fn get_comments(
     State(state): State<AppState>,
     Path(post_id): Path<String>,
@@ -340,33 +343,32 @@ pub async fn get_comments(
 
     let collection: Collection<Comment> = state.db.collection("comments");
 
-    // Build filter
-    let mut filter = doc! { "post_id": &post_id };
+    // Build filter — field names match the actual BSON keys stored via
+    // #[serde(rename = "...")] on Comment (postId, userId,
+    // parentCommentId), NOT the Rust snake_case field names.
+    let mut filter = doc! { "postId": &post_id };
 
     // If exclude_replies is true, only get top-level comments
     if params.exclude_replies {
-        filter.insert("parent_comment_id", doc! { "$eq": null });
+        filter.insert("parentCommentId", doc! { "$eq": null });
     }
 
     // Filter by user if provided
     if let Some(user_id) = &params.user_id {
-        filter.insert("user_id", user_id);
+        filter.insert("userId", user_id);
     }
 
     // Pagination
-    // NOTE: `params.page` / `params.limit` are plain `i64` (GetCommentsQuery
-    // fills them via serde `#[serde(default = "...")]`, not `Option`), so we
-    // just clamp them directly instead of calling `.unwrap_or(...)`.
     let page = params.page.max(1);
     let limit = params.limit.min(MAX_PAGE_SIZE).max(1);
     let skip = (page - 1) * limit;
 
-    // Sort
+    // Sort — same rule: use the stored camelCase field names
     let sort_order = match params.sort.as_str() {
-        "oldest" => doc! { "created_at": 1 },
-        "likes" => doc! { "likes_count": -1, "created_at": -1 },
-        "replies" => doc! { "reply_count": -1, "created_at": -1 },
-        _ => doc! { "created_at": -1 }, // newest default
+        "oldest" => doc! { "createdAt": 1 },
+        "likes" => doc! { "likesCount": -1, "createdAt": -1 },
+        "replies" => doc! { "replyCount": -1, "createdAt": -1 },
+        _ => doc! { "createdAt": -1 }, // newest default
     };
 
     let total_count = collection.count_documents(filter.clone()).await? as i64;
@@ -400,10 +402,10 @@ pub async fn get_comments(
             if let Some(ref comment_id) = comment.id {
                 let comment_id_hex = comment_id.to_hex();
                 let replies_cursor = collection
-                    .find(doc! { "parent_comment_id": &comment_id_hex })
+                    .find(doc! { "parentCommentId": &comment_id_hex })
                     .with_options(
                         FindOptions::builder()
-                            .sort(doc! { "created_at": 1 })
+                            .sort(doc! { "createdAt": 1 })
                             .limit(10) // Limit replies to 10 per comment
                             .build()
                     )
@@ -437,7 +439,6 @@ pub async fn get_comments(
         }
     })))
 }
-
 // ============================================================================
 // GET COMMENT BY ID
 // ============================================================================
