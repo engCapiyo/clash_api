@@ -671,119 +671,131 @@ async fn handle_incoming_message(
         // GET LATEST COMMENT - For client chat messages
         // ============================================================================
         Some("get.latest.comment") => {
-            tracing::info!("📖 Getting latest client chat message for fixture");
+    tracing::info!("📖 Getting latest client chat message for fixture");
 
-            let payload = match json_msg.get("payload") {
-                Some(p) => p.clone(),
-                None => {
-                    tracing::error!("❌ get.latest.comment missing payload");
-                    return;
-                }
-            };
+    let payload = match json_msg.get("payload") {
+        Some(p) => p.clone(),
+        None => {
+            tracing::error!("❌ get.latest.comment missing payload");
+            return;
+        }
+    };
 
-            let fixture_id = payload
-                .get("fixtureId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+    let fixture_id = payload
+        .get("fixtureId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-            if fixture_id.is_empty() {
-                tracing::error!("❌ get.latest.comment missing fixtureId");
-                return;
-            }
+    if fixture_id.is_empty() {
+        tracing::error!("❌ get.latest.comment missing fixtureId");
+        return;
+    }
 
-            let channel_id = {
-                let rooms = joined_rooms.lock().await;
-                rooms
-                    .iter()
-                    .find_map(|room| {
-                        let suffix = format!("_{}", fixture_id);
-                        if room.ends_with(&suffix) {
-                            Some(room[..room.len() - suffix.len()].to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default()
-            };
+    // ✅ Prefer the explicit channelId the client sends, same as get.minute.
+    // Falls back to scanning joined_rooms only if the client is on an older
+    // build that doesn't send it yet.
+    let explicit_channel_id = payload
+        .get("channelId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
 
-            if channel_id.is_empty() {
-                tracing::error!("❌ get.latest.comment: Could not determine channel_id");
-                return;
-            }
-
-            let messages_col = state.db.collection::<Message>("messages");
-
-            let filter = doc! {
-                "channel_id": &channel_id,
-                "fixture_id": &fixture_id,
-            };
-
-            let options = mongodb::options::FindOptions::builder()
-                .sort(doc! { "sent_at": -1 })
-                .limit(1)
-                .build();
-
-            match messages_col.find_one(filter).await {
-                Ok(Some(msg)) => {
-                    let latest_comment = serde_json::json!({
-                        "id": msg.message_id,
-                        "sender_id": msg.sender_id,
-                        "sender_name": msg.sender_name,
-                        "text": msg.text,
-                        "selection": msg.selection,
-                        "image_url": msg.image_url,
-                        "video_url": msg.video_url,
-                        "is_image": msg.is_image,
-                        "is_video": msg.is_video,
-                        "timestamp": msg.sent_at.to_chrono().to_rfc3339(),
-                        "reply_to": msg.reply_to.map(|r| serde_json::json!({
-                            "messageId": r.message_id,
-                            "text": r.text,
-                            "username": r.username,
-                            "selection": r.selection,
-                            "isMe": r.is_me,
-                        })),
-                    });
-
-                    let response = serde_json::json!({
-                        "type": "latest.comment.response",
-                        "payload": {
-                            "fixture_id": fixture_id,
-                            "channel_id": channel_id,
-                            "comment": latest_comment,
-                        },
-                        "timestamp": Utc::now().to_rfc3339(),
-                    });
-
-                    if let Ok(json) = serde_json::to_string(&response) {
-                        let mut guard = sender.lock().await;
-                        let _ = guard.send(WsMessage::Text(json)).await;
-                        tracing::info!("📤 Sent latest client comment response");
+    let channel_id = match explicit_channel_id {
+        Some(id) => id,
+        None => {
+            let rooms = joined_rooms.lock().await;
+            rooms
+                .iter()
+                .find_map(|room| {
+                    let suffix = format!("_{}", fixture_id);
+                    if room.ends_with(&suffix) {
+                        Some(room[..room.len() - suffix.len()].to_string())
+                    } else {
+                        None
                     }
-                }
-                Ok(None) => {
-                    let response = serde_json::json!({
-                        "type": "latest.comment.response",
-                        "payload": {
-                            "fixture_id": fixture_id,
-                            "channel_id": channel_id,
-                            "comment": null,
-                        },
-                        "timestamp": Utc::now().to_rfc3339(),
-                    });
+                })
+                .unwrap_or_default()
+        }
+    };
 
-                    if let Ok(json) = serde_json::to_string(&response) {
-                        let mut guard = sender.lock().await;
-                        let _ = guard.send(WsMessage::Text(json)).await;
-                        tracing::info!("📤 Sent empty latest client comment response");
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("❌ Failed to fetch latest client comment: {}", e);
-                }
+    if channel_id.is_empty() {
+        tracing::error!("❌ get.latest.comment: Could not determine channel_id");
+        return;
+    }
+
+    let messages_col = state.db.collection::<Message>("messages");
+
+    let filter = doc! {
+        "channel_id": &channel_id,
+        "fixture_id": &fixture_id,
+    };
+
+    let options = mongodb::options::FindOptions::builder()
+        .sort(doc! { "sent_at": -1 })
+        .limit(1)
+        .build();
+
+    match messages_col.find_one(filter).await {
+        Ok(Some(msg)) => {
+            let latest_comment = serde_json::json!({
+                "id": msg.message_id,
+                "sender_id": msg.sender_id,
+                "sender_name": msg.sender_name,
+                "text": msg.text,
+                "selection": msg.selection,
+                "image_url": msg.image_url,
+                "video_url": msg.video_url,
+                "is_image": msg.is_image,
+                "is_video": msg.is_video,
+                "timestamp": msg.sent_at.to_chrono().to_rfc3339(),
+                "reply_to": msg.reply_to.map(|r| serde_json::json!({
+                    "messageId": r.message_id,
+                    "text": r.text,
+                    "username": r.username,
+                    "selection": r.selection,
+                    "isMe": r.is_me,
+                })),
+            });
+
+            let response = serde_json::json!({
+                "type": "latest.comment.response",
+                "payload": {
+                    "fixture_id": fixture_id,
+                    "channel_id": channel_id,
+                    "comment": latest_comment,
+                },
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&response) {
+                let mut guard = sender.lock().await;
+                let _ = guard.send(WsMessage::Text(json)).await;
+                tracing::info!("📤 Sent latest client comment response");
             }
         }
+        Ok(None) => {
+            let response = serde_json::json!({
+                "type": "latest.comment.response",
+                "payload": {
+                    "fixture_id": fixture_id,
+                    "channel_id": channel_id,
+                    "comment": null,
+                },
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+
+            if let Ok(json) = serde_json::to_string(&response) {
+                let mut guard = sender.lock().await;
+                let _ = guard.send(WsMessage::Text(json)).await;
+                tracing::info!("📤 Sent empty latest client comment response");
+            }
+        }
+        Err(e) => {
+            tracing::error!("❌ Failed to fetch latest client comment: {}", e);
+        }
+    }
+}
 
         // ============================================================================
         // CHAT MESSAGE - Standard chat message handler
