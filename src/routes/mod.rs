@@ -13,6 +13,7 @@ pub(crate) mod sub_fixture_routes;
 pub(crate) mod user_profile;
 pub(crate) mod visibility;
 pub(crate) mod comments_routes;
+pub(crate) mod notification;
 
 
 // pub mod auth;  // Remove or comment out if not needed

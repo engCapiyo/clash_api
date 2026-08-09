@@ -437,6 +437,7 @@ async fn notify_channel_members(
         return Ok(());
     }
 
+    // WebSocket broadcast to the channel room — unconditional, unchanged
     broadcast_to_channel(
         state,
         channel_id,
@@ -459,29 +460,17 @@ async fn notify_channel_members(
     });
 
     for user_id in member_ids {
-        if state.is_user_online(&user_id) {
-            let personal_room = format!("user_{}", user_id);
-            let tx = state.get_or_create_broadcaster(&personal_room);
-            let ws_message = serde_json::json!({
-                "type": notification_type,
-                "payload": payload.clone(),
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            });
-            if let Ok(json) = serde_json::to_string(&ws_message) {
-                let _ = tx.send(json);
-            }
-        } else {
-            let _ = fcm_service
-                .send_to_user(
-                    state,
-                    &user_id,
-                    title,
-                    body,
-                    data.clone(),
-                    notification_type,
-                )
-                .await;
-        }
+        // No more is_online branch — every member gets an FCM attempt
+        let _ = fcm_service
+            .send_to_user(
+                state,
+                &user_id,
+                title,
+                body,
+                data.clone(),
+                notification_type,
+            )
+            .await;
     }
 
     Ok(())
