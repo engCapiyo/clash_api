@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use yup_oauth2::parse_service_account_key;
 use yup_oauth2::ServiceAccountKey;
 
+
 use crate::{
     errors::AppError,
     models::notification::{FCMToken, Notification},
@@ -45,8 +46,8 @@ let private_key = env::var("FIREBASE_PRIVATE_KEY")
     .map_err(|_| anyhow!("FIREBASE_PRIVATE_KEY not set in environment"))?;
 
 // ADD THIS:
-let private_key_id = env::var("FIREBASE_PRIVATE_KEY_ID")
-    .map_err(|_| anyhow!("FIREBASE_PRIVATE_KEY_ID not set in environment"))?;
+let private_key_id = env::var("FIREBASE_PRIVATE_KEY")
+    .map_err(|_| anyhow!("FIREBASE_PRIVATE_KEY not set in environment"))?;
 
 let project_id =
     env::var("FIREBASE_PROJECT_ID").unwrap_or_else(|_| "clash-66865".to_string());
