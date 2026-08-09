@@ -46,8 +46,8 @@ let private_key = env::var("FIREBASE_PRIVATE_KEY")
     .map_err(|_| anyhow!("FIREBASE_PRIVATE_KEY not set in environment"))?;
 
 // ADD THIS:
-let private_key_id = env::var("FIREBASE_PRIVATE_KEY")
-    .map_err(|_| anyhow!("FIREBASE_PRIVATE_KEY not set in environment"))?;
+let private_key_id = env::var("FIREBASE_PRIVATE_KEY_ID")
+    .map_err(|_| anyhow!("FIREBASE_PRIVATE_KEY_ID not set in environment"))?;
 
 let project_id =
     env::var("FIREBASE_PROJECT_ID").unwrap_or_else(|_| "clash-66865".to_string());
@@ -157,98 +157,71 @@ let project_id =
         }
     }
 
-    pub async fn send_to_user(
-        &self,
-        state: &AppState,
-        user_id: &str,
-        title: &str,
-        body: &str,
-        data: Value,
-        notification_type: &str,
-    ) -> Result<bool, AppError> {
-        println!("\n📱 [FCM] ===== SENDING TO USER: {} =====", user_id);
-        println!("📱 [FCM] Title: {}", title);
-        println!("📱 [FCM] Type: {}", notification_type);
+   pub async fn send_to_user(
+    &self,
+    state: &AppState,
+    user_id: &str,
+    title: &str,
+    body: &str,
+    data: Value,
+    notification_type: &str,
+) -> Result<bool, AppError> {
+    println!("\n📱 [FCM] ===== SENDING TO USER: {} =====", user_id);
 
-        let start = Instant::now();
+    let tokens_collection: Collection<FCMToken> = state.db.collection("fcm_tokens");
+    let filter = doc! { "user_id": user_id };
 
-        let tokens_collection: Collection<FCMToken> = state.db.collection("fcm_tokens");
-        let filter = doc! { "user_id": user_id };
-
-        println!("📱 [FCM] Querying database for user tokens...");
-        let mut cursor = match tokens_collection.find(filter).await {
-            Ok(c) => {
-                println!("✅ [FCM] Database query successful");
-                c
-            }
-            Err(e) => {
-                println!("❌ [FCM] Database error: {}", e);
-                return Err(AppError::InternalServerError(format!(
-                    "Database error: {}",
-                    e
-                )));
-            }
-        };
-
-        let mut tokens_found = 0;
-        let mut success = false;
-
-        while let Some(token_doc) = cursor
-            .try_next()
-            .await
-            .map_err(|e| AppError::InternalServerError(format!("Database error: {}", e)))?
-        {
-            tokens_found += 1;
-            let token_preview = &token_doc.fcm_token[0..20.min(token_doc.fcm_token.len())];
-            println!(
-                "📱 [FCM] Found token #{}: {}...",
-                tokens_found, token_preview
-            );
-            println!("📱 [FCM] Platform: {}", token_doc.platform);
-
-            if self
-                .send_to_device(
-                    &token_doc.fcm_token,
-                    title,
-                    body,
-                    data.clone(),
-                    notification_type,
-                )
-                .await
-            {
-                success = true;
-                println!("✅ [FCM] Successfully sent to token #{}", tokens_found);
-            } else {
-                println!("❌ [FCM] Failed to send to token #{}", tokens_found);
-            }
+    let mut cursor = match tokens_collection.find(filter).await {
+        Ok(c) => c,
+        Err(e) => {
+            println!("❌ [FCM] Database error: {}", e);
+            return Err(AppError::InternalServerError(format!("Database error: {}", e)));
         }
+    };
 
-        if tokens_found == 0 {
-            println!("⚠️ [FCM] No FCM tokens found for user: {}", user_id);
-        } else {
-            println!("📱 [FCM] Found {} total tokens for user", tokens_found);
-        }
+    let mut tokens_found = 0;
+    let mut success = false;
 
-        println!("📱 [FCM] Saving notification to database...");
-        if let Err(e) = self
-            .save_notification(state, user_id, notification_type, title, body, data)
+    while let Some(token_doc) = cursor
+        .try_next()
+        .await
+        .map_err(|e| AppError::InternalServerError(format!("Database error: {}", e)))?
+    {
+        tokens_found += 1;
+        let token_preview = &token_doc.fcm_token[0..20.min(token_doc.fcm_token.len())];
+        println!("📱 [FCM] Found token #{}: {}...", tokens_found, token_preview);
+
+        if self
+            .send_to_device(&token_doc.fcm_token, title, body, data.clone(), notification_type)
             .await
         {
-            println!("⚠️ [FCM] Failed to save notification: {}", e);
+            success = true;
+            println!("✅ [FCM] Successfully sent to token #{}", tokens_found);
         } else {
-            println!("✅ [FCM] Notification saved to database");
+            println!("❌ [FCM] Failed to send to token #{}", tokens_found);
         }
-
-        println!(
-            "📱 [FCM] Total time for user {}: {:?}",
-            user_id,
-            start.elapsed()
-        );
-        println!("📱 [FCM] ===== END USER {} =====\n", user_id);
-
-        Ok(success)
     }
 
+    // ✅ Skip entirely if no token — don't save notification, don't waste time
+    if tokens_found == 0 {
+        println!("⏭️ [FCM] Skipping user {} — no FCM tokens registered", user_id);
+        return Ok(false);
+    }
+
+    // Only save notification if we actually attempted a send
+    if let Err(e) = self
+        .save_notification(state, user_id, notification_type, title, body, data)
+        .await
+    {
+        println!("⚠️ [FCM] Failed to save notification: {}", e);
+    } else {
+        println!("✅ [FCM] Notification saved to database");
+    }
+
+    println!("📱 [FCM] ===== END USER {} =====\n", user_id);
+
+    Ok(success)
+}
     async fn send_to_device(
         &self,
         token: &str,

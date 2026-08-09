@@ -103,6 +103,7 @@ async fn broadcast_to_room(
 // ============================================================================
 // HELPER: Send notification to channel members
 // ============================================================================
+
 async fn notify_channel_members(
     state: &AppState,
     actor_id: &str,
@@ -116,18 +117,24 @@ async fn notify_channel_members(
     let channels_col: Collection<Channel> = state.db.collection("channels");
     let member_ids = get_channel_members(&channels_col, channel_id).await?;
 
+    tracing::info!(
+        "🔔 notify_channel_members: channel={}, fixture={}, type={}, members={}",
+        channel_id, fixture_id, notification_type, member_ids.len()
+    );
+
     if member_ids.is_empty() {
         return Ok(());
     }
 
-    // Broadcast WebSocket to all members
     let room_key = format!("{}_{}", channel_id, fixture_id);
     broadcast_to_room(state, &room_key, notification_type, payload.clone()).await;
 
-    // Send FCM to offline users
     let fcm_service = match &state.fcm_service {
         Some(s) => s,
-        None => return Ok(()),
+        None => {
+            tracing::warn!("⚠️ FCM service not available — skipping push for channel {}", channel_id);
+            return Ok(());
+        }
     };
 
     let data = serde_json::json!({
@@ -139,35 +146,22 @@ async fn notify_channel_members(
 
     for user_id in member_ids {
         if user_id == actor_id {
+            tracing::debug!("⏭️ Skipping actor {} (self)", user_id);
             continue;
         }
 
-        // Check if user is online
-        if state.is_user_online(&user_id) {
-            // Send to personal room
-            let personal_room = format!("user_{}", user_id);
-            broadcast_to_room(state, &personal_room, notification_type, payload.clone()).await;
-        } else {
-            // Send FCM push
-            let _ = fcm_service
-                .send_to_user(
-                    state,
-                    &user_id,
-                    title,
-                    body,
-                    data.clone(),
-                    notification_type,
-                )
-                .await;
-        }
+        tracing::info!("📤 Dispatching FCM push to member {}", user_id);
+        let _ = fcm_service
+            .send_to_user(state, &user_id, title, body, data.clone(), notification_type)
+            .await;
     }
 
     Ok(())
 }
-
 // ============================================================================
 // HELPER: Create or update ChannelFixture for a channel
 // ============================================================================
+
 async fn upsert_channel_fixture(
     channel_fixtures_col: &Collection<ChannelFixture>,
     channel_id: &str,
