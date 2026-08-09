@@ -150,6 +150,23 @@ where
     Ok(opt.map(FlexibleInt::into_i32))
 }
 
+fn deserialize_flexible_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FlexibleString {
+        Str(String),
+        Int(i64),
+    }
+    let opt = Option::<FlexibleString>::deserialize(deserializer)?;
+    Ok(opt.map(|v| match v {
+        FlexibleString::Str(s) => s,
+        FlexibleString::Int(i) => i.to_string(),
+    }))
+}
+
 // ============================================================================
 // MAIN GAME MODEL — ONLY timeElapsed (no minutesPlayed or minuteDisplay)
 // ============================================================================
@@ -173,10 +190,10 @@ pub struct Game {
     // every request, not just the initial lookup). Field names left
     // snake_case (no #[serde(rename)]) to match what mongo_store.py
     // has already been writing to existing documents.
-    #[serde(default)]
+   #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
     pub home_competitor_id: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
     pub away_competitor_id: Option<String>,
 
     #[serde(default)]
@@ -304,12 +321,11 @@ pub struct HistoryGame {
     // NEW — mirrors Game. Kept so a resolved friendly fixture's
     // competitor/competition ids survive the move into history instead
     // of being silently dropped on archival.
-    #[serde(default)]
+   #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
     pub home_competitor_id: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
     pub away_competitor_id: Option<String>,
-
     #[serde(default)]
     pub competition_id: Option<i64>,
 
