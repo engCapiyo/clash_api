@@ -20,10 +20,10 @@ pub fn notification_routes() -> Router<AppState> {
         .route("/register-token", post(register_token))
         .route("/send", post(send_notification))
         .route("/send-bulk", post(send_bulk_notifications))
-        .route("/user/{user_id}", get(get_user_notifications))
+        .route("/user/:user_id", get(get_user_notifications))
         .route("/mark-read", put(mark_notifications_read))
-        .route("/preferences/{user_id}", get(get_notification_preferences))
+        .route("/preferences/:user_id", get(get_notification_preferences))
         .route("/preferences", put(update_notification_preferences))
         .route("/cleanup", delete(cleanup_expired_tokens))
-        .route("/debug/{user_id}", get(get_user_token_status))
+        .route("/debug/:user_id", get(get_user_token_status))
 }
