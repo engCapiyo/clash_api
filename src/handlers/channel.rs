@@ -405,76 +405,7 @@ async fn broadcast_to_channel(
 
 // handlers/channel.rs
 
-async fn notify_channel_members(
-    state: &AppState,
-    actor_id: &str,
-    channel_id: &str,
-    fixture_id: &str,
-    notification_type: &str,
-    title: &str,
-    body: &str,
-    payload: serde_json::Value,
-) -> Result<()> {
-    let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    let channel = channels_col
-        .find_one(doc! { "channel_id": channel_id })
-        .await
-        .map_err(|e| AppError::MongoDB(e))?
-        .ok_or_else(|| {
-            tracing::warn!("⚠️ Channel not found: {}", channel_id);
-            AppError::DocumentNotFound
-        })?;
-
-    let member_ids: Vec<String> = channel
-        .members
-        .iter()
-        .filter(|m| m.user_id != actor_id)
-        .map(|m| m.user_id.clone())
-        .collect();
-
-    if member_ids.is_empty() {
-        return Ok(());
-    }
-
-    // WebSocket broadcast to the channel room — unconditional, unchanged
-    broadcast_to_channel(
-        state,
-        channel_id,
-        fixture_id,
-        notification_type,
-        payload.clone(),
-    )
-    .await;
-
-    let fcm_service = match &state.fcm_service {
-        Some(s) => s,
-        None => return Ok(()),
-    };
-
-    let data = serde_json::json!({
-        "type": notification_type,
-        "channel_id": channel_id,
-        "fixture_id": fixture_id,
-        "actor_id": actor_id,
-    });
-
-    for user_id in member_ids {
-        // No more is_online branch — every member gets an FCM attempt
-        let _ = fcm_service
-            .send_to_user(
-                state,
-                &user_id,
-                title,
-                body,
-                data.clone(),
-                notification_type,
-            )
-            .await;
-    }
-
-    Ok(())
-}
 // ============================================================================
 // CREATE CHANNEL
 // ============================================================================
@@ -3227,96 +3158,6 @@ pub struct RequestJoinRequest {
     pub user_nickname: Option<String>,
 }
 
-pub async fn request_join_channel_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<RequestJoinRequest>,
-) -> Result<Json<serde_json::Value>> {
-    let channels_col = state.db.collection::<Channel>("channels");
-    let now = BsonDateTime::now();
-
-    let channel = channels_col
-        .find_one(doc! { "channel_id": &payload.channel_id })
-        .await?
-        .ok_or(AppError::DocumentNotFound)?;
-
-    let is_member = channel.members.iter().any(|m| m.user_id == payload.user_id);
-    if is_member {
-        return Err(AppError::ValidationError(
-            "Already a member of this channel".to_string(),
-        ));
-    }
-
-    let is_pending = channel
-        .pending_requests
-        .iter()
-        .any(|r| r.user_id == payload.user_id);
-    if is_pending {
-        return Err(AppError::ValidationError(
-            "Join request already pending".to_string(),
-        ));
-    }
-
-    let new_request = PendingRequest {
-        user_id: payload.user_id.clone(),
-        username: payload.username.clone(),
-        requested_at: now,
-    };
-
-    let bson_request = bson::to_bson(&new_request)
-        .map_err(|e| AppError::ValidationError(format!("Failed to serialize: {}", e)))?;
-
-    channels_col
-        .update_one(
-            doc! { "channel_id": &payload.channel_id },
-            doc! { "$push": { "pending_requests": bson_request } },
-        )
-        .await?;
-
-    let admin_user_ids: Vec<String> = channel
-        .members
-        .iter()
-        .filter(|m| m.role == "admin")
-        .map(|m| m.user_id.clone())
-        .collect();
-
-    if !admin_user_ids.is_empty() {
-        let display_name = payload.user_nickname.unwrap_or(payload.username.clone());
-
-        let notification_data = json!({
-            "type": "join_request",
-            "channel_id": payload.channel_id,
-            "channel_name": channel.name,
-            "user_id": payload.user_id,
-            "username": payload.username,
-            "request_id": format!("{}_{}", payload.user_id, payload.channel_id),
-            "notificationType": "join_request",
-        });
-
-        let title = "📥 Join Request";
-        let body = format!("{} wants to join '{}'", display_name, channel.name);
-
-        if let Some(fcm_service) = &state.fcm_service {
-            for admin_id in &admin_user_ids {
-                let _ = fcm_service
-                    .send_to_user(
-                        &state,
-                        admin_id,
-                        title,
-                        &body,
-                        notification_data.clone(),
-                        "join_request",
-                    )
-                    .await;
-            }
-        }
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "message": "Join request sent to admin",
-        "pending_requests_count": channel.pending_requests.len() + 1,
-    })))
-}
 
 pub async fn get_all_channels_handler(
     State(state): State<AppState>,
@@ -3392,25 +3233,432 @@ pub struct ApproveRequestRequest {
     pub username: String,
 }
 
+
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RejectRequestRequest {
+    pub channel_id: String,
+    pub user_id: String,
+}
+
+// ============================================================================
+// FCM-RELATED FUNCTIONS FROM channel.rs — WITH DEBUG/ERROR LOGGING ADDED
+// ============================================================================
+// Drop-in replacements. Logic is 100% unchanged — only tracing::debug!/
+// tracing::info!/tracing::error! calls were added at each step so you can
+// see exactly where the join-request notification chain succeeds or fails.
+//
+// Make sure your app initializes a tracing subscriber with debug-level
+// filtering (e.g. RUST_LOG=debug or RUST_LOG=your_crate=debug) or the
+// tracing::debug! lines won't print. tracing::info!/warn!/error! print at
+// default levels.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// 1) notify_channel_members
+// ----------------------------------------------------------------------------
+
+async fn notify_channel_members(
+    state: &AppState,
+    actor_id: &str,
+    channel_id: &str,
+    fixture_id: &str,
+    notification_type: &str,
+    title: &str,
+    body: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    tracing::debug!(
+        "🔔 [notify_channel_members] start | actor_id={} channel_id={} fixture_id={} type={}",
+        actor_id, channel_id, fixture_id, notification_type
+    );
+
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": channel_id })
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "❌ [notify_channel_members] Mongo error looking up channel_id={}: {}",
+                channel_id, e
+            );
+            AppError::MongoDB(e)
+        })?
+        .ok_or_else(|| {
+            tracing::warn!(
+                "⚠️ [notify_channel_members] Channel not found: channel_id={}",
+                channel_id
+            );
+            AppError::DocumentNotFound
+        })?;
+
+    tracing::debug!(
+        "🔔 [notify_channel_members] Channel found: channel_id={} total_members={}",
+        channel_id, channel.members.len()
+    );
+
+    let member_ids: Vec<String> = channel
+        .members
+        .iter()
+        .filter(|m| m.user_id != actor_id)
+        .map(|m| m.user_id.clone())
+        .collect();
+
+    tracing::debug!(
+        "🔔 [notify_channel_members] {} member(s) to notify (excluding actor_id={}): {:?}",
+        member_ids.len(), actor_id, member_ids
+    );
+
+    if member_ids.is_empty() {
+        tracing::debug!(
+            "🔔 [notify_channel_members] No members to notify (channel only contains the actor) — skipping broadcast and FCM. channel_id={}",
+            channel_id
+        );
+        return Ok(());
+    }
+
+    // WebSocket broadcast to the channel room — unconditional, unchanged
+    broadcast_to_channel(
+        state,
+        channel_id,
+        fixture_id,
+        notification_type,
+        payload.clone(),
+    )
+    .await;
+    tracing::debug!(
+        "🔔 [notify_channel_members] WebSocket broadcast sent for channel_id={} fixture_id={}",
+        channel_id, fixture_id
+    );
+
+    let fcm_service = match &state.fcm_service {
+        Some(s) => {
+            tracing::debug!("🔔 [notify_channel_members] fcm_service is configured — proceeding with FCM sends");
+            s
+        }
+        None => {
+            tracing::warn!(
+                "⚠️ [notify_channel_members] state.fcm_service is None — FCM is NOT configured on this AppState, so no push notifications will be sent for channel_id={} type={}",
+                channel_id, notification_type
+            );
+            return Ok(());
+        }
+    };
+
+    let data = serde_json::json!({
+        "type": notification_type,
+        "channel_id": channel_id,
+        "fixture_id": fixture_id,
+        "actor_id": actor_id,
+    });
+
+    let mut success_count = 0usize;
+    let mut failure_count = 0usize;
+
+    for user_id in member_ids {
+        tracing::debug!(
+            "🔔 [notify_channel_members] Attempting FCM send | user_id={} type={} title={:?}",
+            user_id, notification_type, title
+        );
+
+        match fcm_service
+            .send_to_user(
+                state,
+                &user_id,
+                title,
+                body,
+                data.clone(),
+                notification_type,
+            )
+            .await
+        {
+            Ok(result) => {
+                success_count += 1;
+                tracing::info!(
+                    "✅ [notify_channel_members] FCM send_to_user succeeded | user_id={} type={} result={:?}",
+                    user_id, notification_type, result
+                );
+            }
+            Err(e) => {
+                failure_count += 1;
+                tracing::error!(
+                    "❌ [notify_channel_members] FCM send_to_user FAILED | user_id={} channel_id={} type={} error={:?}",
+                    user_id, channel_id, notification_type, e
+                );
+            }
+        }
+    }
+
+    tracing::debug!(
+        "🔔 [notify_channel_members] done | channel_id={} type={} success={} failed={}",
+        channel_id, notification_type, success_count, failure_count
+    );
+
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// 2) request_join_channel_handler
+// ----------------------------------------------------------------------------
+
+pub async fn request_join_channel_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<RequestJoinRequest>,
+) -> Result<Json<serde_json::Value>> {
+    tracing::debug!(
+        "📥 [request_join_channel_handler] start | channel_id={} user_id={} username={}",
+        payload.channel_id, payload.user_id, payload.username
+    );
+
+    let channels_col = state.db.collection::<Channel>("channels");
+    let now = BsonDateTime::now();
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &payload.channel_id })
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "❌ [request_join_channel_handler] Mongo error looking up channel_id={}: {}",
+                payload.channel_id, e
+            );
+            e
+        })?
+        .ok_or_else(|| {
+            tracing::warn!(
+                "⚠️ [request_join_channel_handler] Channel not found: channel_id={}",
+                payload.channel_id
+            );
+            AppError::DocumentNotFound
+        })?;
+
+    tracing::debug!(
+        "📥 [request_join_channel_handler] Channel found: name={:?} member_count={}",
+        channel.name, channel.members.len()
+    );
+
+    let is_member = channel.members.iter().any(|m| m.user_id == payload.user_id);
+    if is_member {
+        tracing::warn!(
+            "⚠️ [request_join_channel_handler] user_id={} is already a member of channel_id={} — rejecting request",
+            payload.user_id, payload.channel_id
+        );
+        return Err(AppError::ValidationError(
+            "Already a member of this channel".to_string(),
+        ));
+    }
+
+    let is_pending = channel
+        .pending_requests
+        .iter()
+        .any(|r| r.user_id == payload.user_id);
+    if is_pending {
+        tracing::warn!(
+            "⚠️ [request_join_channel_handler] user_id={} already has a pending request for channel_id={} — rejecting duplicate",
+            payload.user_id, payload.channel_id
+        );
+        return Err(AppError::ValidationError(
+            "Join request already pending".to_string(),
+        ));
+    }
+
+    let new_request = PendingRequest {
+        user_id: payload.user_id.clone(),
+        username: payload.username.clone(),
+        requested_at: now,
+    };
+
+    let bson_request = bson::to_bson(&new_request).map_err(|e| {
+        tracing::error!(
+            "❌ [request_join_channel_handler] Failed to serialize PendingRequest for user_id={}: {}",
+            payload.user_id, e
+        );
+        AppError::ValidationError(format!("Failed to serialize: {}", e))
+    })?;
+
+    channels_col
+        .update_one(
+            doc! { "channel_id": &payload.channel_id },
+            doc! { "$push": { "pending_requests": bson_request } },
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "❌ [request_join_channel_handler] Mongo error pushing pending_request for user_id={} channel_id={}: {}",
+                payload.user_id, payload.channel_id, e
+            );
+            e
+        })?;
+
+    tracing::debug!(
+        "📥 [request_join_channel_handler] pending_requests updated in DB for user_id={} channel_id={}",
+        payload.user_id, payload.channel_id
+    );
+
+    let admin_user_ids: Vec<String> = channel
+        .members
+        .iter()
+        .filter(|m| m.role == "admin")
+        .map(|m| m.user_id.clone())
+        .collect();
+
+    tracing::debug!(
+        "📥 [request_join_channel_handler] Resolved {} admin(s) for channel_id={}: {:?}",
+        admin_user_ids.len(), payload.channel_id, admin_user_ids
+    );
+
+    if admin_user_ids.is_empty() {
+        tracing::warn!(
+            "⚠️ [request_join_channel_handler] channel_id={} has NO members with role=='admin' — no one will be notified of this join request. This is likely a data issue: check that the admin's ChannelMember.role is exactly the string \"admin\".",
+            payload.channel_id
+        );
+    }
+
+    if !admin_user_ids.is_empty() {
+        let display_name = payload.user_nickname.unwrap_or(payload.username.clone());
+
+        let notification_data = json!({
+            "type": "join_request",
+            "channel_id": payload.channel_id,
+            "channel_name": channel.name,
+            "user_id": payload.user_id,
+            "username": payload.username,
+            "request_id": format!("{}_{}", payload.user_id, payload.channel_id),
+            "notificationType": "join_request",
+        });
+
+        let title = "📥 Join Request";
+        let body = format!("{} wants to join '{}'", display_name, channel.name);
+
+        tracing::debug!(
+            "📥 [request_join_channel_handler] Prepared notification | title={} body={} data={}",
+            title, body, notification_data
+        );
+
+        match &state.fcm_service {
+            Some(fcm_service) => {
+                tracing::debug!("📥 [request_join_channel_handler] fcm_service is configured — sending to {} admin(s)", admin_user_ids.len());
+
+                let mut success_count = 0usize;
+                let mut failure_count = 0usize;
+
+                for admin_id in &admin_user_ids {
+                    tracing::debug!(
+                        "📥 [request_join_channel_handler] Sending FCM join_request to admin_id={}",
+                        admin_id
+                    );
+
+                    match fcm_service
+                        .send_to_user(
+                            &state,
+                            admin_id,
+                            title,
+                            &body,
+                            notification_data.clone(),
+                            "join_request",
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            success_count += 1;
+                            tracing::info!(
+                                "✅ [request_join_channel_handler] FCM join_request sent | admin_id={} result={:?}",
+                                admin_id, result
+                            );
+                        }
+                        Err(e) => {
+                            failure_count += 1;
+                            tracing::error!(
+                                "❌ [request_join_channel_handler] FCM join_request FAILED | admin_id={} channel_id={} error={:?} — this admin will NOT be pushed a notification. Check that admin_id has a registered fcm_token in the fcm_tokens collection.",
+                                admin_id, payload.channel_id, e
+                            );
+                        }
+                    }
+                }
+
+                tracing::debug!(
+                    "📥 [request_join_channel_handler] FCM fan-out complete | channel_id={} success={} failed={}",
+                    payload.channel_id, success_count, failure_count
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "⚠️ [request_join_channel_handler] state.fcm_service is None — FCM is not configured, so the {} admin(s) for channel_id={} were NOT notified. The join request was still saved to pending_requests.",
+                    admin_user_ids.len(), payload.channel_id
+                );
+            }
+        }
+    }
+
+    tracing::debug!(
+        "📥 [request_join_channel_handler] done | user_id={} channel_id={} pending_requests_count={}",
+        payload.user_id, payload.channel_id, channel.pending_requests.len() + 1
+    );
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Join request sent to admin",
+        "pending_requests_count": channel.pending_requests.len() + 1,
+    })))
+}
+
+// ----------------------------------------------------------------------------
+// 3) approve_join_request_handler
+// ----------------------------------------------------------------------------
+
 pub async fn approve_join_request_handler(
     State(state): State<AppState>,
     Json(payload): Json<ApproveRequestRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    tracing::debug!(
+        "✅ [approve_join_request_handler] start | channel_id={} user_id={} username={}",
+        payload.channel_id, payload.user_id, payload.username
+    );
+
     let channels_col = state.db.collection::<Channel>("channels");
     let users_col = state.db.collection::<User>("users");
     let now = BsonDateTime::now();
 
     let channel = channels_col
         .find_one(doc! { "channel_id": &payload.channel_id })
-        .await?
-        .ok_or(AppError::DocumentNotFound)?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "❌ [approve_join_request_handler] Mongo error looking up channel_id={}: {}",
+                payload.channel_id, e
+            );
+            e
+        })?
+        .ok_or_else(|| {
+            tracing::warn!(
+                "⚠️ [approve_join_request_handler] Channel not found: channel_id={}",
+                payload.channel_id
+            );
+            AppError::DocumentNotFound
+        })?;
 
-    let user_obj_id = ObjectId::parse_str(&payload.user_id)?;
-    let user = users_col.find_one(doc! { "_id": user_obj_id }).await?;
+    let user_obj_id = ObjectId::parse_str(&payload.user_id).map_err(|e| {
+        tracing::error!(
+            "❌ [approve_join_request_handler] Invalid ObjectId for user_id={}: {}",
+            payload.user_id, e
+        );
+        e
+    })?;
+    let user = users_col.find_one(doc! { "_id": user_obj_id }).await.map_err(|e| {
+        tracing::error!(
+            "❌ [approve_join_request_handler] Mongo error looking up user_id={}: {}",
+            payload.user_id, e
+        );
+        e
+    })?;
 
     let (season_points, correct_votes, total_votes) = if let Some(u) = user {
         (u.season_points, u.correct_votes, u.total_votes)
     } else {
+        tracing::warn!(
+            "⚠️ [approve_join_request_handler] No users doc found for user_id={} — defaulting stats to 0",
+            payload.user_id
+        );
         (0, 0, 0)
     };
 
@@ -3427,8 +3675,13 @@ pub async fn approve_join_request_handler(
         last_active_at: None,
     };
 
-    let bson_member = bson::to_bson(&new_member)
-        .map_err(|e| AppError::ValidationError(format!("Failed to serialize: {}", e)))?;
+    let bson_member = bson::to_bson(&new_member).map_err(|e| {
+        tracing::error!(
+            "❌ [approve_join_request_handler] Failed to serialize ChannelMember for user_id={}: {}",
+            payload.user_id, e
+        );
+        AppError::ValidationError(format!("Failed to serialize: {}", e))
+    })?;
 
     let result = channels_col
         .update_one(
@@ -3439,37 +3692,85 @@ pub async fn approve_join_request_handler(
                 "$inc": { "member_count": 1 }
             },
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "❌ [approve_join_request_handler] Mongo error adding member user_id={} to channel_id={}: {}",
+                payload.user_id, payload.channel_id, e
+            );
+            e
+        })?;
 
     if result.matched_count == 0 {
+        tracing::warn!(
+            "⚠️ [approve_join_request_handler] update_one matched 0 documents for channel_id={} — channel disappeared between lookup and update?",
+            payload.channel_id
+        );
         return Err(AppError::DocumentNotFound);
     }
 
+    tracing::debug!(
+        "✅ [approve_join_request_handler] user_id={} added to channel_id={} as member (matched_count={} modified_count={})",
+        payload.user_id, payload.channel_id, result.matched_count, result.modified_count
+    );
+
     log_membership_event(&state, &payload.channel_id, &payload.user_id, "joined").await;
 
-    if let Some(fcm_service) = &state.fcm_service {
-        let notification_data = json!({
-            "type": "join_approved",
-            "channel_id": payload.channel_id,
-            "channel_name": channel.name,
-            "action": "open_channel",
-            "notificationType": "join_approved",
-        });
+    match &state.fcm_service {
+        Some(fcm_service) => {
+            let notification_data = json!({
+                "type": "join_approved",
+                "channel_id": payload.channel_id,
+                "channel_name": channel.name,
+                "action": "open_channel",
+                "notificationType": "join_approved",
+            });
 
-        let title = "✅ Request Approved!";
-        let body = format!("You have been added to '{}' 🎉", channel.name);
+            let title = "✅ Request Approved!";
+            let body = format!("You have been added to '{}' 🎉", channel.name);
 
-        let _ = fcm_service
-            .send_to_user(
-                &state,
-                &payload.user_id,
-                title,
-                &body,
-                notification_data,
-                "join_approved",
-            )
-            .await;
+            tracing::debug!(
+                "✅ [approve_join_request_handler] Sending FCM join_approved | user_id={} title={} body={}",
+                payload.user_id, title, body
+            );
+
+            match fcm_service
+                .send_to_user(
+                    &state,
+                    &payload.user_id,
+                    title,
+                    &body,
+                    notification_data,
+                    "join_approved",
+                )
+                .await
+            {
+                Ok(result) => {
+                    tracing::info!(
+                        "✅ [approve_join_request_handler] FCM join_approved sent | user_id={} result={:?}",
+                        payload.user_id, result
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "❌ [approve_join_request_handler] FCM join_approved FAILED | user_id={} channel_id={} error={:?} — user was still added to the channel, they just won't get a push about it. Check their fcm_tokens entry.",
+                        payload.user_id, payload.channel_id, e
+                    );
+                }
+            }
+        }
+        None => {
+            tracing::warn!(
+                "⚠️ [approve_join_request_handler] state.fcm_service is None — user_id={} was added to channel_id={} but NOT notified via FCM",
+                payload.user_id, payload.channel_id
+            );
+        }
     }
+
+    tracing::debug!(
+        "✅ [approve_join_request_handler] done | user_id={} channel_id={}",
+        payload.user_id, payload.channel_id
+    );
 
     Ok(Json(json!({
         "success": true,
@@ -3477,22 +3778,38 @@ pub async fn approve_join_request_handler(
     })))
 }
 
-#[derive(Debug, serde::Deserialize)]
-pub struct RejectRequestRequest {
-    pub channel_id: String,
-    pub user_id: String,
-}
+// ----------------------------------------------------------------------------
+// 4) reject_join_request_handler
+// ----------------------------------------------------------------------------
 
 pub async fn reject_join_request_handler(
     State(state): State<AppState>,
     Json(payload): Json<RejectRequestRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    tracing::debug!(
+        "❌ [reject_join_request_handler] start | channel_id={} user_id={}",
+        payload.channel_id, payload.user_id
+    );
+
     let channels_col = state.db.collection::<Channel>("channels");
 
     let channel = channels_col
         .find_one(doc! { "channel_id": &payload.channel_id })
-        .await?
-        .ok_or(AppError::DocumentNotFound)?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "❌ [reject_join_request_handler] Mongo error looking up channel_id={}: {}",
+                payload.channel_id, e
+            );
+            e
+        })?
+        .ok_or_else(|| {
+            tracing::warn!(
+                "⚠️ [reject_join_request_handler] Channel not found: channel_id={}",
+                payload.channel_id
+            );
+            AppError::DocumentNotFound
+        })?;
 
     let result = channels_col
         .update_one(
@@ -3502,34 +3819,82 @@ pub async fn reject_join_request_handler(
             },
             doc! { "$pull": { "pending_requests": { "user_id": &payload.user_id } } },
         )
-        .await?;
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "❌ [reject_join_request_handler] Mongo error pulling pending_request user_id={} channel_id={}: {}",
+                payload.user_id, payload.channel_id, e
+            );
+            e
+        })?;
 
     if result.matched_count == 0 {
+        tracing::warn!(
+            "⚠️ [reject_join_request_handler] No matching pending_request found for user_id={} in channel_id={} — nothing to reject",
+            payload.user_id, payload.channel_id
+        );
         return Err(AppError::DocumentNotFound);
     }
 
-    if let Some(fcm_service) = &state.fcm_service {
-        let notification_data = json!({
-            "type": "join_rejected",
-            "channel_id": payload.channel_id,
-            "channel_name": channel.name,
-            "notificationType": "join_rejected",
-        });
+    tracing::debug!(
+        "❌ [reject_join_request_handler] pending_request removed for user_id={} channel_id={}",
+        payload.user_id, payload.channel_id
+    );
 
-        let title = "❌ Request Declined";
-        let body = format!("Your request to join '{}' was declined", channel.name);
+    match &state.fcm_service {
+        Some(fcm_service) => {
+            let notification_data = json!({
+                "type": "join_rejected",
+                "channel_id": payload.channel_id,
+                "channel_name": channel.name,
+                "notificationType": "join_rejected",
+            });
 
-        let _ = fcm_service
-            .send_to_user(
-                &state,
-                &payload.user_id,
-                title,
-                &body,
-                notification_data,
-                "join_rejected",
-            )
-            .await;
+            let title = "❌ Request Declined";
+            let body = format!("Your request to join '{}' was declined", channel.name);
+
+            tracing::debug!(
+                "❌ [reject_join_request_handler] Sending FCM join_rejected | user_id={} title={} body={}",
+                payload.user_id, title, body
+            );
+
+            match fcm_service
+                .send_to_user(
+                    &state,
+                    &payload.user_id,
+                    title,
+                    &body,
+                    notification_data,
+                    "join_rejected",
+                )
+                .await
+            {
+                Ok(result) => {
+                    tracing::info!(
+                        "✅ [reject_join_request_handler] FCM join_rejected sent | user_id={} result={:?}",
+                        payload.user_id, result
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "❌ [reject_join_request_handler] FCM join_rejected FAILED | user_id={} channel_id={} error={:?}",
+                        payload.user_id, payload.channel_id, e
+                    );
+                }
+            }
+        }
+        None => {
+            tracing::warn!(
+                "⚠️ [reject_join_request_handler] state.fcm_service is None — user_id={} was removed from pending_requests but NOT notified of the rejection",
+                payload.user_id
+            );
+        }
     }
+
+    tracing::debug!(
+        "❌ [reject_join_request_handler] done | user_id={} channel_id={}",
+        payload.user_id, payload.channel_id
+    );
 
     Ok(Json(json!({
         "success": true,
