@@ -3909,6 +3909,230 @@ pub struct JoinByCodeRequest {
     pub username: String,
 }
 
+// ============================================================================
+// MOST IMPROVED MEMBER (WEEKLY) — AWARD KES 200
+// ============================================================================
+
+const MOST_IMPROVED_AWARD_KES: f64 = 200.0;
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MostImprovedQuery {
+    pub days: Option<i64>,
+}
+
+async fn find_most_improved_member(
+    state: &AppState,
+    channel: &Channel,
+    days: i64,
+) -> Result<Option<(String, String, i32)>> {
+    // Returns (user_id, username, points_gained_this_period)
+    let votes_col = state.db.collection::<Vote>("votes");
+
+    let period_start = chrono::Utc::now() - chrono::Duration::days(days);
+    let period_start_bson = BsonDateTime::from_chrono(period_start);
+
+    let member_ids: Vec<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
+
+    // Sum points_awarded per user across all their votes settled in the window,
+    // restricted to this channel's members.
+    let pipeline = vec![
+        doc! {
+            "$match": {
+                "user_id": { "$in": &member_ids },
+                "voted_at": { "$gte": period_start_bson },
+                "points_awarded": { "$ne": Bson::Null },
+            }
+        },
+        doc! {
+            "$group": {
+                "_id": "$user_id",
+                "total_points": { "$sum": "$points_awarded" }
+            }
+        },
+        doc! { "$sort": { "total_points": -1 } },
+        doc! { "$limit": 1 },
+    ];
+
+    let mut cursor = votes_col.aggregate(pipeline).await?;
+
+    if cursor.advance().await? {
+        let doc = cursor.deserialize_current()?;
+        let user_id: String = doc.get("_id").unwrap().as_str().unwrap().to_string();
+        let total_points: i32 = doc.get("total_points").unwrap().as_i32().unwrap_or(0);
+
+        // Only award if someone actually improved (net positive this period).
+        if total_points <= 0 {
+            return Ok(None);
+        }
+
+        let username = channel
+            .members
+            .iter()
+            .find(|m| m.user_id == user_id)
+            .map(|m| m.username.clone())
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        return Ok(Some((user_id, username, total_points)));
+    }
+
+    Ok(None)
+}
+
+pub async fn award_most_improved_member_handler(
+    State(state): State<AppState>,
+    Path(channel_id): Path<String>,
+    Query(params): Query<MostImprovedQuery>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+    let users_col = state.db.collection::<User>("users");
+    let payouts_col = state.db.collection::<Payout>("payouts");
+    let now = BsonDateTime::now();
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    let days = params.days.unwrap_or(7);
+
+    let most_improved = find_most_improved_member(&state, &channel, days).await?;
+
+    let (user_id, username, points_gained) = match most_improved {
+        Some(v) => v,
+        None => {
+            return Ok(Json(json!({
+                "success": true,
+                "awarded": false,
+                "message": "No member gained points this period",
+            })));
+        }
+    };
+
+    let user_obj_id = ObjectId::parse_str(&user_id)?;
+
+    // Guard against double-award: skip if we already paid this user
+    // a most_improved_weekly award within the window.
+    let period_start_bson = BsonDateTime::from_chrono(chrono::Utc::now() - chrono::Duration::days(days));
+    let already_awarded = payouts_col
+        .find_one(doc! {
+            "channel_id": &channel_id,
+            "user_id": &user_id,
+            "payout_type": "most_improved_weekly",
+            "created_at": { "$gte": period_start_bson },
+        })
+        .await?
+        .is_some();
+
+    if already_awarded {
+        return Ok(Json(json!({
+            "success": true,
+            "awarded": false,
+            "message": "Most improved member already awarded this period",
+            "user_id": user_id,
+        })));
+    }
+
+    users_col
+        .update_one(
+            doc! { "_id": user_obj_id },
+            doc! {
+                "$inc": { "balance": MOST_IMPROVED_AWARD_KES },
+                "$set": { "updated_at": now }
+            },
+        )
+        .await?;
+
+    let payout = Payout {
+        id: None,
+        user_id: user_id.clone(),
+        channel_id: channel_id.clone(),
+        payout_type: "most_improved_weekly".to_string(),
+        amount: MOST_IMPROVED_AWARD_KES,
+        currency: "KES".to_string(),
+        week: None,
+        season: channel.season.clone(),
+        status: "paid".to_string(),
+        created_at: now,
+        paid_at: Some(now),
+        votes_at_payout: None,
+        messages_at_payout: None,
+    };
+
+    payouts_col.insert_one(&payout).await?;
+
+    let award_payload = serde_json::json!({
+        "channel_id": channel_id,
+        "user_id": user_id,
+        "username": username,
+        "points_gained": points_gained,
+        "amount": MOST_IMPROVED_AWARD_KES,
+    });
+
+    let _ = notify_channel_members(
+        &state,
+        "system",
+        &channel_id,
+        "general",
+        "reward.most_improved",
+        "🚀 Most Improved Player",
+        &format!(
+            "{} gained {} points this week and won KES {:.2}!",
+            username, points_gained, MOST_IMPROVED_AWARD_KES
+        ),
+        award_payload,
+    )
+    .await;
+
+    Ok(Json(json!({
+        "success": true,
+        "awarded": true,
+        "channel_id": channel_id,
+        "user_id": user_id,
+        "username": username,
+        "points_gained": points_gained,
+        "amount_awarded": MOST_IMPROVED_AWARD_KES,
+        "payout": payout,
+    })))
+}
+
+// Cron-friendly: run across every channel in one call.
+pub async fn award_most_improved_all_channels_handler(
+    State(state): State<AppState>,
+    Query(params): Query<MostImprovedQuery>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let mut cursor = channels_col.find(doc! {}).await?;
+    let mut channel_ids = Vec::new();
+    while cursor.advance().await? {
+        let channel: Channel = cursor.deserialize_current()?;
+        channel_ids.push(channel.channel_id);
+    }
+
+    let mut results = Vec::new();
+    for channel_id in channel_ids {
+        match award_most_improved_member_handler(
+            State(state.clone()),
+            Path(channel_id.clone()),
+            Query(MostImprovedQuery { days: params.days }),
+        )
+        .await
+        {
+            Ok(Json(v)) => results.push(v),
+            Err(e) => results.push(json!({
+                "channel_id": channel_id,
+                "error": format!("{:?}", e),
+            })),
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "channels_processed": results.len(),
+        "results": results,
+    })))
+}
+
 pub async fn join_channel_by_code_handler(
     State(state): State<AppState>,
     Json(payload): Json<JoinByCodeRequest>,
