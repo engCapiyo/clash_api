@@ -20,7 +20,7 @@ use crate::{
     state::AppState,
 };
 
-const FIREBASE_PROJECT_ID: &str = "clash-66865";
+const FIREBASE_PROJECT_ID: &str = "funzy-d56d7";
 
 pub struct FCMService {
     authenticator: Arc<
@@ -50,7 +50,7 @@ let private_key_id = env::var("FIREBASE_PRIVATE_KEY_ID")
     .map_err(|_| anyhow!("FIREBASE_PRIVATE_KEY_ID not set in environment"))?;
 
 let project_id =
-    env::var("FIREBASE_PROJECT_ID").unwrap_or_else(|_| "clash-66865".to_string());
+    env::var("FIREBASE_PROJECT_ID").unwrap_or_else(|_| "funzy-d56d7".to_string());
         println!("✅ FIREBASE_CLIENT_EMAIL found: {}", client_email);
         println!(
             "✅ FIREBASE_PRIVATE_KEY found (length: {} chars)",
