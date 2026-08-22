@@ -675,7 +675,8 @@ pub async fn get_games(
 
     let mut games = find_games_tolerant_all(&state, filter, Some(doc! { "kickoffUtc": 1 })).await?;
 
-    let limit = query.limit.unwrap_or(100).max(0) as usize;
+    // Hard-capped at 20 regardless of what the caller requests
+    let limit = query.limit.unwrap_or(20).clamp(0, 20) as usize;
     games.truncate(limit);
 
     tracing::info!("✅ Returning {} games", games.len());
@@ -2028,7 +2029,8 @@ pub async fn get_history_games(
         filter.insert("completedAt", completed_at_filter);
     }
 
-    let limit = query.limit.unwrap_or(50);
+    // Hard-capped at 20 regardless of what the caller requests
+    let limit = query.limit.unwrap_or(20).clamp(0, 20);
     let skip = query.skip.unwrap_or(0);
     let sort = doc! { "completedAt": -1 };
 
