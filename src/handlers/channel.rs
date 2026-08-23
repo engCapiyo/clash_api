@@ -410,119 +410,48 @@ async fn broadcast_to_channel(
 // CREATE CHANNEL
 // ============================================================================
 
-#[derive(Debug, serde::Deserialize)]
-pub struct CreateChannelRequest {
-    pub name: String,
-    pub created_by: String,
-    pub created_by_username: String,
-    pub season: String,
-    pub members: Option<Vec<NewMember>>,
-}
 
-#[derive(Debug, serde::Deserialize)]
-pub struct NewMember {
-    pub user_id: String,
-    pub username: String,
-}
 
-pub async fn create_channel_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<CreateChannelRequest>,
-) -> Result<Json<serde_json::Value>> {
-    let channels_col = state.db.collection::<Channel>("channels");
+
+// Looks up this user's ChannelMember entry from any channel they're
+// already in — this is the single source of truth for msg_count/
+// likes_count (which have no canonical home outside channels).
+
+
+// Resolves the stats to seed a NEW membership with, so a user's numbers
+// never reset just because they joined another channel.
+async fn resolve_member_seed_stats(
+    state: &AppState,
+    user_id: &str,
+) -> Result<(i32, i32, i32, i32, i32)> {
+    // (season_points, correct_votes, total_votes, msg_count, likes_count)
+    if let Some(existing) = find_existing_member_metadata(state, user_id).await? {
+        return Ok((
+            existing.season_points,
+            existing.correct_votes,
+            existing.total_votes,
+            existing.msg_count,
+            existing.likes_count,
+        ));
+    }
+
+    // No existing channel membership anywhere — fall back to the
+    // canonical users collection for vote stats; msg/likes start at 0
+    // since this really is their first channel.
     let users_col = state.db.collection::<User>("users");
-    let now = BsonDateTime::now();
-    let channel_id = Uuid::new_v4().to_string();
-    let invite_code = Uuid::new_v4().to_string().to_uppercase()[0..6].to_string();
-
-    let mut members = vec![ChannelMember {
-        user_id: payload.created_by.clone(),
-        username: payload.created_by_username.clone(),
-        role: "admin".to_string(),
-        joined_at: now,
-        season_points: 0,
-        correct_votes: 0,
-        total_votes: 0,
-        msg_count: 0,
-        likes_count: 0,
-        last_active_at: None,
-    }];
-
-    if let Some(requested_members) = payload.members {
-        for new_member in requested_members {
-            if new_member.user_id == payload.created_by {
-                continue;
-            }
-
-            let filter = if let Ok(oid) = ObjectId::parse_str(&new_member.user_id) {
-                doc! { "_id": oid }
-            } else {
-                doc! { "user_id": &new_member.user_id }
-            };
-
-            let user = users_col.find_one(filter).await?;
-
-            let (season_points, correct_votes, total_votes) = if let Some(u) = user {
-                (u.season_points, u.correct_votes, u.total_votes)
-            } else {
-                (0, 0, 0)
-            };
-
-            members.push(ChannelMember {
-                user_id: new_member.user_id,
-                username: new_member.username,
-                role: "member".to_string(),
-                joined_at: now,
-                season_points,
-                correct_votes,
-                total_votes,
-                msg_count: 0,
-                likes_count: 0,
-                last_active_at: None,
-            });
-        }
-    }
-
-    let member_count = members.len() as i32;
-
-    let channel = Channel {
-        id: None,
-        channel_id: channel_id.clone(),
-        name: payload.name,
-        created_by: payload.created_by.clone(),
-        created_at: now,
-        members: members.clone(),
-        activity: ChannelActivity {
-            total_messages: 0,
-            messages_this_week: 0,
-            week_reset_at: now,
-            last_message_at: None,
-        },
-        season: payload.season,
-        member_count,
-        invite_code: invite_code.clone(),
-        pending_requests: vec![],
+    let filter = if let Ok(oid) = ObjectId::parse_str(user_id) {
+        doc! { "_id": oid }
+    } else {
+        doc! { "user_id": user_id }
     };
+    let user = users_col.find_one(filter).await?;
 
-    channels_col.insert_one(channel).await?;
-
-    if let Ok(oid) = ObjectId::parse_str(&payload.created_by) {
-        users_col
-            .update_one(doc! { "_id": oid }, doc! { "$set": { "is_admin": true } })
-            .await?;
-    }
-
-    for m in &members {
-        log_membership_event(&state, &channel_id, &m.user_id, "joined").await;
-    }
-
-    Ok(Json(json!({
-        "success": true,
-        "channel_id": channel_id,
-        "invite_code": invite_code,
-        "member_count": member_count,
-    })))
+    Ok(match user {
+        Some(u) => (u.season_points, u.correct_votes, u.total_votes, 0, 0),
+        None => (0, 0, 0, 0, 0),
+    })
 }
+
 
 // ============================================================================
 // FINALIZE FIXTURE RESULT
@@ -3150,13 +3079,7 @@ pub async fn get_weekly_top_channel_handler(
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-pub struct RequestJoinRequest {
-    pub channel_id: String,
-    pub user_id: String,
-    pub username: String,
-    pub user_nickname: Option<String>,
-}
+
 
 
 pub async fn get_all_channels_handler(
@@ -3226,12 +3149,7 @@ pub async fn get_pending_requests_handler(
     })))
 }
 
-#[derive(Debug, serde::Deserialize)]
-pub struct ApproveRequestRequest {
-    pub channel_id: String,
-    pub user_id: String,
-    pub username: String,
-}
+
 
 
 
@@ -3401,6 +3319,13 @@ async fn notify_channel_members(
 // ----------------------------------------------------------------------------
 // 2) request_join_channel_handler
 // ----------------------------------------------------------------------------
+#[derive(Debug, serde::Deserialize)]
+pub struct RequestJoinRequest {
+    pub channel_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub user_nickname: Option<String>,
+}
 
 pub async fn request_join_channel_handler(
     State(state): State<AppState>,
@@ -3606,6 +3531,224 @@ pub async fn request_join_channel_handler(
 // 3) approve_join_request_handler
 // ----------------------------------------------------------------------------
 
+// ============================================================================
+// NEW HELPERS — add near log_membership_event
+// ============================================================================
+
+// Looks up this user's ChannelMember entry from any channel they're
+// already in — this is the single source of truth for msg_count/
+// likes_count (which have no canonical home outside the channels
+// collection, unlike season_points/correct_votes/total_votes which
+// also live on `users`).
+async fn find_existing_member_metadata(
+    state: &AppState,
+    user_id: &str,
+) -> Result<Option<ChannelMember>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "members.user_id": user_id })
+        .await?;
+
+    Ok(channel.and_then(|c| c.members.into_iter().find(|m| m.user_id == user_id)))
+}
+
+// Resolves the stats to seed a NEW membership with, so a user's numbers
+// never reset just because they joined another channel. Returns
+// (season_points, correct_votes, total_votes, msg_count, likes_count).
+
+
+// ============================================================================
+// CREATE CHANNEL
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CreateChannelRequest {
+    pub name: String,
+    pub created_by: String,
+    pub created_by_username: String,
+    pub season: String,
+    pub members: Option<Vec<NewMember>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct NewMember {
+    pub user_id: String,
+    pub username: String,
+}
+
+pub async fn create_channel_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<CreateChannelRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+    let users_col = state.db.collection::<User>("users");
+    let now = BsonDateTime::now();
+    let channel_id = Uuid::new_v4().to_string();
+    let invite_code = Uuid::new_v4().to_string().to_uppercase()[0..6].to_string();
+
+    let (
+        creator_season_points,
+        creator_correct_votes,
+        creator_total_votes,
+        creator_msg_count,
+        creator_likes_count,
+    ) = resolve_member_seed_stats(&state, &payload.created_by).await?;
+
+    let mut members = vec![ChannelMember {
+        user_id: payload.created_by.clone(),
+        username: payload.created_by_username.clone(),
+        role: "admin".to_string(),
+        joined_at: now,
+        season_points: creator_season_points,
+        correct_votes: creator_correct_votes,
+        total_votes: creator_total_votes,
+        msg_count: creator_msg_count,
+        likes_count: creator_likes_count,
+        last_active_at: None,
+    }];
+
+    if let Some(requested_members) = payload.members {
+        for new_member in requested_members {
+            if new_member.user_id == payload.created_by {
+                continue;
+            }
+
+            let (season_points, correct_votes, total_votes, msg_count, likes_count) =
+                resolve_member_seed_stats(&state, &new_member.user_id).await?;
+
+            members.push(ChannelMember {
+                user_id: new_member.user_id,
+                username: new_member.username,
+                role: "member".to_string(),
+                joined_at: now,
+                season_points,
+                correct_votes,
+                total_votes,
+                msg_count,
+                likes_count,
+                last_active_at: None,
+            });
+        }
+    }
+
+    let member_count = members.len() as i32;
+
+    let channel = Channel {
+        id: None,
+        channel_id: channel_id.clone(),
+        name: payload.name,
+        created_by: payload.created_by.clone(),
+        created_at: now,
+        members: members.clone(),
+        activity: ChannelActivity {
+            total_messages: 0,
+            messages_this_week: 0,
+            week_reset_at: now,
+            last_message_at: None,
+        },
+        season: payload.season,
+        member_count,
+        invite_code: invite_code.clone(),
+        pending_requests: vec![],
+    };
+
+    channels_col.insert_one(channel).await?;
+
+    if let Ok(oid) = ObjectId::parse_str(&payload.created_by) {
+        users_col
+            .update_one(doc! { "_id": oid }, doc! { "$set": { "is_admin": true } })
+            .await?;
+    }
+
+    for m in &members {
+        log_membership_event(&state, &channel_id, &m.user_id, "joined").await;
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel_id,
+        "invite_code": invite_code,
+        "member_count": member_count,
+    })))
+}
+
+// ============================================================================
+// JOIN CHANNEL BY CODE
+// ============================================================================
+
+
+
+
+pub async fn join_channel_by_code_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<JoinByCodeRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let channels_col = state.db.collection::<Channel>("channels");
+    let now = BsonDateTime::now();
+
+    let channel = channels_col
+        .find_one(doc! { "invite_code": &payload.invite_code })
+        .await?
+        .ok_or(AppError::ValidationError("Invalid invite code".to_string()))?;
+
+    let is_member = channel.members.iter().any(|m| m.user_id == payload.user_id);
+    if is_member {
+        return Err(AppError::ValidationError(
+            "Already a member of this channel".to_string(),
+        ));
+    }
+
+    let (season_points, correct_votes, total_votes, msg_count, likes_count) =
+        resolve_member_seed_stats(&state, &payload.user_id).await?;
+
+    let new_member = ChannelMember {
+        user_id: payload.user_id.clone(),
+        username: payload.username,
+        role: "member".to_string(),
+        joined_at: now,
+        season_points,
+        correct_votes,
+        total_votes,
+        msg_count,
+        likes_count,
+        last_active_at: None,
+    };
+
+    let bson_member = bson::to_bson(&new_member)
+        .map_err(|e| AppError::ValidationError(format!("Failed to serialize: {}", e)))?;
+
+    channels_col
+        .update_one(
+            doc! { "channel_id": &channel.channel_id },
+            doc! {
+                "$push": { "members": bson_member },
+                "$inc": { "member_count": 1 }
+            },
+        )
+        .await?;
+
+    log_membership_event(&state, &channel.channel_id, &payload.user_id, "joined").await;
+
+    Ok(Json(json!({
+        "success": true,
+        "channel_id": channel.channel_id,
+        "channel_name": channel.name,
+        "message": "Joined channel successfully"
+    })))
+}
+
+// ============================================================================
+// APPROVE JOIN REQUEST (ADMIN ACCEPTANCE)
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ApproveRequestRequest {
+    pub channel_id: String,
+    pub user_id: String,
+    pub username: String,
+}
+
 pub async fn approve_join_request_handler(
     State(state): State<AppState>,
     Json(payload): Json<ApproveRequestRequest>,
@@ -3616,7 +3759,6 @@ pub async fn approve_join_request_handler(
     );
 
     let channels_col = state.db.collection::<Channel>("channels");
-    let users_col = state.db.collection::<User>("users");
     let now = BsonDateTime::now();
 
     let channel = channels_col
@@ -3637,30 +3779,14 @@ pub async fn approve_join_request_handler(
             AppError::DocumentNotFound
         })?;
 
-    let user_obj_id = ObjectId::parse_str(&payload.user_id).map_err(|e| {
-        tracing::error!(
-            "❌ [approve_join_request_handler] Invalid ObjectId for user_id={}: {}",
-            payload.user_id, e
-        );
-        e
-    })?;
-    let user = users_col.find_one(doc! { "_id": user_obj_id }).await.map_err(|e| {
-        tracing::error!(
-            "❌ [approve_join_request_handler] Mongo error looking up user_id={}: {}",
-            payload.user_id, e
-        );
-        e
-    })?;
-
-    let (season_points, correct_votes, total_votes) = if let Some(u) = user {
-        (u.season_points, u.correct_votes, u.total_votes)
-    } else {
-        tracing::warn!(
-            "⚠️ [approve_join_request_handler] No users doc found for user_id={} — defaulting stats to 0",
-            payload.user_id
-        );
-        (0, 0, 0)
-    };
+    let (season_points, correct_votes, total_votes, msg_count, likes_count) =
+        resolve_member_seed_stats(&state, &payload.user_id).await.map_err(|e| {
+            tracing::error!(
+                "❌ [approve_join_request_handler] Failed to resolve seed stats for user_id={}: {:?}",
+                payload.user_id, e
+            );
+            e
+        })?;
 
     let new_member = ChannelMember {
         user_id: payload.user_id.clone(),
@@ -3670,8 +3796,8 @@ pub async fn approve_join_request_handler(
         season_points,
         correct_votes,
         total_votes,
-        msg_count: 0,
-        likes_count: 0,
+        msg_count,
+        likes_count,
         last_active_at: None,
     };
 
@@ -3777,7 +3903,6 @@ pub async fn approve_join_request_handler(
         "message": "User approved and added to channel"
     })))
 }
-
 // ----------------------------------------------------------------------------
 // 4) reject_join_request_handler
 // ----------------------------------------------------------------------------
@@ -4133,70 +4258,6 @@ pub async fn award_most_improved_all_channels_handler(
     })))
 }
 
-pub async fn join_channel_by_code_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<JoinByCodeRequest>,
-) -> Result<Json<serde_json::Value>> {
-    let channels_col = state.db.collection::<Channel>("channels");
-    let users_col = state.db.collection::<User>("users");
-    let now = BsonDateTime::now();
-
-    let channel = channels_col
-        .find_one(doc! { "invite_code": &payload.invite_code })
-        .await?
-        .ok_or(AppError::ValidationError("Invalid invite code".to_string()))?;
-
-    let is_member = channel.members.iter().any(|m| m.user_id == payload.user_id);
-    if is_member {
-        return Err(AppError::ValidationError(
-            "Already a member of this channel".to_string(),
-        ));
-    }
-
-    let user_obj_id = ObjectId::parse_str(&payload.user_id)?;
-    let user = users_col.find_one(doc! { "_id": user_obj_id }).await?;
-
-    let (season_points, correct_votes, total_votes) = if let Some(u) = user {
-        (u.season_points, u.correct_votes, u.total_votes)
-    } else {
-        (0, 0, 0)
-    };
-
-    let new_member = ChannelMember {
-        user_id: payload.user_id.clone(),
-        username: payload.username,
-        role: "member".to_string(),
-        joined_at: now,
-        season_points,
-        correct_votes,
-        total_votes,
-        msg_count: 0,
-        likes_count: 0,
-        last_active_at: None,
-    };
-
-    let bson_member = bson::to_bson(&new_member)
-        .map_err(|e| AppError::ValidationError(format!("Failed to serialize: {}", e)))?;
-
-    channels_col
-        .update_one(
-            doc! { "channel_id": &channel.channel_id },
-            doc! {
-                "$push": { "members": bson_member },
-                "$inc": { "member_count": 1 }
-            },
-        )
-        .await?;
-
-    log_membership_event(&state, &channel.channel_id, &payload.user_id, "joined").await;
-
-    Ok(Json(json!({
-        "success": true,
-        "channel_id": channel.channel_id,
-        "channel_name": channel.name,
-        "message": "Joined channel successfully"
-    })))
-}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct AddMembersRequest {
@@ -4209,7 +4270,6 @@ pub async fn add_members_to_channel_handler(
     Json(payload): Json<AddMembersRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let channels_col = state.db.collection::<Channel>("channels");
-    let users_col = state.db.collection::<User>("users");
     let now = BsonDateTime::now();
 
     let no_last_active: Option<BsonDateTime> = None;
@@ -4218,18 +4278,11 @@ pub async fn add_members_to_channel_handler(
     let mut added_user_ids = Vec::new();
 
     for member in &payload.members {
-        let user_obj_id = match ObjectId::parse_str(&member.user_id) {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-
-        let user = users_col.find_one(doc! { "_id": user_obj_id }).await?;
-
-        let (season_points, correct_votes, total_votes) = if let Some(u) = user {
-            (u.season_points, u.correct_votes, u.total_votes)
-        } else {
-            (0, 0, 0)
-        };
+        // ✅ pull full seed stats (season_points, correct_votes, total_votes,
+        // msg_count, likes_count) from any existing channel membership,
+        // falling back to the users collection — same as create_channel_handler.
+        let (season_points, correct_votes, total_votes, msg_count, likes_count) =
+            resolve_member_seed_stats(&state, &member.user_id).await?;
 
         members_to_add.push(doc! {
             "user_id": &member.user_id,
@@ -4239,8 +4292,8 @@ pub async fn add_members_to_channel_handler(
             "season_points": season_points,
             "correct_votes": correct_votes,
             "total_votes": total_votes,
-            "msg_count": 0,
-            "likes_count": 0,
+            "msg_count": msg_count,
+            "likes_count": likes_count,
             "last_active_at": no_last_active,
         });
 
