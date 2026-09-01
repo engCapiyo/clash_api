@@ -676,7 +676,7 @@ pub async fn get_games(
     let mut games = find_games_tolerant_all(&state, filter, Some(doc! { "kickoffUtc": 1 })).await?;
 
     // Hard-capped at 20 regardless of what the caller requests
-    let limit = query.limit.unwrap_or(20).clamp(0, 20) as usize;
+    let limit = query.limit.unwrap_or(20).clamp(0, 30) as usize;
     games.truncate(limit);
 
     tracing::info!("✅ Returning {} games", games.len());
@@ -1707,7 +1707,7 @@ pub async fn get_latest_commentary(
     Path(match_id): Path<String>,
     Query(params): Query<LatestCommentaryQuery>,
 ) -> Result<Json<serde_json::Value>> {
-    let limit = params.limit.unwrap_or(20);
+    let limit = params.limit.unwrap_or(100);
 
     let game = find_game_tolerant_all(&state, doc! { "matchId": &match_id })
         .await?
@@ -2030,7 +2030,7 @@ pub async fn get_history_games(
     }
 
     // Hard-capped at 20 regardless of what the caller requests
-    let limit = query.limit.unwrap_or(20).clamp(0, 20);
+    let limit = query.limit.unwrap_or(100).clamp(0, 100);
     let skip = query.skip.unwrap_or(0);
     let sort = doc! { "completedAt": -1 };
 
