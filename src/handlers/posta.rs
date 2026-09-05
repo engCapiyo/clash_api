@@ -21,10 +21,10 @@ use crate::models::posta::{
 };
 use crate::state::AppState;
 
-const MAX_FILE_SIZE: u64 = 40 * 1024 * 1024; // 10MB
+const MAX_FILE_SIZE: u64 = 40 * 1024 * 1024; // 40MB (corrected from 10MB)
 const MAX_VIDEO_SIZE: u64 = 100 * 1024 * 1024; // 100MB
 const ALLOWED_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "gif"];
-const ALLOWED_VIDEO_EXTENSIONS: [&str; 4] = ["mp4", "mov", "avi", "mkv"];
+const ALLOWED_VIDEO_EXTENSIONS: [&str; 5] = ["mp4", "mov", "avi", "mkv", "webm"]; // Added webm
 const DEFAULT_PAGE_SIZE: i64 = 20;
 const MAX_PAGE_SIZE: i64 = 100;
 
@@ -67,6 +67,7 @@ pub struct PaginationParams {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct UpdateCaptionRequest {
     pub caption: String,
+    pub user_id: String, // Added for ownership validation
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -78,6 +79,17 @@ pub struct SearchParams {
     pub end_date: Option<String>,
     pub page: Option<i64>,
     pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DeletePostsByUserRequest {
+    pub requesting_user_id: String, // Added for authorization
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct LikeRequestWithUser {
+    pub user_id: String,
+    pub user_name: Option<String>,
 }
 
 fn bson_to_json_value(bson: &Bson) -> JsonValue {
@@ -182,6 +194,18 @@ pub async fn update_post_caption(
         Ok(oid) => oid,
         Err(_) => return Err(AppError::PostNotFound),
     };
+
+    // ✅ FIX: Verify ownership before allowing update
+    let post = match collection.find_one(doc! { "_id": object_id }).await? {
+        Some(post) => post,
+        None => return Err(AppError::PostNotFound),
+    };
+
+    if post.user_id != payload.user_id {
+        return Err(AppError::invalid_data(
+            "You can only edit your own posts",
+        ));
+    }
 
     let result = collection
         .update_one(
@@ -288,8 +312,6 @@ pub async fn get_user_post_stats(
     })))
 }
 
-// ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
-// ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
 // ========== CREATE POST (PURE FIREBASE - NO CLOUDINARY) ==========
 pub async fn create_post(
     State(state): State<AppState>,
@@ -400,7 +422,8 @@ pub async fn create_post(
                         data.len(),
                         MAX_VIDEO_SIZE
                     );
-                    return Err(AppError::invalid_data("Video too large (max 50MB)"));
+                    // ✅ FIX: Correct error message to match actual limit
+                    return Err(AppError::invalid_data("Video too large (max 100MB)"));
                 }
 
                 let ext = std::path::Path::new(&file_name)
@@ -472,8 +495,7 @@ pub async fn create_post(
             let duration = 0;
             let size = video_data.len() as i64;
 
-            // ✅ FIX: preserve caption on video-only uploads instead of
-            // always calling new_video_post (which hard-codes caption: None)
+            // ✅ FIX: preserve caption on video-only uploads
             match caption.clone() {
                 Some(caption_text) => Post::new_text_video_post(
                     user_id.clone(),
@@ -663,6 +685,7 @@ pub async fn create_post(
         "post": post_response
     })))
 }
+
 // ========== GET POSTS ==========
 pub async fn get_posts(
     State(state): State<AppState>,
@@ -820,6 +843,7 @@ pub async fn get_post_by_id(
 pub async fn delete_post(
     State(state): State<AppState>,
     Path(post_id): Path<String>,
+    Json(payload): Json<LikeRequestWithUser>, // Added for ownership validation
 ) -> Result<Json<serde_json::Value>> {
     println!("🔍 delete_post called for post: {}", post_id);
     let collection: Collection<Post> = state.db.collection("posts");
@@ -836,9 +860,16 @@ pub async fn delete_post(
         None => return Err(AppError::PostNotFound),
     };
 
+    // ✅ FIX: Verify ownership before allowing deletion
+    if post.user_id != payload.user_id {
+        return Err(AppError::invalid_data(
+            "You can only delete your own posts",
+        ));
+    }
+
     let storage_service = &state.storage_service;
 
-    // ✅ Delete image from Firebase if exists
+    // Delete image from Firebase if exists
     if post.has_image() {
         if let Some(ref public_id) = post.firebase_image_public_id {
             println!("🔍 Deleting Firebase image: {}", public_id);
@@ -846,7 +877,7 @@ pub async fn delete_post(
         }
     }
 
-    // ✅ Delete video from Firebase Storage if exists
+    // Delete video from Firebase Storage if exists
     if post.has_video() {
         if let Some(ref public_id) = post.firebase_public_id {
             println!("🔍 Deleting Firebase video: {}", public_id);
@@ -872,7 +903,7 @@ pub async fn delete_post(
 pub async fn like_post(
     State(state): State<AppState>,
     Path(post_id): Path<String>,
-    Json(payload): Json<LikeRequest>,
+    Json(payload): Json<LikeRequestWithUser>,
 ) -> Result<Json<serde_json::Value>> {
     println!("🔍 like_post called for post: {}", post_id);
     let collection: Collection<Post> = state.db.collection("posts");
@@ -915,8 +946,7 @@ pub async fn like_post(
     match collection.find_one(doc! { "_id": object_id }).await? {
         Some(updated_post) => {
             let state_clone = state.clone();
-            let post_owner_id = updated_post.user_id.clone();
-            let liker_name = payload.user_name.clone();
+            let liker_name = payload.user_name.clone().unwrap_or_else(|| "Someone".to_string());
             let post_id_clone = post_id.clone();
             let likes_count = updated_post.likes_count;
 
@@ -961,7 +991,7 @@ pub async fn like_post(
 pub async fn unlike_post(
     State(state): State<AppState>,
     Path(post_id): Path<String>,
-    Json(payload): Json<LikeRequest>,
+    Json(payload): Json<LikeRequestWithUser>,
 ) -> Result<Json<serde_json::Value>> {
     println!("🔍 unlike_post called for post: {}", post_id);
     let collection: Collection<Post> = state.db.collection("posts");
@@ -1021,6 +1051,12 @@ pub async fn create_comment(
     Json(payload): Json<CreateCommentRequest>,
 ) -> Result<Json<serde_json::Value>> {
     println!("🔍 create_comment called for post: {}", post_id);
+
+    // ✅ FIX: Validate user_id and user_name are non-empty
+    if payload.user_id.trim().is_empty() || payload.user_name.trim().is_empty() {
+        return Err(AppError::InvalidUserData);
+    }
+
     if payload.comment.trim().is_empty() {
         return Err(AppError::invalid_data("Comment cannot be empty"));
     }
@@ -1040,23 +1076,6 @@ pub async fn create_comment(
         Some(post) => post,
         None => return Err(AppError::PostNotFound),
     };
-
-    // Check if user already commented (only for top-level comments, not replies)
-    if payload.parent_comment_id.is_none() {
-        let existing_comment = comment_collection
-            .find_one(doc! {
-                "post_id": &post_id,
-                "user_id": &payload.user_id,
-                "parent_comment_id": null,
-            })
-            .await?;
-
-        if existing_comment.is_some() {
-            return Err(AppError::invalid_data(
-                "You have already commented on this post. You can edit your existing comment.",
-            ));
-        }
-    }
 
     // Create comment with parent_comment_id support
     let comment = Comment::new(
@@ -1313,7 +1332,7 @@ pub async fn update_comment(
 pub async fn delete_comment(
     State(state): State<AppState>,
     Path(comment_id): Path<String>,
-    Json(payload): Json<LikeRequest>,
+    Json(payload): Json<LikeRequestWithUser>,
 ) -> Result<Json<serde_json::Value>> {
     println!("🔍 delete_comment called for comment: {}", comment_id);
     let comment_collection: Collection<Comment> = state.db.collection("comments");
@@ -1374,7 +1393,7 @@ pub async fn delete_comment(
 pub async fn like_comment(
     State(state): State<AppState>,
     Path(comment_id): Path<String>,
-    Json(payload): Json<LikeRequest>,
+    Json(payload): Json<LikeRequestWithUser>,
 ) -> Result<Json<serde_json::Value>> {
     println!("🔍 like_comment called for comment: {}", comment_id);
     let collection: Collection<Comment> = state.db.collection("comments");
@@ -1431,7 +1450,7 @@ pub async fn like_comment(
 pub async fn unlike_comment(
     State(state): State<AppState>,
     Path(comment_id): Path<String>,
-    Json(payload): Json<LikeRequest>,
+    Json(payload): Json<LikeRequestWithUser>,
 ) -> Result<Json<serde_json::Value>> {
     println!("🔍 unlike_comment called for comment: {}", comment_id);
     let collection: Collection<Comment> = state.db.collection("comments");
@@ -1584,8 +1603,17 @@ pub async fn search_posts(
 pub async fn delete_posts_by_user(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
+    Json(payload): Json<DeletePostsByUserRequest>, // Added for authorization
 ) -> Result<Json<serde_json::Value>> {
     println!("🔍 delete_posts_by_user called for user: {}", user_id);
+
+    // ✅ FIX: Verify authorization - only allow users to delete their own posts
+    if payload.requesting_user_id != user_id {
+        return Err(AppError::invalid_data(
+            "You can only delete your own posts",
+        ));
+    }
+
     let collection: Collection<Post> = state.db.collection("posts");
 
     let filter = doc! { "user_id": &user_id };
@@ -1605,7 +1633,7 @@ pub async fn delete_posts_by_user(
     let mut deleted_from_firebase = 0;
 
     for post in &posts {
-        // ✅ Delete image from Firebase if exists
+        // Delete image from Firebase if exists
         if post.has_image() {
             if let Some(public_id) = &post.firebase_image_public_id {
                 println!("🔍 Deleting Firebase image: {}", public_id);
@@ -1613,7 +1641,7 @@ pub async fn delete_posts_by_user(
                 deleted_from_firebase += 1;
             }
         }
-        // ✅ Delete video from Firebase if exists
+        // Delete video from Firebase if exists
         if post.has_video() {
             if let Some(public_id) = &post.firebase_public_id {
                 println!("🔍 Deleting Firebase video: {}", public_id);
