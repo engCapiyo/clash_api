@@ -44,6 +44,213 @@ fn phone_query(phone: &str) -> mongodb::bson::Document {
     let normalized = normalize_phone(phone);
     doc! { "phone": { "$regex": format!("{}$", normalized) } }
 }
+// ============================================================================
+// DELETE USER BY ID
+// ============================================================================
+
+pub async fn delete_user(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> impl IntoResponse {
+    // Validate ObjectId
+    let object_id = match ObjectId::parse_str(&user_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "error": "Invalid user ID format"
+                })),
+            );
+        }
+    };
+
+    // Delete the user - FIXED: No None parameter
+    let collection = state.db.collection::<mongodb::bson::Document>("users");
+    
+    let result = match collection.delete_one(
+        doc! { "_id": object_id },
+    ).await {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("❌ Database error: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "error": format!("Failed to delete user: {}", e)
+                })),
+            );
+        }
+    };
+
+    // Check if user was found and deleted
+    if result.deleted_count == 0 {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "error": "User not found"
+            })),
+        );
+    }
+
+    // Success response
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "message": "User deleted successfully",
+            "deleted_count": result.deleted_count
+        })),
+    )
+}
+
+// ============================================================================
+// DELETE MULTIPLE USERS BY IDS (BULK DELETE)
+// ============================================================================
+
+pub async fn delete_users_bulk(
+    State(state): State<AppState>,
+    Json(payload): Json<DeleteUsersRequest>,
+) -> impl IntoResponse {
+    let collection = state.db.collection::<mongodb::bson::Document>("users");
+    
+    // Convert string IDs to ObjectIds
+    let mut object_ids = Vec::new();
+    for id in payload.user_ids {
+        match ObjectId::parse_str(&id) {
+            Ok(oid) => object_ids.push(oid),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "success": false,
+                        "error": format!("Invalid user ID format: {}", id)
+                    })),
+                );
+            }
+        }
+    }
+
+    // Delete all specified users - FIXED: No None parameter
+    let result = match collection.delete_many(
+        doc! { "_id": { "$in": object_ids } },
+    ).await {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("❌ Database error: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "error": format!("Failed to delete users: {}", e)
+                })),
+            );
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "message": format!("Deleted {} users", result.deleted_count),
+            "deleted_count": result.deleted_count
+        })),
+    )
+}
+
+// ============================================================================
+// DELETE USERS BY USERNAME (Specific or Pattern)
+// ============================================================================
+
+pub async fn delete_users_by_username(
+    State(state): State<AppState>,
+    Json(payload): Json<DeleteByUsernameRequest>,
+) -> impl IntoResponse {
+    let collection = state.db.collection::<mongodb::bson::Document>("users");
+    
+    // Delete users with usernames matching the pattern or list
+    // If usernames list is provided, delete those specific usernames
+    if let Some(usernames) = payload.usernames {
+        let result = match collection.delete_many(
+            doc! { "username": { "$in": usernames } },
+        ).await {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("❌ Database error: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "success": false,
+                        "error": format!("Failed to delete users: {}", e)
+                    })),
+                );
+            }
+        };
+
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "message": format!("Deleted {} users", result.deleted_count),
+                "deleted_count": result.deleted_count
+            })),
+        );
+    }
+
+    // If pattern is provided, delete usernames matching the pattern
+    if let Some(pattern) = payload.pattern {
+        let result = match collection.delete_many(
+            doc! { "username": { "$regex": pattern, "$options": "i" } },
+        ).await {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("❌ Database error: {}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "success": false,
+                        "error": format!("Failed to delete users: {}", e)
+                    })),
+                );
+            }
+        };
+
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "message": format!("Deleted {} users matching pattern", result.deleted_count),
+                "deleted_count": result.deleted_count
+            })),
+        );
+    }
+
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "success": false,
+            "error": "Either usernames or pattern must be provided"
+        })),
+    )
+}
+
+// ============================================================================
+// REQUEST STRUCTS - Place these at the bottom of the file
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DeleteUsersRequest {
+    pub user_ids: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct DeleteByUsernameRequest {
+    pub usernames: Option<Vec<String>>,
+    pub pattern: Option<String>,
+}
 
 // ============================================================================
 // HELPER: Generate JWT Token
@@ -92,6 +299,7 @@ fn generate_salt() -> String {
 // ============================================================================
 // REGISTER NEW USER
 // ============================================================================
+
 
 pub async fn register(
     State(state): State<AppState>,
@@ -415,12 +623,11 @@ fn validate_phone_format(phone: &str) -> Result<(), &'static str> {
         return Err("Phone number contains invalid characters");
     }
     let normalized = normalize_phone(phone);
-    if normalized.len() != 9 || !normalized.starts_with('7') {
+    if normalized.len() != 9 || !matches!(normalized.chars().next(), Some('7') | Some('1')) {
         return Err("Enter a valid phone number");
     }
     Ok(())
 }
-
 pub async fn set_pin(
     State(state): State<AppState>,
     Path(user_id): Path<String>,
