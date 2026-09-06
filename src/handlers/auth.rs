@@ -98,6 +98,13 @@ pub async fn register(
     Json(payload): Json<CreateUserRequest>,
 ) -> impl IntoResponse {
     println!("📝 Registering user with phone: {}", payload.phone);
+    if let Err(msg) = validate_phone_format(&payload.phone) {
+    return (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "success": false, "message": msg })),
+    )
+        .into_response();
+}
 
     let collection: Collection<User> = state.db.collection("users");
 
@@ -395,6 +402,24 @@ pub async fn check_user_exists(
 // ============================================================================
 // SET PIN FOR USER (after Firebase registration or fallback)
 // ============================================================================
+
+fn validate_phone_format(phone: &str) -> Result<(), &'static str> {
+    let digit_count = phone.chars().filter(|c| c.is_ascii_digit()).count();
+    if digit_count < 9 || digit_count > 15 {
+        return Err("Phone number must contain between 9 and 15 digits");
+    }
+    let is_valid_chars = phone
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')'));
+    if !is_valid_chars {
+        return Err("Phone number contains invalid characters");
+    }
+    let normalized = normalize_phone(phone);
+    if normalized.len() != 9 || !normalized.starts_with('7') {
+        return Err("Enter a valid phone number");
+    }
+    Ok(())
+}
 
 pub async fn set_pin(
     State(state): State<AppState>,
