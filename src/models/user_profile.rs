@@ -1,6 +1,16 @@
 use serde::{Deserialize, Serialize};
 use mongodb::bson::{oid::ObjectId, DateTime as BsonDateTime};
-use validator::Validate;
+use validator::{Validate, ValidationError};
+use regex::Regex;
+
+fn validate_phone(phone: &str) -> Result<(), ValidationError> {
+    let re = Regex::new(r"^(\+254|254|0)?7[0-9]{8}$").unwrap();
+    if re.is_match(phone) {
+        Ok(())
+    } else {
+        Err(ValidationError::new("invalid_phone"))
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UserProfile {
@@ -27,7 +37,7 @@ pub struct CreateUserProfile {
 
     pub username: String,
 
-    #[validate(length(min = 10))]
+    #[validate(custom(function = "validate_phone"))]
     pub phone: String,
 
     pub nickname: String,
@@ -48,6 +58,26 @@ pub struct UpdateBalanceRequest {
 
     #[validate(range(min = 0.0))]
     pub balance: f64,
+}
+#[derive(Debug, Deserialize, Validate)]
+pub struct SaveProfileRequest {
+    #[validate(length(min = 1))]
+    pub user_id: String,
+
+    pub username: String,
+
+    #[validate(custom(function = "validate_phone"))]
+    pub phone: String,
+
+    pub nickname: String,
+    pub club_fan: String,
+    pub country_fan: String,
+
+    #[validate(range(min = 0.0))]
+    pub balance: f64,
+
+    #[validate(range(min = 0))]
+    pub number_of_bets: i32,
 }
 
 #[derive(Debug, Deserialize)]

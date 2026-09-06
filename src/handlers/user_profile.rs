@@ -10,20 +10,8 @@ use futures_util::TryStreamExt;
 use validator::Validate;
 
 use crate::state::AppState;
-use crate::models::user_profile::{UserProfile, CreateUserProfile, UpdateBalanceRequest, UserQuery};
+use crate::models::user_profile::{UserProfile, CreateUserProfile, SaveProfileRequest, UpdateBalanceRequest, UserQuery};
 use crate::errors::{AppError, Result};
-
-#[derive(Debug, Deserialize)]
-pub struct SaveProfileRequest {
-    pub user_id: String,
-    pub username: String,
-    pub phone: String,
-    pub nickname: String,
-    pub club_fan: String,
-    pub country_fan: String,
-    pub balance: f64,
-    pub number_of_bets: i32,
-}
 
 // Get all user profiles
 pub async fn get_user_profiles(
@@ -48,7 +36,6 @@ pub async fn get_user_profiles(
     let cursor = collection.find(filter).await?;
     let mut users: Vec<UserProfile> = cursor.try_collect().await?;
 
-    // Sort by created_at descending (most recent first)
     users.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
     println!("✅ Successfully fetched {} user profiles", users.len());
@@ -64,7 +51,6 @@ pub async fn get_user_profile_by_id(
 
     let collection: Collection<UserProfile> = state.db.collection("user_profiles");
 
-    // Try to find by user_id first
     let filter = doc! { "user_id": &id };
 
     match collection.find_one(filter).await? {
@@ -73,7 +59,6 @@ pub async fn get_user_profile_by_id(
             Ok(Json(user))
         }
         None => {
-            // Try by MongoDB ObjectId
             if let Ok(object_id) = ObjectId::parse_str(&id) {
                 let filter = doc! { "_id": object_id };
                 match collection.find_one(filter).await? {
@@ -118,7 +103,6 @@ pub async fn get_user_profile_by_phone(
 }
 
 // Create or update user profile (UPSERT)
-// Create or update user profile (UPSERT)
 pub async fn save_user_profile(
     State(state): State<AppState>,
     Json(payload): Json<SaveProfileRequest>,
@@ -135,20 +119,14 @@ pub async fn save_user_profile(
     println!("   number_of_bets: {}", payload.number_of_bets);
     println!("═══════════════════════════════════════════");
 
-    // Validate required fields
-    if payload.user_id.is_empty() {
-        println!("❌ VALIDATION FAILED: user_id is empty");
-        return Err(AppError::invalid_data("User ID is required"));
+    if let Err(validation_errors) = payload.validate() {
+        println!("❌ VALIDATION FAILED: {:?}", validation_errors);
+        return Err(AppError::invalid_data(&format!("Validation failed: {:?}", validation_errors)));
     }
-
-    if payload.phone.is_empty() {
-        println!("❌ VALIDATION FAILED: phone is empty");
-        return Err(AppError::invalid_data("Phone number is required"));
-    }
+    println!("✅ Validation passed");
 
     let collection: Collection<UserProfile> = state.db.collection("user_profiles");
 
-    // Check if user already exists
     let filter = doc! { "user_id": &payload.user_id };
     println!("🔍 Looking up existing user with filter: {:?}", filter);
 
@@ -197,7 +175,6 @@ pub async fn save_user_profile(
     println!("   phone:      '{}'", user_profile.phone);
     println!("   is_update:  {}", existing_user.is_some());
 
-    // Upsert: update if exists, insert if new
     let update = doc! {
         "$set": {
             "username": &user_profile.username,
@@ -254,7 +231,6 @@ pub async fn update_user_balance(
         return Err(AppError::DocumentNotFound);
     }
 
-    // Fetch and return updated user
     match collection.find_one(filter).await? {
         Some(user) => {
             println!("✅ Updated balance for {} to: {}", user.username, user.balance);
@@ -275,16 +251,13 @@ pub async fn get_user_stats(
 
     let collection: Collection<UserProfile> = state.db.collection("user_profiles");
 
-    // Get all users
     let cursor = collection.find(doc! {}).await?;
     let users: Vec<UserProfile> = cursor.try_collect().await?;
 
-    // Calculate statistics
     let total_users = users.len() as i64;
     let total_balance: f64 = users.iter().map(|u| u.balance).sum();
     let total_bets: i64 = users.iter().map(|u| u.number_of_bets as i64).sum();
 
-    // Find top users by balance
     let mut sorted_users = users.clone();
     sorted_users.sort_by(|a, b| b.balance.partial_cmp(&a.balance).unwrap());
 
@@ -298,7 +271,6 @@ pub async fn get_user_stats(
         }))
         .collect();
 
-    // Count by club
     use std::collections::HashMap;
     let mut club_counts: HashMap<String, i64> = HashMap::new();
 
@@ -350,17 +322,14 @@ pub async fn get_recent_users(
     let cursor = collection.find(doc! {}).await?;
     let mut users: Vec<UserProfile> = cursor.try_collect().await?;
 
-    // Sort by created_at descending (most recent first)
     users.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-    // Take only last 20
     let recent_users: Vec<UserProfile> = users.into_iter().take(20).collect();
 
     println!("✅ Successfully fetched {} recent users", recent_users.len());
     Ok(Json(recent_users))
 }
 
-// Create a new user profile
 // Create a new user profile
 pub async fn create_user_profile(
     State(state): State<AppState>,
@@ -378,7 +347,6 @@ pub async fn create_user_profile(
     println!("   number_of_bets: {}", payload.number_of_bets);
     println!("═══════════════════════════════════════════");
 
-    // Validate the request
     if let Err(validation_errors) = payload.validate() {
         println!("❌ VALIDATION FAILED: {:?}", validation_errors);
         return Err(AppError::invalid_data(&format!("Validation failed: {:?}", validation_errors)));
@@ -387,7 +355,6 @@ pub async fn create_user_profile(
 
     let collection: Collection<UserProfile> = state.db.collection("user_profiles");
 
-    // Check if user already exists
     let existing_filter = doc! { 
         "$or": [
             { "user_id": &payload.user_id },
@@ -440,7 +407,6 @@ pub async fn create_user_profile(
     println!("   user_id:  '{}'", user_profile.user_id);
     println!("   phone:    '{}'", user_profile.phone);
 
-    // Insert the user
     let insert_result = collection.insert_one(&user_profile).await?;
     println!("📊 insert_one result — inserted_id: {:?}", insert_result.inserted_id);
 
