@@ -4,7 +4,7 @@ use validator::{Validate, ValidationError};
 use regex::Regex;
 
 fn validate_phone(phone: &str) -> Result<(), ValidationError> {
-    let re = Regex::new(r"^(\+254|254|0)?7[0-9]{8}$").unwrap();
+    let re = Regex::new(r"^(\+254|254|0)?[17][0-9]{8}$").unwrap();
     if re.is_match(phone) {
         Ok(())
     } else {
