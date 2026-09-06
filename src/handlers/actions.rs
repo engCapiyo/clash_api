@@ -376,27 +376,37 @@ pub async fn create_bet_handler(
     let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    tracing::info!(
-        "💰 Create bet: fixture={}, user={}, amount={}",
-        payload.fixture_id,
-        payload.starter_id,
-        payload.amount
-    );
+    tracing::info!("═══════════════════════════════════════════");
+    tracing::info!("💰 CREATE_BET_HANDLER called (pledge)");
+    tracing::info!("   fixture_id:        '{}'", payload.fixture_id);
+    tracing::info!("   starter_id:        '{}'", payload.starter_id);
+    tracing::info!("   starter_name:      '{}'", payload.starter_name);
+    tracing::info!("   starter_selection: '{}'", payload.starter_selection);
+    tracing::info!("   amount:            {}", payload.amount);
+    tracing::info!("   vote_id:           '{}'", payload.vote_id);
+    tracing::info!("═══════════════════════════════════════════");
 
     if payload.amount <= 0.0 {
-        tracing::warn!("⚠️ Invalid amount: {}", payload.amount);
+        tracing::warn!("⚠️ VALIDATION FAILED — invalid amount: {}", payload.amount);
         return Err(AppError::ValidationError(
             "Amount must be greater than 0".to_string(),
         ));
     }
+    tracing::debug!("✅ Amount validation passed: {}", payload.amount);
 
     let starter_id = bson::oid::ObjectId::parse_str(&payload.starter_id).map_err(|e| {
-        tracing::error!("❌ Invalid starter_id: {}", e);
+        tracing::error!("❌ INVALID starter_id '{}': {}", payload.starter_id, e);
         AppError::InvalidObjectId(e.to_string())
     })?;
+    tracing::debug!("✅ starter_id parsed as ObjectId: {}", starter_id);
+
     let fixture_id = payload.fixture_id.clone();
 
     // Check if already voted
+    tracing::debug!(
+        "🔍 Checking existing vote — fixture='{}', user='{}'",
+        fixture_id, payload.starter_id
+    );
     let vote_exists = votes_col
         .find_one(doc! {
             "fixture_id": &fixture_id,
@@ -408,7 +418,13 @@ pub async fn create_bet_handler(
             AppError::MongoDB(e)
         })?;
 
+    match &vote_exists {
+        Some(v) => tracing::info!("✅ Existing vote found — selection='{}'", v.selection),
+        None => tracing::info!("📭 No existing vote — will auto-vote with starter_selection='{}'", payload.starter_selection),
+    }
+
     // Start transaction
+    tracing::debug!("🔄 Starting DB session/transaction");
     let mut session = state.client.start_session().await.map_err(|e| {
         tracing::error!("❌ Failed to start session: {}", e);
         AppError::MongoDB(e)
@@ -417,10 +433,10 @@ pub async fn create_bet_handler(
         tracing::error!("❌ Failed to start transaction: {}", e);
         AppError::MongoDB(e)
     })?;
-
     tracing::debug!("✅ Transaction started");
 
     // Check balance
+    tracing::debug!("🔍 Looking up user by _id: {}", starter_id);
     let user = users_col
         .find_one(doc! { "_id": starter_id })
         .session(&mut session)
@@ -430,31 +446,38 @@ pub async fn create_bet_handler(
             AppError::MongoDB(e)
         })?
         .ok_or_else(|| {
-            tracing::error!("❌ User not found: {}", payload.starter_id);
+            tracing::error!("❌ USER NOT FOUND for starter_id: {}", payload.starter_id);
             AppError::DocumentNotFound
         })?;
 
-    tracing::debug!("💰 User balance: {}", user.balance);
+    tracing::info!(
+        "👤 Found user — id='{}', username='{}', balance={}",
+        payload.starter_id, user.username, user.balance
+    );
 
     if user.balance < payload.amount {
         tracing::warn!(
-            "⚠️ Insufficient balance: {} < {}",
-            user.balance,
-            payload.amount
+            "⚠️ INSUFFICIENT BALANCE — user='{}', balance={}, requested={}",
+            payload.starter_id, user.balance, payload.amount
         );
         session
             .abort_transaction()
             .await
             .map_err(|e| AppError::MongoDB(e))?;
+        tracing::info!("↩️ Transaction aborted (insufficient balance)");
         return Err(AppError::ValidationError(format!(
             "Insufficient balance. You have {}, need {}",
             user.balance, payload.amount
         )));
     }
+    tracing::debug!("✅ Balance check passed: {} >= {}", user.balance, payload.amount);
 
     // Auto-cast vote if not already voted
     if vote_exists.is_none() {
-        tracing::debug!("🔄 Auto-casting vote for user");
+        tracing::info!(
+            "🔄 AUTO-VOTING — user='{}', selection='{}'",
+            payload.starter_id, payload.starter_selection
+        );
         let vote = Vote::new(
             fixture_id.clone(),
             payload.starter_id.clone(),
@@ -470,23 +493,31 @@ pub async fn create_bet_handler(
                 tracing::error!("❌ Failed to insert auto-vote: {}", e);
                 AppError::MongoDB(e)
             })?;
+        tracing::debug!("✅ Auto-vote inserted");
 
         let increment_field = match payload.starter_selection.as_str() {
             "home" => "vote_counts.home",
             "away" => "vote_counts.away",
             "draw" => "vote_counts.draw",
             _ => {
-                tracing::error!("❌ Invalid selection: {}", payload.starter_selection);
+                tracing::error!("❌ INVALID starter_selection: '{}'", payload.starter_selection);
                 session.abort_transaction().await?;
+                tracing::info!("↩️ Transaction aborted (invalid selection)");
                 return Err(AppError::ValidationError("Invalid selection".to_string()));
             }
         };
+        tracing::debug!("📊 Vote increment field resolved: '{}'", increment_field);
 
         // Get user's channels
         let channel_ids = get_user_channel_ids(&channels_col, &payload.starter_id).await?;
+        tracing::info!(
+            "📋 User '{}' belongs to {} channels: {:?}",
+            payload.starter_id, channel_ids.len(), channel_ids
+        );
 
         // Update channel_fixtures for EACH channel
         for channel_id in &channel_ids {
+            tracing::debug!("🔄 Upserting channel_fixture for auto-vote — channel='{}'", channel_id);
             upsert_channel_fixture(
                 &channel_fixtures_col,
                 channel_id,
@@ -497,9 +528,15 @@ pub async fn create_bet_handler(
             )
             .await?;
         }
+    } else {
+        tracing::debug!("⏭️ Skipping auto-vote — user already voted");
     }
 
     // Deduct balance
+    tracing::info!(
+        "💸 DEDUCTING BALANCE — user='{}', amount={}, balance_before={}",
+        payload.starter_id, payload.amount, user.balance
+    );
     users_col
         .update_one(
             doc! { "_id": starter_id },
@@ -511,8 +548,7 @@ pub async fn create_bet_handler(
             tracing::error!("❌ Failed to deduct balance: {}", e);
             AppError::MongoDB(e)
         })?;
-
-    tracing::debug!("💰 Balance deducted");
+    tracing::debug!("✅ Balance deducted — expected new balance: {}", user.balance - payload.amount);
 
     // Create bet
     let bet = Bet::new_open(
@@ -522,6 +558,11 @@ pub async fn create_bet_handler(
         payload.starter_selection.clone(),
         payload.amount,
         payload.vote_id.clone(),
+    );
+
+    tracing::info!(
+        "📝 INSERTING BET — fixture='{}', starter='{}', selection='{}', amount={}",
+        fixture_id, payload.starter_id, payload.starter_selection, payload.amount
     );
 
     let insert_result = bets_col
@@ -538,17 +579,22 @@ pub async fn create_bet_handler(
         .as_object_id()
         .map(|oid| oid.to_hex())
         .ok_or_else(|| {
-            tracing::error!("❌ Failed to get bet ID");
+            tracing::error!("❌ Failed to extract bet ID from insert result");
             AppError::InternalServerError("Failed to get bet ID".to_string())
         })?;
 
-    tracing::debug!("✅ Bet created: {}", bet_id);
+    tracing::info!("✅ Bet inserted successfully — bet_id='{}'", bet_id);
 
     // Get user's channels for pledge count update
     let channel_ids = get_user_channel_ids(&channels_col, &payload.starter_id).await?;
+    tracing::info!(
+        "📋 Updating pledge_count for {} channels: {:?}",
+        channel_ids.len(), channel_ids
+    );
 
     // Update pledge_count for EACH channel
     for channel_id in &channel_ids {
+        tracing::debug!("🔄 Incrementing pledge_count — channel='{}'", channel_id);
         upsert_channel_fixture(
             &channel_fixtures_col,
             channel_id,
@@ -560,10 +606,12 @@ pub async fn create_bet_handler(
         .await?;
     }
 
+    tracing::debug!("🔄 Committing transaction");
     session.commit_transaction().await.map_err(|e| {
         tracing::error!("❌ Failed to commit transaction: {}", e);
         AppError::MongoDB(e)
     })?;
+    tracing::info!("✅ Transaction committed");
 
     // ============================================================
     // ✅ SEND NOTIFICATIONS TO ALL CHANNEL MEMBERS
@@ -577,8 +625,9 @@ pub async fn create_bet_handler(
         "bet_id": bet_id,
     });
 
+    tracing::debug!("📤 Sending pledge.create notifications to {} channels", channel_ids.len());
     for channel_id in &channel_ids {
-        let _ = notify_channel_members(
+        let notify_result = notify_channel_members(
             &state,
             &payload.starter_id,
             channel_id,
@@ -592,15 +641,18 @@ pub async fn create_bet_handler(
             pledge_payload.clone(),
         )
         .await;
+        if let Err(e) = notify_result {
+            tracing::warn!("⚠️ Notification failed for channel '{}': {:?}", channel_id, e);
+        }
     }
 
-    tracing::info!(
-        "✅ Bet created successfully: {} for user {}",
-        bet_id,
-        payload.starter_id
-    );
-
     let new_balance = user.balance - payload.amount;
+
+    tracing::info!(
+        "✅ PLEDGE COMPLETE — bet_id='{}', user='{}', amount={}, new_balance={}, auto_voted={}, channels_updated={}",
+        bet_id, payload.starter_id, payload.amount, new_balance, vote_exists.is_none(), channel_ids.len()
+    );
+    tracing::info!("═══════════════════════════════════════════");
 
     Ok(Json(json!({
         "success": true,

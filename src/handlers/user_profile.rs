@@ -118,18 +118,31 @@ pub async fn get_user_profile_by_phone(
 }
 
 // Create or update user profile (UPSERT)
+// Create or update user profile (UPSERT)
 pub async fn save_user_profile(
     State(state): State<AppState>,
     Json(payload): Json<SaveProfileRequest>,
 ) -> Result<Json<UserProfile>> {
-    println!("🎯 Saving user profile for: {}", payload.username);
+    println!("═══════════════════════════════════════════");
+    println!("🎯 SAVE_USER_PROFILE called");
+    println!("   user_id:      '{}'", payload.user_id);
+    println!("   username:     '{}'", payload.username);
+    println!("   phone:        '{}'", payload.phone);
+    println!("   nickname:     '{}'", payload.nickname);
+    println!("   club_fan:     '{}'", payload.club_fan);
+    println!("   country_fan:  '{}'", payload.country_fan);
+    println!("   balance:      {}", payload.balance);
+    println!("   number_of_bets: {}", payload.number_of_bets);
+    println!("═══════════════════════════════════════════");
 
     // Validate required fields
     if payload.user_id.is_empty() {
+        println!("❌ VALIDATION FAILED: user_id is empty");
         return Err(AppError::invalid_data("User ID is required"));
     }
 
     if payload.phone.is_empty() {
+        println!("❌ VALIDATION FAILED: phone is empty");
         return Err(AppError::invalid_data("Phone number is required"));
     }
 
@@ -137,8 +150,27 @@ pub async fn save_user_profile(
 
     // Check if user already exists
     let filter = doc! { "user_id": &payload.user_id };
+    println!("🔍 Looking up existing user with filter: {:?}", filter);
 
     let existing_user = collection.find_one(filter.clone()).await?;
+
+    match &existing_user {
+        Some(existing) => {
+            println!("✅ FOUND EXISTING USER:");
+            println!("   existing.user_id:  '{}'", existing.user_id);
+            println!("   existing.phone:    '{}'", existing.phone);
+            println!("   existing.username: '{}'", existing.username);
+            if existing.phone != payload.phone {
+                println!(
+                    "⚠️ PHONE MISMATCH — existing='{}' vs incoming='{}'",
+                    existing.phone, payload.phone
+                );
+            }
+        }
+        None => {
+            println!("📭 NO EXISTING USER FOUND for user_id '{}' — will INSERT new", payload.user_id);
+        }
+    }
 
     let now = Utc::now();
     let bson_now = BsonDateTime::from_chrono(now);
@@ -147,7 +179,7 @@ pub async fn save_user_profile(
         id: existing_user.as_ref().and_then(|u| u.id.clone()).or(Some(ObjectId::new())),
         user_id: payload.user_id.clone(),
         username: payload.username,
-        phone: payload.phone,
+        phone: payload.phone.clone(),
         nickname: payload.nickname,
         club_fan: payload.club_fan,
         country_fan: payload.country_fan,
@@ -158,6 +190,12 @@ pub async fn save_user_profile(
             .unwrap_or(bson_now),
         updated_at: bson_now,
     };
+
+    println!("📝 Writing user_profile document:");
+    println!("   _id:        {:?}", user_profile.id);
+    println!("   user_id:    '{}'", user_profile.user_id);
+    println!("   phone:      '{}'", user_profile.phone);
+    println!("   is_update:  {}", existing_user.is_some());
 
     // Upsert: update if exists, insert if new
     let update = doc! {
@@ -176,9 +214,14 @@ pub async fn save_user_profile(
         }
     };
 
-    collection.update_one(filter, update).await?;
+    let update_result = collection.update_one(filter, update).await?;
+    println!(
+        "📊 update_one result — matched: {}, modified: {}, upserted_id: {:?}",
+        update_result.matched_count, update_result.modified_count, update_result.upserted_id
+    );
 
-    println!("✅ Successfully saved user profile for: {}", user_profile.username);
+    println!("✅ SAVE_USER_PROFILE completed for: {}", user_profile.username);
+    println!("═══════════════════════════════════════════");
     Ok(Json(user_profile))
 }
 
@@ -318,16 +361,29 @@ pub async fn get_recent_users(
 }
 
 // Create a new user profile
+// Create a new user profile
 pub async fn create_user_profile(
     State(state): State<AppState>,
     Json(payload): Json<CreateUserProfile>,
 ) -> Result<Json<UserProfile>> {
-    println!("🎯 Creating new user profile: {}", payload.username);
+    println!("═══════════════════════════════════════════");
+    println!("🎯 CREATE_USER_PROFILE called");
+    println!("   user_id:      '{}'", payload.user_id);
+    println!("   username:     '{}'", payload.username);
+    println!("   phone:        '{}'", payload.phone);
+    println!("   nickname:     '{}'", payload.nickname);
+    println!("   club_fan:     '{}'", payload.club_fan);
+    println!("   country_fan:  '{}'", payload.country_fan);
+    println!("   balance:      {}", payload.balance);
+    println!("   number_of_bets: {}", payload.number_of_bets);
+    println!("═══════════════════════════════════════════");
 
     // Validate the request
     if let Err(validation_errors) = payload.validate() {
+        println!("❌ VALIDATION FAILED: {:?}", validation_errors);
         return Err(AppError::invalid_data(&format!("Validation failed: {:?}", validation_errors)));
     }
+    println!("✅ Validation passed");
 
     let collection: Collection<UserProfile> = state.db.collection("user_profiles");
 
@@ -338,10 +394,30 @@ pub async fn create_user_profile(
             { "phone": &payload.phone }
         ]
     };
+    println!("🔍 Checking for duplicates with filter: {:?}", existing_filter);
 
-    if let Some(existing) = collection.find_one(existing_filter).await? {
-        println!("⚠️ User already exists: {}", existing.username);
-        return Err(AppError::invalid_data("User with this ID or phone already exists"));
+    match collection.find_one(existing_filter).await? {
+        Some(existing) => {
+            println!("⚠️ DUPLICATE FOUND — rejecting insert");
+            println!("   incoming.user_id:  '{}'", payload.user_id);
+            println!("   incoming.phone:    '{}'", payload.phone);
+            println!("   existing.user_id:  '{}'", existing.user_id);
+            println!("   existing.phone:    '{}'", existing.phone);
+            println!("   existing.username: '{}'", existing.username);
+
+            if existing.user_id != payload.user_id {
+                println!("   🚨 CONFLICT TYPE: different user_id, same phone — likely a real duplicate account");
+            }
+            if existing.phone != payload.phone {
+                println!("   🚨 CONFLICT TYPE: matched on user_id but phone differs — existing='{}' incoming='{}'", existing.phone, payload.phone);
+            }
+
+            println!("═══════════════════════════════════════════");
+            return Err(AppError::invalid_data("User with this ID or phone already exists"));
+        }
+        None => {
+            println!("✅ No duplicate found — proceeding to insert");
+        }
     }
 
     let now = Utc::now();
@@ -359,9 +435,16 @@ pub async fn create_user_profile(
         updated_at: BsonDateTime::from_chrono(now),
     };
 
-    // Insert the user
-    collection.insert_one(&user_profile).await?;
+    println!("📝 Inserting new user_profile document:");
+    println!("   _id:      {:?}", user_profile.id);
+    println!("   user_id:  '{}'", user_profile.user_id);
+    println!("   phone:    '{}'", user_profile.phone);
 
-    println!("✅ Successfully created user profile: {}", user_profile.username);
+    // Insert the user
+    let insert_result = collection.insert_one(&user_profile).await?;
+    println!("📊 insert_one result — inserted_id: {:?}", insert_result.inserted_id);
+
+    println!("✅ CREATE_USER_PROFILE completed for: {}", user_profile.username);
+    println!("═══════════════════════════════════════════");
     Ok(Json(user_profile))
 }
