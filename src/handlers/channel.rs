@@ -712,6 +712,10 @@ pub async fn cast_vote_handler(
         .update_one(game_filter, doc! { "$inc": { "votes": 1 } })
         .await?;
 
+    // `user` was fetched further up (before this increment) so its
+    // total_votes is the pre-vote count.
+    let new_total_votes = user.total_votes + 1;
+
     users_col
         .update_one(
             doc! { "_id": user_id_obj },
@@ -731,7 +735,12 @@ pub async fn cast_vote_handler(
                     "channel_id": &channel.channel_id,
                     "members.user_id": &payload.user_id,
                 },
-                doc! { "$set": { "members.$.last_active_at": now } },
+                doc! {
+                    "$set": {
+                        "members.$.last_active_at": now,
+                        "members.$.total_votes": new_total_votes,
+                    }
+                },
             )
             .await?;
     }
@@ -999,6 +1008,7 @@ pub async fn rollback_vote_handler(
     let fixtures_col = state.db.collection::<Fixture>("fixtures");
     let games_col = state.db.collection::<Game>("games");
     let users_col = state.db.collection::<User>("users");
+    let channels_col = state.db.collection::<Channel>("channels");
 
     let vote = votes_col
         .find_one(doc! {
@@ -1051,12 +1061,40 @@ pub async fn rollback_vote_handler(
         .update_one(game_filter, doc! { "$inc": { "votes": -1 } })
         .await?;
 
+    let user_obj_id = ObjectId::parse_str(&payload.user_id)?;
+    let user_before_rollback = users_col
+        .find_one(doc! { "_id": user_obj_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+    let new_total_votes = (user_before_rollback.total_votes - 1).max(0);
+
     users_col
         .update_one(
-            doc! { "_id": ObjectId::parse_str(&payload.user_id)? },
-            doc! { "$inc": { "total_votes": -1 } },
+            doc! { "_id": user_obj_id },
+            doc! { "$set": { "total_votes": new_total_votes } },
         )
         .await?;
+
+    // ✅ Mirror the decrement onto every channel the user belongs to right
+    // away, rather than leaving those member records stale until whichever
+    // fixture they vote on next happens to settle (previously this only
+    // updated the canonical "users" collection).
+    let mut channel_cursor = channels_col
+        .find(doc! { "members.user_id": &payload.user_id })
+        .await?;
+
+    while channel_cursor.advance().await? {
+        let channel: Channel = channel_cursor.deserialize_current()?;
+        channels_col
+            .update_one(
+                doc! {
+                    "channel_id": &channel.channel_id,
+                    "members.user_id": &payload.user_id,
+                },
+                doc! { "$set": { "members.$.total_votes": new_total_votes } },
+            )
+            .await?;
+    }
 
     Ok(Json(json!({
         "success": true,
@@ -4408,42 +4446,26 @@ pub async fn leave_channel_handler(
     // DEDUCT 30 POINTS FROM USER (DISCOURAGE CHANNEL HOPPING)
     // ============================================================
     
-    // Deduct 30 season points from the leaving user
+    // Deduct 30 season points from the leaving user, clamped at 0 so the
+    // canonical "users" collection and every channel mirror of it share
+    // the same floor (previously only the channel copy was clamped, so
+    // the users collection could drift negative while channels sat at 0).
     let user_obj_id = ObjectId::parse_str(&payload.user_id)?;
+    let user_before_penalty = users_col
+        .find_one(doc! { "_id": user_obj_id })
+        .await?
+        .ok_or(AppError::DocumentNotFound)?;
+    let new_season_points = (user_before_penalty.season_points - 30).max(0);
+
     users_col
         .update_one(
             doc! { "_id": user_obj_id },
             doc! {
-                "$inc": { "season_points": -30 },
-                "$set": { "updated_at": now }
+                "$set": { "season_points": new_season_points, "updated_at": now }
             },
         )
         .await?;
-    
-    // Also update the channel member's points
-    let mut updated_member_count = 0;
-    for member in &channel.members {
-        if member.user_id == payload.user_id {
-            let new_points = (member.season_points - 30).max(0); // Don't go below 0
-            channels_col
-                .update_one(
-                    doc! {
-                        "channel_id": &payload.channel_id,
-                        "members.user_id": &payload.user_id,
-                    },
-                    doc! {
-                        "$set": {
-                            "members.$.season_points": new_points,
-                            "members.$.last_active_at": now,
-                        }
-                    },
-                )
-                .await?;
-            updated_member_count = 1;
-            break;
-        }
-    }
-    
+
     // ============================================================
     // REMOVE USER FROM CHANNEL
     // ============================================================
@@ -4466,10 +4488,37 @@ pub async fn leave_channel_handler(
         users_col
             .update_one(
                 doc! { "_id": user_obj_id },
-                doc! { "$inc": { "season_points": 30 } },
+                doc! { "$set": { "season_points": user_before_penalty.season_points } },
             )
             .await?;
         return Err(AppError::DocumentNotFound);
+    }
+
+    // ============================================================
+    // SYNC THE PENALTY TO EVERY OTHER CHANNEL THE USER IS STILL IN
+    // (the channel they just left already had their member record
+    // pulled above, so this loop naturally skips it — this is the
+    // fix: previously only the channel being left was updated, so
+    // season_points in every OTHER channel stayed stale until the
+    // user's next vote happened to settle)
+    // ============================================================
+    let mut other_channel_cursor = channels_col
+        .find(doc! { "members.user_id": &payload.user_id })
+        .await?;
+
+    while other_channel_cursor.advance().await? {
+        let other_channel: Channel = other_channel_cursor.deserialize_current()?;
+        channels_col
+            .update_one(
+                doc! {
+                    "channel_id": &other_channel.channel_id,
+                    "members.user_id": &payload.user_id,
+                },
+                doc! {
+                    "$set": { "members.$.season_points": new_season_points }
+                },
+            )
+            .await?;
     }
     
     // ============================================================

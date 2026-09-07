@@ -1528,6 +1528,33 @@ pub async fn settle_bets_handler(
                 tracing::error!("❌ Failed to update correct voters: {}", e);
                 AppError::MongoDB(e)
             })?;
+
+        // ✅ Mirror the exact same +3/+1/+1 onto the canonical "users"
+        // collection. Previously this only ever landed on the channels
+        // collection — users.season_points/correct_votes/total_votes never
+        // moved here, so they'd silently drift out of sync with what
+        // channel leaderboards showed until some unrelated code path
+        // (e.g. finalize_fixture_result_handler) happened to resync them.
+        let correct_oids: Vec<bson::oid::ObjectId> = correct_ids
+            .iter()
+            .filter_map(|id| bson::oid::ObjectId::parse_str(id).ok())
+            .collect();
+        if !correct_oids.is_empty() {
+            users_col
+                .update_many(
+                    doc! { "_id": { "$in": &correct_oids } },
+                    doc! { "$inc": {
+                        "season_points": 3,
+                        "correct_votes": 1,
+                        "total_votes": 1,
+                    }},
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!("❌ Failed to sync correct voters to users collection: {}", e);
+                    AppError::MongoDB(e)
+                })?;
+        }
     }
 
     if !incorrect_ids.is_empty() {
@@ -1546,6 +1573,28 @@ pub async fn settle_bets_handler(
                 tracing::error!("❌ Failed to update incorrect voters: {}", e);
                 AppError::MongoDB(e)
             })?;
+
+        // ✅ Same mirror for incorrect voters — the users collection was
+        // never getting the -3/+1 either.
+        let incorrect_oids: Vec<bson::oid::ObjectId> = incorrect_ids
+            .iter()
+            .filter_map(|id| bson::oid::ObjectId::parse_str(id).ok())
+            .collect();
+        if !incorrect_oids.is_empty() {
+            users_col
+                .update_many(
+                    doc! { "_id": { "$in": &incorrect_oids } },
+                    doc! { "$inc": {
+                        "season_points": -3,
+                        "total_votes": 1,
+                    }},
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!("❌ Failed to sync incorrect voters to users collection: {}", e);
+                    AppError::MongoDB(e)
+                })?;
+        }
     }
 
     // ============================================================
