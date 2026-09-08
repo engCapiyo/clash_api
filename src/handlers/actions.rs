@@ -365,6 +365,18 @@ pub async fn cast_vote_handler(
 
 // ============================================================================
 // 2. CREATE BET — Creates/Updates channel_fixtures for ALL user's channels
+//
+// RULES (as specified):
+//   - Voting is compulsory. Every pledge/bet requires a vote to exist.
+//   - If the user hasn't voted yet, this handler atomically casts the vote
+//     (using starter_selection) THEN creates the pledge, in the same
+//     transaction — both succeed or both roll back together.
+//   - Pledges/bets can happen any number of times, but the vote is once
+//     per fixture per user.
+//   - If the user already voted, the pledge's selection MUST match their
+//     existing vote's selection. If it doesn't, reject with a clear error
+//     ("You voted for X, you cannot bet on Y") — no auto-changing votes,
+//     no silent mismatch.
 // ============================================================================
 pub async fn create_bet_handler(
     State(state): State<AppState>,
@@ -383,7 +395,7 @@ pub async fn create_bet_handler(
     tracing::info!("   starter_name:      '{}'", payload.starter_name);
     tracing::info!("   starter_selection: '{}'", payload.starter_selection);
     tracing::info!("   amount:            {}", payload.amount);
-    tracing::info!("   vote_id:           '{}'", payload.vote_id);
+    tracing::info!("   vote_id:           '{:?}'", payload.vote_id);
     tracing::info!("═══════════════════════════════════════════");
 
     if payload.amount <= 0.0 {
@@ -393,6 +405,20 @@ pub async fn create_bet_handler(
         ));
     }
     tracing::debug!("✅ Amount validation passed: {}", payload.amount);
+
+    // starter_selection must be a valid selection value up front — needed
+    // both for auto-voting and for the mismatch check below.
+    let increment_field = match payload.starter_selection.as_str() {
+        "home" => "vote_counts.home",
+        "away" => "vote_counts.away",
+        "draw" => "vote_counts.draw",
+        _ => {
+            tracing::error!("❌ INVALID starter_selection: '{}'", payload.starter_selection);
+            return Err(AppError::ValidationError(
+                "Invalid selection. Must be 'home', 'away', or 'draw'".to_string(),
+            ));
+        }
+    };
 
     let starter_id = bson::oid::ObjectId::parse_str(&payload.starter_id).map_err(|e| {
         tracing::error!("❌ INVALID starter_id '{}': {}", payload.starter_id, e);
@@ -418,9 +444,32 @@ pub async fn create_bet_handler(
             AppError::MongoDB(e)
         })?;
 
-    match &vote_exists {
-        Some(v) => tracing::info!("✅ Existing vote found — selection='{}'", v.selection),
-        None => tracing::info!("📭 No existing vote — will auto-vote with starter_selection='{}'", payload.starter_selection),
+    // ========================================================================
+    // ✅ VOTE / PLEDGE CONSISTENCY GUARD
+    // If the user already voted, the pledge selection MUST match the vote.
+    // A user cannot vote "home" then pledge on "away" — reject immediately,
+    // before touching balance or opening a transaction.
+    // ========================================================================
+    if let Some(existing_vote) = &vote_exists {
+        if existing_vote.selection != payload.starter_selection {
+            tracing::warn!(
+                "⚠️ VOTE/PLEDGE MISMATCH — user='{}' voted '{}' but tried to bet on '{}'",
+                payload.starter_id, existing_vote.selection, payload.starter_selection
+            );
+            return Err(AppError::ValidationError(format!(
+                "You voted for {}, you cannot bet on {}",
+                existing_vote.selection, payload.starter_selection
+            )));
+        }
+        tracing::info!(
+            "✅ Existing vote found — selection='{}' matches pledge selection",
+            existing_vote.selection
+        );
+    } else {
+        tracing::info!(
+            "📭 No existing vote — will auto-vote with starter_selection='{}'",
+            payload.starter_selection
+        );
     }
 
     // Start transaction
@@ -472,7 +521,9 @@ pub async fn create_bet_handler(
     }
     tracing::debug!("✅ Balance check passed: {} >= {}", user.balance, payload.amount);
 
-    // Auto-cast vote if not already voted
+    // Auto-cast vote if not already voted — ATOMIC with the pledge below.
+    // Voting is compulsory: this is the only place a first-time voter's
+    // vote gets created when they go straight to pledging.
     if vote_exists.is_none() {
         tracing::info!(
             "🔄 AUTO-VOTING — user='{}', selection='{}'",
@@ -495,19 +546,6 @@ pub async fn create_bet_handler(
             })?;
         tracing::debug!("✅ Auto-vote inserted");
 
-        let increment_field = match payload.starter_selection.as_str() {
-            "home" => "vote_counts.home",
-            "away" => "vote_counts.away",
-            "draw" => "vote_counts.draw",
-            _ => {
-                tracing::error!("❌ INVALID starter_selection: '{}'", payload.starter_selection);
-                session.abort_transaction().await?;
-                tracing::info!("↩️ Transaction aborted (invalid selection)");
-                return Err(AppError::ValidationError("Invalid selection".to_string()));
-            }
-        };
-        tracing::debug!("📊 Vote increment field resolved: '{}'", increment_field);
-
         // Get user's channels
         let channel_ids = get_user_channel_ids(&channels_col, &payload.starter_id).await?;
         tracing::info!(
@@ -529,7 +567,7 @@ pub async fn create_bet_handler(
             .await?;
         }
     } else {
-        tracing::debug!("⏭️ Skipping auto-vote — user already voted");
+        tracing::debug!("⏭️ Skipping auto-vote — user already voted (selection matches)");
     }
 
     // Deduct balance
@@ -794,6 +832,23 @@ pub async fn fill_bet_handler(
         ));
     }
 
+    // Validate finisher_selection up front — needed both for auto-voting
+    // and for the vote/fill mismatch check below. Previously this was
+    // only checked deep inside the "no existing vote" branch, so a bad
+    // value could slip through untouched when the finisher already had
+    // a matching vote on file.
+    let finisher_increment_field = match payload.finisher_selection.as_str() {
+        "home" => "vote_counts.home",
+        "away" => "vote_counts.away",
+        "draw" => "vote_counts.draw",
+        _ => {
+            tracing::error!("❌ INVALID finisher_selection: '{}'", payload.finisher_selection);
+            return Err(AppError::ValidationError(
+                "Invalid selection. Must be 'home', 'away', or 'draw'".to_string(),
+            ));
+        }
+    };
+
     let finisher_id = bson::oid::ObjectId::parse_str(&payload.finisher_id).map_err(|e| {
         tracing::error!("❌ Invalid finisher_id: {}", e);
         AppError::InvalidObjectId(e.to_string())
@@ -890,6 +945,38 @@ pub async fn fill_bet_handler(
             AppError::MongoDB(e)
         })?;
 
+    // ========================================================================
+    // ✅ VOTE / FILL CONSISTENCY GUARD (same rule as create_bet_handler)
+    // If the finisher already voted on this fixture, their fill selection
+    // MUST match their existing vote. A finisher cannot vote "home" then
+    // fill a bet by selecting "away" — reject before any balance moves.
+    // ========================================================================
+    if let Some(v) = &existing_vote {
+        if v.selection != payload.finisher_selection {
+            tracing::warn!(
+                "⚠️ VOTE/FILL MISMATCH — finisher='{}' voted '{}' but tried to fill as '{}'",
+                payload.finisher_id, v.selection, payload.finisher_selection
+            );
+            session
+                .abort_transaction()
+                .await
+                .map_err(|e| AppError::MongoDB(e))?;
+            return Err(AppError::ValidationError(format!(
+                "You voted for {}, you cannot bet on {}",
+                v.selection, payload.finisher_selection
+            )));
+        }
+        tracing::info!(
+            "✅ Existing vote found — selection='{}' matches fill selection",
+            v.selection
+        );
+    } else {
+        tracing::info!(
+            "📭 No existing vote for finisher — will auto-vote with finisher_selection='{}'",
+            payload.finisher_selection
+        );
+    }
+
     // 5. Deduct finisher balance
     users_col
         .update_one(
@@ -952,36 +1039,25 @@ pub async fn fill_bet_handler(
                 AppError::MongoDB(e)
             })?;
 
-        let increment_field = match payload.finisher_selection.as_str() {
-            "home" => "vote_counts.home",
-            "away" => "vote_counts.away",
-            "draw" => "vote_counts.draw",
-            _ => {
-                tracing::error!(
-                    "❌ Invalid finisher selection: {}",
-                    payload.finisher_selection
-                );
-                session.abort_transaction().await?;
-                return Err(AppError::ValidationError("Invalid selection".to_string()));
-            }
-        };
-
         // Get finisher's channels
         let finisher_channel_ids =
             get_user_channel_ids(&channels_col, &payload.finisher_id).await?;
 
         // Update channel_fixtures for EACH of finisher's channels
+        // (finisher_increment_field validated up front, before the transaction)
         for channel_id in &finisher_channel_ids {
             upsert_channel_fixture(
                 &channel_fixtures_col,
                 channel_id,
                 &bet.fixture_id,
-                Some(increment_field),
+                Some(finisher_increment_field),
                 1,
                 "active",
             )
             .await?;
         }
+    } else {
+        tracing::debug!("⏭️ Skipping auto-vote — finisher already voted (selection matches)");
     }
 
     // Get BOTH starter and finisher channel IDs
@@ -1067,9 +1143,6 @@ pub async fn fill_bet_handler(
     })))
 }
 
-// ============================================================================
-// 5. SETTLE BETS — Updates channel_fixtures status only
-// ============================================================================
 // ============================================================================
 // 5. SETTLE BETS — Updates channel_fixtures status only
 // ============================================================================

@@ -73,13 +73,15 @@ pub struct Bet {
 }
 
 impl Bet {
+    // vote_id is now Option<String> so callers can pass None when the
+    // pledge happens before (or without) an explicit vote_id.
     pub fn new_open(
         fixture_id: String,
         starter_id: String,
         starter_name: String,
         starter_selection: String,
         amount: f64,
-        vote_id: String,
+        vote_id: Option<String>,
     ) -> Self {
         let now = BsonDateTime::now();
         Self {
@@ -93,7 +95,7 @@ impl Bet {
             finisher_name: None,
             finisher_selection: None,
             finisher_amount: None,
-            vote_id: Some(vote_id),
+            vote_id,
             status: "open".to_string(),
             winner_id: None,
             starter_result: None,
@@ -140,7 +142,13 @@ pub struct CreateBetRequest {
     pub starter_selection: String,
     pub amount: f64,
     pub fixture_id: String,
-    pub vote_id: String,
+    // FIX: was `String` (required) — Axum's Json extractor 422s before
+    // the handler runs whenever the client omits this field or sends
+    // null, which is exactly what happens when a user pledges without
+    // an existing local vote_id. Now optional; the handler already has
+    // auto-vote logic for the "no vote yet" case, so a missing vote_id
+    // should reach that logic instead of failing at deserialization.
+    pub vote_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
