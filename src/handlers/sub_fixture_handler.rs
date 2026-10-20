@@ -1,6 +1,8 @@
 use crate::{
     errors::AppError,
+    handlers::actions::settle_pokes_handler,
     models::{
+        actions::SettlePokeRequest,
         channel::Channel,
         game::Game,
         sub_fixture::{
@@ -182,8 +184,9 @@ async fn notify_sub_fixture_members(
 
 // ============================================================================
 // HELPER: Resolve market_id from either ObjectId or business key
+// (pub(crate): also used by the poke handlers in handlers/actions.rs)
 // ============================================================================
-async fn resolve_market_id(
+pub(crate) async fn resolve_market_id(
     markets_col: &Collection<SubFixtureMarket>,
     match_id: &str,
     market_id_or_oid: &str,
@@ -790,6 +793,8 @@ pub async fn get_market_sub_fixture_bets_handler(
 
 // ============================================================================
 // 6. SETTLE SUB-FIXTURE BETS FOR A MARKET (internal, reusable logic)
+//    Also settles the POINTS pokes on the same market (after the money
+//    transaction commits). winning_team = None => refund everything.
 // ============================================================================
 pub async fn settle_sub_fixture_bets_for_market(
     state: &Arc<AppState>,
@@ -993,6 +998,40 @@ pub async fn settle_sub_fixture_bets_for_market(
         .await
         .map_err(|e| AppError::MongoDB(e))?;
 
+    // ========================================================================
+    // PART 3: SETTLE POINTS POKES ON THIS MARKET
+    // Runs after the money transaction has committed. Poke settlement is
+    // exactly-once per poke (status-guarded), so re-running is safe. A failure
+    // here is logged but does not undo the money settlement above.
+    // winning_team = None => both sides of every matched poke are refunded.
+    // ========================================================================
+    match settle_pokes_handler(
+        State((**state).clone()),
+        Json(SettlePokeRequest {
+            fixture_id: match_id.to_string(),
+            market_id: Some(market_id.to_string()),
+            result: winning_team.map(|w| w.to_string()),
+        }),
+    )
+    .await
+    {
+        Ok(Json(res)) => {
+            tracing::info!(
+                "🎯 Pokes settled for market {}: {}",
+                market_id,
+                res.get("message").and_then(|m| m.as_str()).unwrap_or("ok")
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                "❌ Poke settlement failed for market {} (match {}): {:?}",
+                market_id,
+                match_id,
+                e
+            );
+        }
+    }
+
     // ============================================================
     // ✅ SEND SETTLEMENT NOTIFICATIONS
     // ============================================================
@@ -1192,6 +1231,10 @@ pub async fn get_market_details_handler(
 // which case there's no reliable winner to declare. Refunding via the
 // existing settle_sub_fixture_bets_for_market(..., None) path is the same
 // no-winner/draw behavior it already uses elsewhere.
+//
+// That same call also refunds the POINTS pokes on each market (Part 3 of
+// settle_sub_fixture_bets_for_market). The market is only flipped to
+// "expired" AFTER that call, because poke settlement looks the market up.
 pub async fn cleanup_sub_fixtures_for_match(
     state: &Arc<AppState>,
     match_id: &str,

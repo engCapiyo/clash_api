@@ -1,68 +1,87 @@
+// File: src/routes/sub_fixtures.rs
+
 use axum::{
     routing::{get, post},
     Router,
 };
 
-use crate::state::AppState;
+use crate::{
+    handlers::sub_fixture_handler::{
+        create_sub_fixture_bet_handler, create_sub_fixture_market_handler,
+        fill_sub_fixture_bet_handler, get_market_details_handler,
+        get_market_sub_fixture_bets_handler, get_markets_for_match_handler,
+        get_open_sub_fixture_bets_handler, get_sub_fixture_visibility_handler,
+        get_user_sub_fixture_bets_handler, settle_sub_fixture_market_handler,
+    },
+    AppState,
+};
 
 pub fn sub_fixture_routes() -> Router<AppState> {
     Router::new()
-        // ========== SUB-FIXTURE BET ROUTES ==========
-        .route(
-            "/sub-fixture/bet",
-            post(crate::handlers::sub_fixture_handler::create_sub_fixture_bet_handler),
-        )
-        .route(
-            "/sub-fixture/bet/:bet_id/fill",
-            post(crate::handlers::sub_fixture_handler::fill_sub_fixture_bet_handler),
-        )
-        .route(
-            "/sub-fixture/bets/open/:match_id",
-            get(crate::handlers::sub_fixture_handler::get_open_sub_fixture_bets_handler),
-        )
-        .route(
-            "/sub-fixture/bets/user/:user_id",
-            get(crate::handlers::sub_fixture_handler::get_user_sub_fixture_bets_handler),
-        )
-        .route(
-            "/sub-fixture/bets/market/:match_id/:market_id",
-            get(crate::handlers::sub_fixture_handler::get_market_sub_fixture_bets_handler),
-        )
-        // ========== SUB-FIXTURE SETTLEMENT ROUTE (NEW) ==========
-        // Previously settle_sub_fixture_bets_for_market existed as a plain
-        // function with no route calling it -- unreachable over HTTP. This
-        // wires it up so the Python poller can settle first_goal/first_card/
-        // first_corner/over_under markets as soon as it detects them.
-        // ========== SUB-FIXTURE SETTLEMENT ROUTE ==========
-        // Previously settle_sub_fixture_bets_for_market existed as a plain
-        // function with no route calling it -- unreachable over HTTP. This
-        // wires it up so the Python poller can settle first_goal/first_card/
-        // first_corner/over_under markets as soon as it detects them.
-        .route(
-            "/sub-fixture/settle",
-            post(crate::handlers::sub_fixture_handler::settle_sub_fixture_market_handler),
-        )
-        // ========== SUB-FIXTURE MARKET ROUTES (NEW) ==========
-        // Paths match exactly what the Flutter client calls (no "/sub-fixture"
-        // prefix on these two -- SwipeableVotePledgeModal hits
-        // "$_api/sub_fixtures/markets/:match_id" and
-        // "$_api/sub_fixtures/visibility/:match_id" directly). Both 404'd
-        // before this, which is why the whole Sub-Fixtures tab silently
-        // failed to load.
-        .route(
-            "/markets/:match_id",
-            get(crate::handlers::sub_fixture_handler::get_markets_for_match_handler),
-        )
+        // ============================================================
+        // MARKETS (sub-fixture definitions for a match)
+        // ============================================================
+        // Create (or idempotently fetch) a market.
+        //   { match_id, market_type, options, line?, lock_at? }
         .route(
             "/sub-fixture/market/create",
-            post(crate::handlers::sub_fixture_handler::create_sub_fixture_market_handler),
+            post(create_sub_fixture_market_handler),
         )
+        // All visible markets for a match (modal "sub fixtures" list).
         .route(
-            "/visibility/:match_id",
-            get(crate::handlers::sub_fixture_handler::get_sub_fixture_visibility_handler),
+            "/sub-fixture/markets/:match_id",
+            get(get_markets_for_match_handler),
         )
+        // Whether any visible market exists (swipe-card "has sub-fixtures" flag).
         .route(
-            "/markets/:match_id/:market_id",
-            get(crate::handlers::sub_fixture_handler::get_market_details_handler),
+            "/sub-fixture/visibility/:match_id",
+            get(get_sub_fixture_visibility_handler),
+        )
+        // One market's detail + stats + every bet.
+        //   :market_id accepts ObjectId or business key.
+        .route(
+            "/sub-fixture/market/:match_id/:market_id",
+            get(get_market_details_handler),
+        )
+        // ============================================================
+        // MONEY BETS ON A MARKET
+        // ============================================================
+        // Create an open money bet.
+        //   { match_id, market_id, starter_id, starter_name, selection, amount }
+        .route(
+            "/sub-fixture/bet/create",
+            post(create_sub_fixture_bet_handler),
+        )
+        // Fill an open money bet (stake MUST equal starter's).
+        //   { match_id, market_id, finisher_id, finisher_name, selection, amount }
+        .route(
+            "/sub-fixture/bet/:bet_id/fill",
+            post(fill_sub_fixture_bet_handler),
+        )
+        // Open money bets for a whole match (all markets).
+        .route(
+            "/sub-fixture/bets/:match_id",
+            get(get_open_sub_fixture_bets_handler),
+        )
+        // Open + matched money bets for a single market.
+        //   :market_id accepts ObjectId or business key.
+        .route(
+            "/sub-fixture/bets/:match_id/:market_id",
+            get(get_market_sub_fixture_bets_handler),
+        )
+        // All money bets (any status) belonging to a user.
+        .route(
+            "/sub-fixture/bets/user/:user_id",
+            get(get_user_sub_fixture_bets_handler),
+        )
+        // ============================================================
+        // SETTLEMENT
+        // ============================================================
+        // Settle a market's money bets AND its points pokes.
+        //   { match_id, market_id, winning_team: Option<String> }
+        //   winning_team = None => refund everything (no winner / draw).
+        .route(
+            "/sub-fixture/settle",
+            post(settle_sub_fixture_market_handler),
         )
 }

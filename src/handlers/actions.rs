@@ -1,23 +1,26 @@
 use crate::{
     errors::AppError,
+    handlers::sub_fixture_handler::resolve_market_id,
     models::{
         actions::{
-            Bet, CastVoteRequest, CreateBetRequest, FillBetRequest, RollbackVoteRequest,
-            SettleBetRequest, Vote,
+            Bet, CastVoteRequest, CreateBetRequest, CreatePokeRequest, FillBetRequest,
+            FillPokeRequest, Poke, PokeListQuery, RollbackVoteRequest, SettleBetRequest,
+            SettlePokeRequest, Vote, MIN_POKE_POINTS,
         },
         channel::{Channel, ChannelFixture, VoteCounts},
         game::Game,
+        sub_fixture::SubFixtureMarket,
         user::User,
     },
     AppState,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
-use bson::{doc, to_bson, DateTime as BsonDateTime};
+use bson::{doc, to_bson, Bson, DateTime as BsonDateTime, Document};
 use futures_util::StreamExt;
-use mongodb::Collection;
+use mongodb::{ClientSession, Collection};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
@@ -103,7 +106,6 @@ async fn broadcast_to_room(
 // ============================================================================
 // HELPER: Send notification to channel members
 // ============================================================================
-
 async fn notify_channel_members(
     state: &AppState,
     actor_id: &str,
@@ -158,10 +160,10 @@ async fn notify_channel_members(
 
     Ok(())
 }
+
 // ============================================================================
 // HELPER: Create or update ChannelFixture for a channel
 // ============================================================================
-
 async fn upsert_channel_fixture(
     channel_fixtures_col: &Collection<ChannelFixture>,
     channel_id: &str,
@@ -195,12 +197,13 @@ async fn upsert_channel_fixture(
         "added_at": BsonDateTime::now(),
     };
 
-    let defaultable_fields: [(&str, i32); 5] = [
+    let defaultable_fields: [(&str, i32); 6] = [
         ("vote_counts.home", 0),
         ("vote_counts.away", 0),
         ("vote_counts.draw", 0),
         ("pledge_count", 0),
         ("bet_count", 0),
+        ("poke_count", 0),
     ];
 
     for (field, default) in defaultable_fields {
@@ -237,7 +240,223 @@ async fn upsert_channel_fixture(
 }
 
 // ============================================================================
-// 1. CAST VOTE — Creates/Updates channel_fixtures for ALL user's channels
+// POKE HELPERS (points-based, no draw)
+// ============================================================================
+
+/// Read the spendable points balance from a raw user document.
+/// `season_points` is the canonical balance; voting +/-3 and poke stakes all
+/// spend/earn this same field.
+fn read_points(user: &Document) -> i64 {
+    match user.get("season_points") {
+        Some(Bson::Int32(v)) => *v as i64,
+        Some(Bson::Int64(v)) => *v,
+        Some(Bson::Double(v)) => *v as i64,
+        _ => 0,
+    }
+}
+
+/// Map a main-match selection to its vote_counts field.
+/// No draw: only home/away are valid selections.
+fn vote_count_field(selection: &str) -> Option<&'static str> {
+    match selection {
+        "home" => Some("vote_counts.home"),
+        "away" => Some("vote_counts.away"),
+        _ => None,
+    }
+}
+
+/// Match filter for a main-match poke (market_id null) or a sub-fixture market.
+fn poke_target_filter(fixture_id: &str, market_id: &Option<String>) -> Document {
+    match market_id {
+        Some(m) => doc! { "fixture_id": fixture_id, "market_id": m },
+        None => doc! { "fixture_id": fixture_id, "market_id": Bson::Null },
+    }
+}
+
+fn poke_json(p: &Poke) -> serde_json::Value {
+    json!({
+        "id": p.id.map(|oid| oid.to_hex()),
+        "fixture_id": p.fixture_id,
+        "market_id": p.market_id,
+        "starter_id": p.starter_id,
+        "starter_name": p.starter_name,
+        "starter_selection": p.starter_selection,
+        "stake": p.stake,
+        "finisher_id": p.finisher_id,
+        "finisher_name": p.finisher_name,
+        "finisher_selection": p.finisher_selection,
+        "status": p.status,
+        "winner_id": p.winner_id,
+        "starter_result": p.starter_result,
+        "finisher_result": p.finisher_result,
+        "total_pot": p.total_pot(),
+        "created_at": p.created_at,
+        "matched_at": p.matched_at,
+        "settled_at": p.settled_at,
+    })
+}
+
+struct PokeTarget {
+    /// Resolved market business key (e.g. `{match_id}_{market_type}`).
+    /// `None` => the poke is on the main match.
+    market_id: Option<String>,
+    /// Allowed selections. Main match => ["home","away"]. Sub-fixture => market options.
+    options: Vec<String>,
+}
+
+/// Resolve the poke target and (optionally) enforce that the market is open
+/// and the parent match has not started — the same rules as sub-fixture bets.
+async fn load_poke_target(
+    state: &AppState,
+    fixture_id: &str,
+    market_id: &Option<String>,
+    require_open: bool,
+) -> Result<PokeTarget, AppError> {
+    let Some(raw) = market_id else {
+        return Ok(PokeTarget {
+            market_id: None,
+            options: vec!["home".to_string(), "away".to_string()],
+        });
+    };
+
+    let markets_col: Collection<SubFixtureMarket> = state.db.collection("sub_fixture_markets");
+    let resolved = resolve_market_id(&markets_col, fixture_id, raw).await?;
+
+    let market = markets_col
+        .find_one(doc! { "matchId": fixture_id, "marketId": &resolved })
+        .await
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
+
+    if require_open {
+        if market.status != "open" {
+            return Err(AppError::ValidationError(format!(
+                "Market is not open (status: {})",
+                market.status
+            )));
+        }
+        let games_col: Collection<Game> = state.db.collection("games");
+        let game = games_col
+            .find_one(doc! { "matchId": fixture_id })
+            .await
+            .map_err(AppError::MongoDB)?
+            .ok_or(AppError::DocumentNotFound)?;
+        if game.status != "upcoming" && game.status != "not_started" {
+            return Err(AppError::ValidationError(
+                "Match is no longer accepting pokes".to_string(),
+            ));
+        }
+    }
+
+    Ok(PokeTarget {
+        market_id: Some(resolved),
+        options: market.options,
+    })
+}
+
+/// Reject draw and any selection not in `options`.
+fn check_selection(selection: &str, options: &[String]) -> Result<(), AppError> {
+    if selection != "draw" && options.iter().any(|o| o == selection) {
+        Ok(())
+    } else {
+        Err(AppError::ValidationError(format!(
+            "Invalid selection. Must be one of: {}",
+            options.join(", ")
+        )))
+    }
+}
+
+/// Mirror a points delta onto every channel membership row for this user.
+async fn mirror_points_to_channels(
+    channels_col: &Collection<Channel>,
+    user_id: &str,
+    delta: i32,
+    session: &mut ClientSession,
+) -> Result<(), AppError> {
+    channels_col
+        .update_many(
+            doc! { "members.user_id": user_id },
+            doc! { "$inc": { "members.$[m].season_points": delta } },
+        )
+        .array_filters(vec![doc! { "m.user_id": user_id }])
+        .session(&mut *session)
+        .await
+        .map_err(|e| {
+            tracing::error!("❌ Failed to mirror points to channels: {}", e);
+            AppError::MongoDB(e)
+        })?;
+    Ok(())
+}
+
+/// Atomically reserve `stake` points. The `season_points >= stake` filter
+/// makes two concurrent requests unable to spend the same points twice.
+async fn reserve_points(
+    users_doc_col: &Collection<Document>,
+    channels_col: &Collection<Channel>,
+    user_oid: bson::oid::ObjectId,
+    user_id: &str,
+    stake: i32,
+    session: &mut ClientSession,
+) -> Result<(), AppError> {
+    let res = users_doc_col
+        .update_one(
+            doc! { "_id": user_oid, "season_points": { "$gte": stake } },
+            doc! { "$inc": { "season_points": -stake } },
+        )
+        .session(&mut *session)
+        .await
+        .map_err(|e| {
+            tracing::error!("❌ Failed to reserve points: {}", e);
+            AppError::MongoDB(e)
+        })?;
+
+    if res.matched_count == 0 {
+        return Err(AppError::ValidationError(
+            "Insufficient points".to_string(),
+        ));
+    }
+
+    mirror_points_to_channels(channels_col, user_id, -stake, session).await
+}
+
+/// Give points back / pay out.
+async fn credit_points(
+    users_doc_col: &Collection<Document>,
+    channels_col: &Collection<Channel>,
+    user_id: &str,
+    amount: i32,
+    session: &mut ClientSession,
+) -> Result<(), AppError> {
+    let oid = bson::oid::ObjectId::parse_str(user_id)
+        .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+
+    users_doc_col
+        .update_one(doc! { "_id": oid }, doc! { "$inc": { "season_points": amount } })
+        .session(&mut *session)
+        .await
+        .map_err(|e| {
+            tracing::error!("❌ Failed to credit points: {}", e);
+            AppError::MongoDB(e)
+        })?;
+
+    mirror_points_to_channels(channels_col, user_id, amount, session).await
+}
+
+/// Vote/poke consistency: Ok(true) => auto-vote needed, Ok(false) => existing
+/// vote matches, Err => mismatch (reject).
+fn check_vote_matches(existing: &Option<Vote>, selection: &str) -> Result<bool, AppError> {
+    match existing {
+        Some(v) if v.selection != selection => Err(AppError::ValidationError(format!(
+            "You voted for {}, you cannot poke {}",
+            v.selection, selection
+        ))),
+        Some(_) => Ok(false),
+        None => Ok(true),
+    }
+}
+
+// ============================================================================
+// 1. CAST VOTE
 // ============================================================================
 pub async fn cast_vote_handler(
     State(state): State<AppState>,
@@ -254,7 +473,18 @@ pub async fn cast_vote_handler(
         payload.selection
     );
 
-    // Check if already voted globally
+    // No draw: only home/away accepted.
+    let increment_field = match payload.selection.as_str() {
+        "home" => "vote_counts.home",
+        "away" => "vote_counts.away",
+        _ => {
+            tracing::error!("❌ Invalid selection: {}", payload.selection);
+            return Err(AppError::ValidationError(
+                "Invalid selection. Must be 'home' or 'away'".to_string(),
+            ));
+        }
+    };
+
     let existing = votes_col
         .find_one(doc! {
             "fixture_id": &payload.fixture_id,
@@ -273,7 +503,6 @@ pub async fn cast_vote_handler(
         ));
     }
 
-    // Insert vote (global)
     let vote = Vote::new(
         payload.fixture_id.clone(),
         payload.user_id.clone(),
@@ -286,21 +515,6 @@ pub async fn cast_vote_handler(
         AppError::MongoDB(e)
     })?;
 
-    tracing::debug!("✅ Vote inserted successfully");
-
-    let increment_field = match payload.selection.as_str() {
-        "home" => "vote_counts.home",
-        "away" => "vote_counts.away",
-        "draw" => "vote_counts.draw",
-        _ => {
-            tracing::error!("❌ Invalid selection: {}", payload.selection);
-            return Err(AppError::ValidationError(
-                "Invalid selection. Must be 'home', 'away', or 'draw'".to_string(),
-            ));
-        }
-    };
-
-    // Get ALL channels the user belongs to
     let channel_ids = get_user_channel_ids(&channels_col, &payload.user_id).await?;
 
     tracing::info!(
@@ -309,9 +523,7 @@ pub async fn cast_vote_handler(
         payload.fixture_id
     );
 
-    // Create/Update ChannelFixture for EACH channel
     for channel_id in &channel_ids {
-        tracing::debug!("🔄 Processing channel: {}", channel_id);
         upsert_channel_fixture(
             &channel_fixtures_col,
             channel_id,
@@ -323,9 +535,6 @@ pub async fn cast_vote_handler(
         .await?;
     }
 
-    // ============================================================
-    // ✅ SEND NOTIFICATIONS TO ALL CHANNEL MEMBERS
-    // ============================================================
     let vote_payload = serde_json::json!({
         "fixture_id": payload.fixture_id,
         "user_id": payload.user_id,
@@ -364,19 +573,7 @@ pub async fn cast_vote_handler(
 }
 
 // ============================================================================
-// 2. CREATE BET — Creates/Updates channel_fixtures for ALL user's channels
-//
-// RULES (as specified):
-//   - Voting is compulsory. Every pledge/bet requires a vote to exist.
-//   - If the user hasn't voted yet, this handler atomically casts the vote
-//     (using starter_selection) THEN creates the pledge, in the same
-//     transaction — both succeed or both roll back together.
-//   - Pledges/bets can happen any number of times, but the vote is once
-//     per fixture per user.
-//   - If the user already voted, the pledge's selection MUST match their
-//     existing vote's selection. If it doesn't, reject with a clear error
-//     ("You voted for X, you cannot bet on Y") — no auto-changing votes,
-//     no silent mismatch.
+// 2. CREATE BET (money) — no draw
 // ============================================================================
 pub async fn create_bet_handler(
     State(state): State<AppState>,
@@ -399,23 +596,19 @@ pub async fn create_bet_handler(
     tracing::info!("═══════════════════════════════════════════");
 
     if payload.amount <= 0.0 {
-        tracing::warn!("⚠️ VALIDATION FAILED — invalid amount: {}", payload.amount);
         return Err(AppError::ValidationError(
             "Amount must be greater than 0".to_string(),
         ));
     }
-    tracing::debug!("✅ Amount validation passed: {}", payload.amount);
 
-    // starter_selection must be a valid selection value up front — needed
-    // both for auto-voting and for the mismatch check below.
+    // No draw.
     let increment_field = match payload.starter_selection.as_str() {
         "home" => "vote_counts.home",
         "away" => "vote_counts.away",
-        "draw" => "vote_counts.draw",
         _ => {
             tracing::error!("❌ INVALID starter_selection: '{}'", payload.starter_selection);
             return Err(AppError::ValidationError(
-                "Invalid selection. Must be 'home', 'away', or 'draw'".to_string(),
+                "Invalid selection. Must be 'home' or 'away'".to_string(),
             ));
         }
     };
@@ -424,15 +617,9 @@ pub async fn create_bet_handler(
         tracing::error!("❌ INVALID starter_id '{}': {}", payload.starter_id, e);
         AppError::InvalidObjectId(e.to_string())
     })?;
-    tracing::debug!("✅ starter_id parsed as ObjectId: {}", starter_id);
 
     let fixture_id = payload.fixture_id.clone();
 
-    // Check if already voted
-    tracing::debug!(
-        "🔍 Checking existing vote — fixture='{}', user='{}'",
-        fixture_id, payload.starter_id
-    );
     let vote_exists = votes_col
         .find_one(doc! {
             "fixture_id": &fixture_id,
@@ -444,12 +631,6 @@ pub async fn create_bet_handler(
             AppError::MongoDB(e)
         })?;
 
-    // ========================================================================
-    // ✅ VOTE / PLEDGE CONSISTENCY GUARD
-    // If the user already voted, the pledge selection MUST match the vote.
-    // A user cannot vote "home" then pledge on "away" — reject immediately,
-    // before touching balance or opening a transaction.
-    // ========================================================================
     if let Some(existing_vote) = &vote_exists {
         if existing_vote.selection != payload.starter_selection {
             tracing::warn!(
@@ -461,101 +642,41 @@ pub async fn create_bet_handler(
                 existing_vote.selection, payload.starter_selection
             )));
         }
-        tracing::info!(
-            "✅ Existing vote found — selection='{}' matches pledge selection",
-            existing_vote.selection
-        );
-    } else {
-        tracing::info!(
-            "📭 No existing vote — will auto-vote with starter_selection='{}'",
-            payload.starter_selection
-        );
     }
 
-    // Start transaction
-    tracing::debug!("🔄 Starting DB session/transaction");
-    let mut session = state.client.start_session().await.map_err(|e| {
-        tracing::error!("❌ Failed to start session: {}", e);
-        AppError::MongoDB(e)
-    })?;
-    session.start_transaction().await.map_err(|e| {
-        tracing::error!("❌ Failed to start transaction: {}", e);
-        AppError::MongoDB(e)
-    })?;
-    tracing::debug!("✅ Transaction started");
+    let mut session = state.client.start_session().await.map_err(AppError::MongoDB)?;
+    session.start_transaction().await.map_err(AppError::MongoDB)?;
 
-    // Check balance
-    tracing::debug!("🔍 Looking up user by _id: {}", starter_id);
     let user = users_col
         .find_one(doc! { "_id": starter_id })
         .session(&mut session)
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find user: {}", e);
-            AppError::MongoDB(e)
-        })?
-        .ok_or_else(|| {
-            tracing::error!("❌ USER NOT FOUND for starter_id: {}", payload.starter_id);
-            AppError::DocumentNotFound
-        })?;
-
-    tracing::info!(
-        "👤 Found user — id='{}', username='{}', balance={}",
-        payload.starter_id, user.username, user.balance
-    );
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
 
     if user.balance < payload.amount {
-        tracing::warn!(
-            "⚠️ INSUFFICIENT BALANCE — user='{}', balance={}, requested={}",
-            payload.starter_id, user.balance, payload.amount
-        );
-        session
-            .abort_transaction()
-            .await
-            .map_err(|e| AppError::MongoDB(e))?;
-        tracing::info!("↩️ Transaction aborted (insufficient balance)");
+        session.abort_transaction().await.map_err(AppError::MongoDB)?;
         return Err(AppError::ValidationError(format!(
             "Insufficient balance. You have {}, need {}",
             user.balance, payload.amount
         )));
     }
-    tracing::debug!("✅ Balance check passed: {} >= {}", user.balance, payload.amount);
 
-    // Auto-cast vote if not already voted — ATOMIC with the pledge below.
-    // Voting is compulsory: this is the only place a first-time voter's
-    // vote gets created when they go straight to pledging.
     if vote_exists.is_none() {
-        tracing::info!(
-            "🔄 AUTO-VOTING — user='{}', selection='{}'",
-            payload.starter_id, payload.starter_selection
-        );
         let vote = Vote::new(
             fixture_id.clone(),
             payload.starter_id.clone(),
             payload.starter_name.clone(),
             payload.starter_selection.clone(),
         );
-
         votes_col
             .insert_one(&vote)
             .session(&mut session)
             .await
-            .map_err(|e| {
-                tracing::error!("❌ Failed to insert auto-vote: {}", e);
-                AppError::MongoDB(e)
-            })?;
-        tracing::debug!("✅ Auto-vote inserted");
+            .map_err(AppError::MongoDB)?;
 
-        // Get user's channels
         let channel_ids = get_user_channel_ids(&channels_col, &payload.starter_id).await?;
-        tracing::info!(
-            "📋 User '{}' belongs to {} channels: {:?}",
-            payload.starter_id, channel_ids.len(), channel_ids
-        );
-
-        // Update channel_fixtures for EACH channel
         for channel_id in &channel_ids {
-            tracing::debug!("🔄 Upserting channel_fixture for auto-vote — channel='{}'", channel_id);
             upsert_channel_fixture(
                 &channel_fixtures_col,
                 channel_id,
@@ -566,15 +687,8 @@ pub async fn create_bet_handler(
             )
             .await?;
         }
-    } else {
-        tracing::debug!("⏭️ Skipping auto-vote — user already voted (selection matches)");
     }
 
-    // Deduct balance
-    tracing::info!(
-        "💸 DEDUCTING BALANCE — user='{}', amount={}, balance_before={}",
-        payload.starter_id, payload.amount, user.balance
-    );
     users_col
         .update_one(
             doc! { "_id": starter_id },
@@ -582,13 +696,8 @@ pub async fn create_bet_handler(
         )
         .session(&mut session)
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to deduct balance: {}", e);
-            AppError::MongoDB(e)
-        })?;
-    tracing::debug!("✅ Balance deducted — expected new balance: {}", user.balance - payload.amount);
+        .map_err(AppError::MongoDB)?;
 
-    // Create bet
     let bet = Bet::new_open(
         fixture_id.clone(),
         payload.starter_id.clone(),
@@ -598,41 +707,22 @@ pub async fn create_bet_handler(
         payload.vote_id.clone(),
     );
 
-    tracing::info!(
-        "📝 INSERTING BET — fixture='{}', starter='{}', selection='{}', amount={}",
-        fixture_id, payload.starter_id, payload.starter_selection, payload.amount
-    );
-
     let insert_result = bets_col
         .insert_one(&bet)
         .session(&mut session)
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to create bet: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
     let bet_id = insert_result
         .inserted_id
         .as_object_id()
         .map(|oid| oid.to_hex())
         .ok_or_else(|| {
-            tracing::error!("❌ Failed to extract bet ID from insert result");
             AppError::InternalServerError("Failed to get bet ID".to_string())
         })?;
 
-    tracing::info!("✅ Bet inserted successfully — bet_id='{}'", bet_id);
-
-    // Get user's channels for pledge count update
     let channel_ids = get_user_channel_ids(&channels_col, &payload.starter_id).await?;
-    tracing::info!(
-        "📋 Updating pledge_count for {} channels: {:?}",
-        channel_ids.len(), channel_ids
-    );
-
-    // Update pledge_count for EACH channel
     for channel_id in &channel_ids {
-        tracing::debug!("🔄 Incrementing pledge_count — channel='{}'", channel_id);
         upsert_channel_fixture(
             &channel_fixtures_col,
             channel_id,
@@ -644,16 +734,8 @@ pub async fn create_bet_handler(
         .await?;
     }
 
-    tracing::debug!("🔄 Committing transaction");
-    session.commit_transaction().await.map_err(|e| {
-        tracing::error!("❌ Failed to commit transaction: {}", e);
-        AppError::MongoDB(e)
-    })?;
-    tracing::info!("✅ Transaction committed");
+    session.commit_transaction().await.map_err(AppError::MongoDB)?;
 
-    // ============================================================
-    // ✅ SEND NOTIFICATIONS TO ALL CHANNEL MEMBERS
-    // ============================================================
     let pledge_payload = serde_json::json!({
         "fixture_id": fixture_id,
         "user_id": payload.starter_id,
@@ -663,9 +745,8 @@ pub async fn create_bet_handler(
         "bet_id": bet_id,
     });
 
-    tracing::debug!("📤 Sending pledge.create notifications to {} channels", channel_ids.len());
     for channel_id in &channel_ids {
-        let notify_result = notify_channel_members(
+        let _ = notify_channel_members(
             &state,
             &payload.starter_id,
             channel_id,
@@ -679,25 +760,14 @@ pub async fn create_bet_handler(
             pledge_payload.clone(),
         )
         .await;
-        if let Err(e) = notify_result {
-            tracing::warn!("⚠️ Notification failed for channel '{}': {:?}", channel_id, e);
-        }
     }
-
-    let new_balance = user.balance - payload.amount;
-
-    tracing::info!(
-        "✅ PLEDGE COMPLETE — bet_id='{}', user='{}', amount={}, new_balance={}, auto_voted={}, channels_updated={}",
-        bet_id, payload.starter_id, payload.amount, new_balance, vote_exists.is_none(), channel_ids.len()
-    );
-    tracing::info!("═══════════════════════════════════════════");
 
     Ok(Json(json!({
         "success": true,
         "message": "Pledge created successfully",
         "bet_id": bet_id,
         "vote_id": payload.vote_id,
-        "new_balance": new_balance,
+        "new_balance": user.balance - payload.amount,
         "status": "open",
         "auto_voted": vote_exists.is_none(),
         "channels_updated": channel_ids.len(),
@@ -705,7 +775,7 @@ pub async fn create_bet_handler(
 }
 
 // ============================================================================
-// 3. ROLLBACK VOTE — Decrements channel_fixtures for ALL user's channels
+// 3. ROLLBACK VOTE — refuses if user has a live poke on the same target
 // ============================================================================
 pub async fn rollback_vote_handler(
     State(state): State<AppState>,
@@ -714,6 +784,7 @@ pub async fn rollback_vote_handler(
     let votes_col: Collection<Vote> = state.db.collection("votes");
     let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
     let channels_col: Collection<Channel> = state.db.collection("channels");
+    let pokes_col: Collection<Poke> = state.db.collection("pokes");
 
     tracing::info!(
         "↩️ Rollback vote: fixture={}, user={}",
@@ -727,15 +798,35 @@ pub async fn rollback_vote_handler(
             "user_id": &payload.user_id,
         })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find vote: {}", e);
-            AppError::MongoDB(e)
-        })?
+        .map_err(AppError::MongoDB)?
         .ok_or(AppError::ValidationError(
             "User has not voted on this fixture".to_string(),
         ))?;
 
-    tracing::debug!("✅ Found vote: selection={}", vote.selection);
+    // A vote that backs an open/matched poke cannot be rolled back.
+    // payload.fixture_id is either a main fixture id or a market_id.
+    let live_pokes = pokes_col
+        .count_documents(doc! {
+            "status": { "$in": ["open", "matched"] },
+            "$and": [
+                { "$or": [
+                    { "starter_id": &payload.user_id },
+                    { "finisher_id": &payload.user_id },
+                ]},
+                { "$or": [
+                    { "market_id": &payload.fixture_id },
+                    { "market_id": Bson::Null, "fixture_id": &payload.fixture_id },
+                ]},
+            ],
+        })
+        .await
+        .map_err(AppError::MongoDB)?;
+
+    if live_pokes > 0 {
+        return Err(AppError::ValidationError(
+            "You have an active poke on this match, you cannot undo your vote".to_string(),
+        ));
+    }
 
     votes_col
         .delete_one(doc! {
@@ -743,36 +834,24 @@ pub async fn rollback_vote_handler(
             "user_id": &payload.user_id,
         })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to delete vote: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
-    tracing::debug!("✅ Vote deleted");
-
+    // Legacy draw votes can still be rolled back even though draw is no
+    // longer accepted for new votes.
     let decrement_field = match vote.selection.as_str() {
         "home" => "vote_counts.home",
         "away" => "vote_counts.away",
         "draw" => "vote_counts.draw",
         _ => {
-            tracing::error!("❌ Invalid selection in vote record: {}", vote.selection);
             return Err(AppError::ValidationError(
                 "Invalid selection in vote record".to_string(),
             ));
         }
     };
 
-    // Get ALL channels the user belongs to
     let channel_ids = get_user_channel_ids(&channels_col, &payload.user_id).await?;
 
-    tracing::info!(
-        "📊 User is in {} channels, decrementing vote counts",
-        channel_ids.len()
-    );
-
-    // Decrement channel_fixtures for EACH channel
     for channel_id in &channel_ids {
-        tracing::debug!("🔄 Decrementing channel: {}", channel_id);
         channel_fixtures_col
             .update_one(
                 doc! {
@@ -782,17 +861,8 @@ pub async fn rollback_vote_handler(
                 doc! { "$inc": { decrement_field: -1 } },
             )
             .await
-            .map_err(|e| {
-                tracing::error!("❌ Failed to decrement channel_fixture: {}", e);
-                AppError::MongoDB(e)
-            })?;
+            .map_err(AppError::MongoDB)?;
     }
-
-    tracing::info!(
-        "✅ Vote rolled back for user {} in {} channels",
-        payload.user_id,
-        channel_ids.len()
-    );
 
     Ok(Json(json!({
         "success": true,
@@ -805,7 +875,7 @@ pub async fn rollback_vote_handler(
 }
 
 // ============================================================================
-// 4. FILL BET — Creates/Updates channel_fixtures for BOTH user's channels
+// 4. FILL BET (money) — no draw
 // ============================================================================
 pub async fn fill_bet_handler(
     State(state): State<AppState>,
@@ -826,113 +896,65 @@ pub async fn fill_bet_handler(
     );
 
     if payload.amount <= 0.0 {
-        tracing::warn!("⚠️ Invalid amount: {}", payload.amount);
         return Err(AppError::ValidationError(
             "Amount must be greater than 0".to_string(),
         ));
     }
 
-    // Validate finisher_selection up front — needed both for auto-voting
-    // and for the vote/fill mismatch check below. Previously this was
-    // only checked deep inside the "no existing vote" branch, so a bad
-    // value could slip through untouched when the finisher already had
-    // a matching vote on file.
+    // No draw.
     let finisher_increment_field = match payload.finisher_selection.as_str() {
         "home" => "vote_counts.home",
         "away" => "vote_counts.away",
-        "draw" => "vote_counts.draw",
         _ => {
-            tracing::error!("❌ INVALID finisher_selection: '{}'", payload.finisher_selection);
+            tracing::error!(
+                "❌ INVALID finisher_selection: '{}'",
+                payload.finisher_selection
+            );
             return Err(AppError::ValidationError(
-                "Invalid selection. Must be 'home', 'away', or 'draw'".to_string(),
+                "Invalid selection. Must be 'home' or 'away'".to_string(),
             ));
         }
     };
 
-    let finisher_id = bson::oid::ObjectId::parse_str(&payload.finisher_id).map_err(|e| {
-        tracing::error!("❌ Invalid finisher_id: {}", e);
-        AppError::InvalidObjectId(e.to_string())
-    })?;
-    let bet_id = bson::oid::ObjectId::parse_str(&payload.bet_id).map_err(|e| {
-        tracing::error!("❌ Invalid bet_id: {}", e);
-        AppError::InvalidObjectId(e.to_string())
-    })?;
+    let finisher_id = bson::oid::ObjectId::parse_str(&payload.finisher_id)
+        .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+    let bet_id = bson::oid::ObjectId::parse_str(&payload.bet_id)
+        .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
 
-    // Start transaction
-    let mut session = state.client.start_session().await.map_err(|e| {
-        tracing::error!("❌ Failed to start session: {}", e);
-        AppError::MongoDB(e)
-    })?;
-    session.start_transaction().await.map_err(|e| {
-        tracing::error!("❌ Failed to start transaction: {}", e);
-        AppError::MongoDB(e)
-    })?;
+    let mut session = state.client.start_session().await.map_err(AppError::MongoDB)?;
+    session.start_transaction().await.map_err(AppError::MongoDB)?;
 
-    tracing::debug!("✅ Transaction started");
-
-    // 1. Find the bet (must be OPEN)
     let bet = bets_col
-        .find_one(doc! {
-            "_id": bet_id,
-            "status": "open",
-        })
+        .find_one(doc! { "_id": bet_id, "status": "open" })
         .session(&mut session)
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find bet: {}", e);
-            AppError::MongoDB(e)
-        })?
+        .map_err(AppError::MongoDB)?
         .ok_or(AppError::ValidationError(
             "Bet not found or already filled".to_string(),
         ))?;
 
-    tracing::debug!("✅ Found bet: {}", payload.bet_id);
-
-    // 2. Check finisher didn't create this bet
     if bet.starter_id == payload.finisher_id {
-        tracing::warn!("⚠️ Cannot fill own bet");
-        session
-            .abort_transaction()
-            .await
-            .map_err(|e| AppError::MongoDB(e))?;
+        session.abort_transaction().await.map_err(AppError::MongoDB)?;
         return Err(AppError::ValidationError(
             "Cannot fill your own bet".to_string(),
         ));
     }
 
-    // 3. Find finisher and check balance
     let finisher = users_col
         .find_one(doc! { "_id": finisher_id })
         .session(&mut session)
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find finisher: {}", e);
-            AppError::MongoDB(e)
-        })?
-        .ok_or_else(|| {
-            tracing::error!("❌ Finisher not found: {}", payload.finisher_id);
-            AppError::DocumentNotFound
-        })?;
-
-    tracing::debug!("💰 Finisher balance: {}", finisher.balance);
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
 
     if finisher.balance < payload.amount {
-        tracing::warn!(
-            "⚠️ Insufficient balance: {} < {}",
-            finisher.balance,
-            payload.amount
-        );
-        session
-            .abort_transaction()
-            .await
-            .map_err(|e| AppError::MongoDB(e))?;
+        session.abort_transaction().await.map_err(AppError::MongoDB)?;
         return Err(AppError::ValidationError(format!(
             "Insufficient balance. You have {}, need {}",
             finisher.balance, payload.amount
         )));
     }
 
-    // 4. Check finisher didn't already vote
     let existing_vote = votes_col
         .find_one(doc! {
             "fixture_id": &bet.fixture_id,
@@ -940,44 +962,18 @@ pub async fn fill_bet_handler(
         })
         .session(&mut session)
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to check finisher vote: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
-    // ========================================================================
-    // ✅ VOTE / FILL CONSISTENCY GUARD (same rule as create_bet_handler)
-    // If the finisher already voted on this fixture, their fill selection
-    // MUST match their existing vote. A finisher cannot vote "home" then
-    // fill a bet by selecting "away" — reject before any balance moves.
-    // ========================================================================
     if let Some(v) = &existing_vote {
         if v.selection != payload.finisher_selection {
-            tracing::warn!(
-                "⚠️ VOTE/FILL MISMATCH — finisher='{}' voted '{}' but tried to fill as '{}'",
-                payload.finisher_id, v.selection, payload.finisher_selection
-            );
-            session
-                .abort_transaction()
-                .await
-                .map_err(|e| AppError::MongoDB(e))?;
+            session.abort_transaction().await.map_err(AppError::MongoDB)?;
             return Err(AppError::ValidationError(format!(
                 "You voted for {}, you cannot bet on {}",
                 v.selection, payload.finisher_selection
             )));
         }
-        tracing::info!(
-            "✅ Existing vote found — selection='{}' matches fill selection",
-            v.selection
-        );
-    } else {
-        tracing::info!(
-            "📭 No existing vote for finisher — will auto-vote with finisher_selection='{}'",
-            payload.finisher_selection
-        );
     }
 
-    // 5. Deduct finisher balance
     users_col
         .update_one(
             doc! { "_id": finisher_id },
@@ -985,17 +981,7 @@ pub async fn fill_bet_handler(
         )
         .session(&mut session)
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to deduct finisher balance: {}", e);
-            AppError::MongoDB(e)
-        })?;
-
-    tracing::debug!("💰 Finisher balance deducted");
-
-    // 6. Update bet to MATCHED
-    let finisher_id_clone = payload.finisher_id.clone();
-    let finisher_name_clone = payload.finisher_name.clone();
-    let finisher_selection_clone = payload.finisher_selection.clone();
+        .map_err(AppError::MongoDB)?;
 
     bets_col
         .update_one(
@@ -1003,9 +989,9 @@ pub async fn fill_bet_handler(
             doc! {
                 "$set": {
                     "status": "matched",
-                    "finisher_id": finisher_id_clone,
-                    "finisher_name": finisher_name_clone,
-                    "finisher_selection": finisher_selection_clone,
+                    "finisher_id": payload.finisher_id.clone(),
+                    "finisher_name": payload.finisher_name.clone(),
+                    "finisher_selection": payload.finisher_selection.clone(),
                     "finisher_amount": payload.amount,
                     "matched_at": now,
                 }
@@ -1013,38 +999,23 @@ pub async fn fill_bet_handler(
         )
         .session(&mut session)
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to update bet: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
-    tracing::debug!("✅ Bet updated to matched");
-
-    // 7. Create vote for finisher if not already voted
     if existing_vote.is_none() {
-        tracing::debug!("🔄 Auto-casting vote for finisher");
         let vote = Vote::new(
             bet.fixture_id.clone(),
             payload.finisher_id.clone(),
             payload.finisher_name.clone(),
             payload.finisher_selection.clone(),
         );
-
         votes_col
             .insert_one(&vote)
             .session(&mut session)
             .await
-            .map_err(|e| {
-                tracing::error!("❌ Failed to insert finisher vote: {}", e);
-                AppError::MongoDB(e)
-            })?;
+            .map_err(AppError::MongoDB)?;
 
-        // Get finisher's channels
         let finisher_channel_ids =
             get_user_channel_ids(&channels_col, &payload.finisher_id).await?;
-
-        // Update channel_fixtures for EACH of finisher's channels
-        // (finisher_increment_field validated up front, before the transaction)
         for channel_id in &finisher_channel_ids {
             upsert_channel_fixture(
                 &channel_fixtures_col,
@@ -1056,11 +1027,8 @@ pub async fn fill_bet_handler(
             )
             .await?;
         }
-    } else {
-        tracing::debug!("⏭️ Skipping auto-vote — finisher already voted (selection matches)");
     }
 
-    // Get BOTH starter and finisher channel IDs
     let starter_channel_ids = get_user_channel_ids(&channels_col, &bet.starter_id).await?;
     let finisher_channel_ids = get_user_channel_ids(&channels_col, &payload.finisher_id).await?;
     let all_channel_ids: HashSet<String> = starter_channel_ids
@@ -1068,12 +1036,6 @@ pub async fn fill_bet_handler(
         .chain(finisher_channel_ids.into_iter())
         .collect();
 
-    tracing::info!(
-        "📊 Updating bet_count for {} channels",
-        all_channel_ids.len()
-    );
-
-    // Update bet_count for ALL channels where either user is a member
     for channel_id in &all_channel_ids {
         upsert_channel_fixture(
             &channel_fixtures_col,
@@ -1086,15 +1048,8 @@ pub async fn fill_bet_handler(
         .await?;
     }
 
-    // Commit transaction
-    session.commit_transaction().await.map_err(|e| {
-        tracing::error!("❌ Failed to commit transaction: {}", e);
-        AppError::MongoDB(e)
-    })?;
+    session.commit_transaction().await.map_err(AppError::MongoDB)?;
 
-    // ============================================================
-    // ✅ SEND NOTIFICATIONS TO ALL CHANNEL MEMBERS
-    // ============================================================
     let match_payload = serde_json::json!({
         "bet_id": payload.bet_id,
         "fixture_id": bet.fixture_id,
@@ -1125,14 +1080,6 @@ pub async fn fill_bet_handler(
         .await;
     }
 
-    tracing::info!(
-        "✅ Bet filled: bet_id={}, finisher={}, fixture={}, channels_updated={}",
-        payload.bet_id,
-        payload.finisher_id,
-        bet.fixture_id,
-        all_channel_ids.len()
-    );
-
     Ok(Json(json!({
         "success": true,
         "message": "Bet filled successfully",
@@ -1144,7 +1091,7 @@ pub async fn fill_bet_handler(
 }
 
 // ============================================================================
-// 5. SETTLE BETS — Updates channel_fixtures status only
+// 5. SETTLE BETS (money) + vote scoring — draw refunds
 // ============================================================================
 pub async fn settle_bets_handler(
     State(state): State<AppState>,
@@ -1167,48 +1114,30 @@ pub async fn settle_bets_handler(
     let mut settled_count = 0;
     let mut refund_count = 0;
 
-    // Get all channels for this fixture
     let mut channel_cursor = channel_fixtures_col
         .find(doc! { "fixture_id": &payload.fixture_id })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find channel fixtures: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
     let mut all_channel_ids = HashSet::new();
     while let Some(cf) = channel_cursor.next().await {
-        let cf: ChannelFixture = cf.map_err(|e| {
-            tracing::error!("❌ Failed to deserialize channel fixture: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        let cf: ChannelFixture = cf.map_err(AppError::MongoDB)?;
         all_channel_ids.insert(cf.channel_id);
     }
 
-    // ========================================================================
-    // PART 1: SETTLE MATCHED BETS
-    // ========================================================================
+    // ---- matched bets ----
     let mut matched_cursor = bets_col
         .find(doc! {
             "fixture_id": &payload.fixture_id,
             "status": "matched",
         })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find matched bets: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
-    let mut settled_bets = Vec::new();
-    let mut refunded_bets = Vec::new();
+    let mut refunded_bets: Vec<(String, String)> = Vec::new();
 
     while let Some(bet) = matched_cursor.next().await {
-        let bet: Bet = bet.map_err(|e| {
-            tracing::error!("❌ Failed to deserialize bet: {}", e);
-            AppError::MongoDB(e)
-        })?;
-
-        tracing::debug!("🔄 Processing bet: {:?}", bet.id);
+        let bet: Bet = bet.map_err(AppError::MongoDB)?;
 
         let (starter_won, finisher_won) = match payload.result.as_str() {
             "home" => (
@@ -1227,25 +1156,14 @@ pub async fn settle_bets_handler(
         };
 
         let total_pot = bet.starter_amount + bet.finisher_amount.unwrap_or(0.0);
-
-        let mut session = state.client.start_session().await.map_err(|e| {
-            tracing::error!("❌ Failed to start session: {}", e);
-            AppError::MongoDB(e)
-        })?;
-        session.start_transaction().await.map_err(|e| {
-            tracing::error!("❌ Failed to start transaction: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        let mut session = state.client.start_session().await.map_err(AppError::MongoDB)?;
+        session.start_transaction().await.map_err(AppError::MongoDB)?;
 
         let bet_id = bet.id.ok_or(AppError::DocumentNotFound)?;
 
-        // CASE 1: STARTER WINS
         if starter_won && !finisher_won {
-            tracing::debug!("🏆 Starter wins");
-            let starter_oid = bson::oid::ObjectId::parse_str(&bet.starter_id).map_err(|e| {
-                tracing::error!("❌ Invalid starter_id: {}", e);
-                AppError::InvalidObjectId(e.to_string())
-            })?;
+            let starter_oid = bson::oid::ObjectId::parse_str(&bet.starter_id)
+                .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
 
             users_col
                 .update_one(
@@ -1254,52 +1172,26 @@ pub async fn settle_bets_handler(
                 )
                 .session(&mut session)
                 .await
-                .map_err(|e| {
-                    tracing::error!("❌ Failed to update starter balance: {}", e);
-                    AppError::MongoDB(e)
-                })?;
+                .map_err(AppError::MongoDB)?;
 
             bets_col
                 .update_one(
                     doc! { "_id": bet_id },
-                    doc! {
-                        "$set": {
-                            "status": "settled",
-                            "winner_id": &bet.starter_id,
-                            "starter_result": "won",
-                            "finisher_result": "lost",
-                            "settled_at": now,
-                        }
-                    },
+                    doc! { "$set": {
+                        "status": "settled",
+                        "winner_id": &bet.starter_id,
+                        "starter_result": "won",
+                        "finisher_result": "lost",
+                        "settled_at": now,
+                    }},
                 )
                 .session(&mut session)
                 .await
-                .map_err(|e| {
-                    tracing::error!("❌ Failed to update bet: {}", e);
-                    AppError::MongoDB(e)
-                })?;
-
-            settled_bets.push((
-                bet_id.to_hex(),
-                bet.starter_id.clone(),
-                total_pot,
-                "starter",
-            ));
-            tracing::info!(
-                "✅ Bet {}: Starter won {} (total pot)",
-                bet_id.to_hex(),
-                total_pot
-            );
-        }
-        // CASE 2: FINISHER WINS
-        else if finisher_won && !starter_won {
-            tracing::debug!("🏆 Finisher wins");
+                .map_err(AppError::MongoDB)?;
+        } else if finisher_won && !starter_won {
             if let Some(finisher_id) = &bet.finisher_id {
-                let finisher_oid = bson::oid::ObjectId::parse_str(finisher_id).map_err(|e| {
-                    tracing::error!("❌ Invalid finisher_id: {}", e);
-                    AppError::InvalidObjectId(e.to_string())
-                })?;
-
+                let finisher_oid = bson::oid::ObjectId::parse_str(finisher_id)
+                    .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
                 users_col
                     .update_one(
                         doc! { "_id": finisher_oid },
@@ -1307,51 +1199,27 @@ pub async fn settle_bets_handler(
                     )
                     .session(&mut session)
                     .await
-                    .map_err(|e| {
-                        tracing::error!("❌ Failed to update finisher balance: {}", e);
-                        AppError::MongoDB(e)
-                    })?;
+                    .map_err(AppError::MongoDB)?;
             }
 
             bets_col
                 .update_one(
                     doc! { "_id": bet_id },
-                    doc! {
-                        "$set": {
-                            "status": "settled",
-                            "winner_id": &bet.finisher_id,
-                            "starter_result": "lost",
-                            "finisher_result": "won",
-                            "settled_at": now,
-                        }
-                    },
+                    doc! { "$set": {
+                        "status": "settled",
+                        "winner_id": &bet.finisher_id,
+                        "starter_result": "lost",
+                        "finisher_result": "won",
+                        "settled_at": now,
+                    }},
                 )
                 .session(&mut session)
                 .await
-                .map_err(|e| {
-                    tracing::error!("❌ Failed to update bet: {}", e);
-                    AppError::MongoDB(e)
-                })?;
-
-            settled_bets.push((
-                bet_id.to_hex(),
-                bet.finisher_id.clone().unwrap_or_default(),
-                total_pot,
-                "finisher",
-            ));
-            tracing::info!(
-                "✅ Bet {}: Finisher won {} (total pot)",
-                bet_id.to_hex(),
-                total_pot
-            );
-        }
-        // CASE 3: DRAW / NO WINNER - REFUND BOTH
-        else {
-            tracing::debug!("🔄 Draw - refunding both");
-            let starter_oid = bson::oid::ObjectId::parse_str(&bet.starter_id).map_err(|e| {
-                tracing::error!("❌ Invalid starter_id: {}", e);
-                AppError::InvalidObjectId(e.to_string())
-            })?;
+                .map_err(AppError::MongoDB)?;
+        } else {
+            // Draw / no winner -> refund both.
+            let starter_oid = bson::oid::ObjectId::parse_str(&bet.starter_id)
+                .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
             users_col
                 .update_one(
                     doc! { "_id": starter_oid },
@@ -1359,16 +1227,11 @@ pub async fn settle_bets_handler(
                 )
                 .session(&mut session)
                 .await
-                .map_err(|e| {
-                    tracing::error!("❌ Failed to refund starter: {}", e);
-                    AppError::MongoDB(e)
-                })?;
+                .map_err(AppError::MongoDB)?;
 
             if let Some(finisher_id) = &bet.finisher_id {
-                let finisher_oid = bson::oid::ObjectId::parse_str(finisher_id).map_err(|e| {
-                    tracing::error!("❌ Invalid finisher_id: {}", e);
-                    AppError::InvalidObjectId(e.to_string())
-                })?;
+                let finisher_oid = bson::oid::ObjectId::parse_str(finisher_id)
+                    .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
                 users_col
                     .update_one(
                         doc! { "_id": finisher_oid },
@@ -1376,79 +1239,49 @@ pub async fn settle_bets_handler(
                     )
                     .session(&mut session)
                     .await
-                    .map_err(|e| {
-                        tracing::error!("❌ Failed to refund finisher: {}", e);
-                        AppError::MongoDB(e)
-                    })?;
+                    .map_err(AppError::MongoDB)?;
             }
 
             bets_col
                 .update_one(
                     doc! { "_id": bet_id },
-                    doc! {
-                        "$set": {
-                            "status": "refunded",
-                            "starter_result": "draw",
-                            "finisher_result": "draw",
-                            "settled_at": now,
-                        }
-                    },
+                    doc! { "$set": {
+                        "status": "refunded",
+                        "starter_result": "draw",
+                        "finisher_result": "draw",
+                        "settled_at": now,
+                    }},
                 )
                 .session(&mut session)
                 .await
-                .map_err(|e| {
-                    tracing::error!("❌ Failed to update bet: {}", e);
-                    AppError::MongoDB(e)
-                })?;
+                .map_err(AppError::MongoDB)?;
 
             refunded_bets.push((bet_id.to_hex(), bet.starter_id.clone()));
-            tracing::info!("🔄 Bet {}: Draw - refunded both parties", bet_id.to_hex());
         }
 
-        session.commit_transaction().await.map_err(|e| {
-            tracing::error!("❌ Failed to commit transaction: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        session.commit_transaction().await.map_err(AppError::MongoDB)?;
         settled_count += 1;
     }
 
-    // ========================================================================
-    // PART 2: REFUND UNMATCHED BETS
-    // ========================================================================
+    // ---- unmatched bets ----
     let mut open_cursor = bets_col
         .find(doc! {
             "fixture_id": &payload.fixture_id,
             "status": "open",
         })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find open bets: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
     while let Some(bet) = open_cursor.next().await {
-        let bet: Bet = bet.map_err(|e| {
-            tracing::error!("❌ Failed to deserialize bet: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        let bet: Bet = bet.map_err(AppError::MongoDB)?;
 
-        tracing::debug!("🔄 Refunding unmatched bet: {:?}", bet.id);
-
-        let mut session = state.client.start_session().await.map_err(|e| {
-            tracing::error!("❌ Failed to start session: {}", e);
-            AppError::MongoDB(e)
-        })?;
-        session.start_transaction().await.map_err(|e| {
-            tracing::error!("❌ Failed to start transaction: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        let mut session = state.client.start_session().await.map_err(AppError::MongoDB)?;
+        session.start_transaction().await.map_err(AppError::MongoDB)?;
 
         let bet_id = bet.id.ok_or(AppError::DocumentNotFound)?;
 
-        let starter_oid = bson::oid::ObjectId::parse_str(&bet.starter_id).map_err(|e| {
-            tracing::error!("❌ Invalid starter_id: {}", e);
-            AppError::InvalidObjectId(e.to_string())
-        })?;
+        let starter_oid = bson::oid::ObjectId::parse_str(&bet.starter_id)
+            .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
         users_col
             .update_one(
                 doc! { "_id": starter_oid },
@@ -1456,73 +1289,49 @@ pub async fn settle_bets_handler(
             )
             .session(&mut session)
             .await
-            .map_err(|e| {
-                tracing::error!("❌ Failed to refund starter: {}", e);
-                AppError::MongoDB(e)
-            })?;
+            .map_err(AppError::MongoDB)?;
 
         bets_col
             .update_one(
                 doc! { "_id": bet_id },
-                doc! {
-                    "$set": {
-                        "status": "refunded",
-                        "starter_result": "unmatched",
-                        "settled_at": now,
-                    }
-                },
+                doc! { "$set": {
+                    "status": "refunded",
+                    "starter_result": "unmatched",
+                    "settled_at": now,
+                }},
             )
             .session(&mut session)
             .await
-            .map_err(|e| {
-                tracing::error!("❌ Failed to update bet: {}", e);
-                AppError::MongoDB(e)
-            })?;
+            .map_err(AppError::MongoDB)?;
 
-        session.commit_transaction().await.map_err(|e| {
-            tracing::error!("❌ Failed to commit transaction: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        session.commit_transaction().await.map_err(AppError::MongoDB)?;
         refund_count += 1;
 
         refunded_bets.push((bet_id.to_hex(), bet.starter_id.clone()));
-        tracing::info!("🔄 Bet {}: Unmatched - refunded starter", bet_id.to_hex());
     }
 
-    // ========================================================================
-    // PART 3: UPDATE FIXTURE STATUS
-    // ========================================================================
-   games_col
-    .update_one(
-        doc! { "matchId": &payload.fixture_id },
-        doc! {
-            "$set": {
+    // ---- mark fixture / game completed ----
+    games_col
+        .update_one(
+            doc! { "matchId": &payload.fixture_id },
+            doc! { "$set": {
                 "status": "completed",
                 "result": &payload.result,
                 "settled_at": now,
-            }
-        },
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!("❌ Failed to update game: {}", e);
-        AppError::MongoDB(e)
-    })?;
-    // Update ALL channel_fixtures with this fixture_id
+            }},
+        )
+        .await
+        .map_err(AppError::MongoDB)?;
+
     channel_fixtures_col
         .update_many(
             doc! { "fixture_id": &payload.fixture_id },
             doc! { "$set": { "status": "completed" } },
         )
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to update channel_fixtures: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
-    // ========================================================================
-    // PART 4: MARK VOTES CORRECT/INCORRECT (winner +3, loser -3, no draw case)
-    // ========================================================================
+    // ---- mark votes correct/incorrect ----
     votes_col
         .update_many(
             doc! {
@@ -1533,10 +1342,7 @@ pub async fn settle_bets_handler(
             doc! { "$set": { "is_correct": true, "points_awarded": 3 } },
         )
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to mark correct votes: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
     votes_col
         .update_many(
@@ -1548,21 +1354,13 @@ pub async fn settle_bets_handler(
             doc! { "$set": { "is_correct": false, "points_awarded": -3 } },
         )
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to mark incorrect votes: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
-    // ========================================================================
-    // PART 5: UPDATE CHANNEL MEMBERS (winner +3, loser -3)
-    // ========================================================================
+    // ---- award/deduct season points on channels + users ----
     let mut correct_cursor = votes_col
         .find(doc! { "fixture_id": &payload.fixture_id, "is_correct": true })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find correct votes: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
     let mut correct_ids: Vec<String> = Vec::new();
     while let Some(v) = correct_cursor.next().await {
         if let Ok(v) = v {
@@ -1573,10 +1371,7 @@ pub async fn settle_bets_handler(
     let mut incorrect_cursor = votes_col
         .find(doc! { "fixture_id": &payload.fixture_id, "is_correct": false })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find incorrect votes: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
     let mut incorrect_ids: Vec<String> = Vec::new();
     while let Some(v) = incorrect_cursor.next().await {
         if let Ok(v) = v {
@@ -1585,7 +1380,6 @@ pub async fn settle_bets_handler(
     }
 
     if !correct_ids.is_empty() {
-        tracing::debug!("✅ Awarding +3 to {} correct voters", correct_ids.len());
         channels_col
             .update_many(
                 doc! { "members.user_id": { "$in": &correct_ids } },
@@ -1597,17 +1391,8 @@ pub async fn settle_bets_handler(
             )
             .array_filters(vec![doc! { "m.user_id": { "$in": &correct_ids } }])
             .await
-            .map_err(|e| {
-                tracing::error!("❌ Failed to update correct voters: {}", e);
-                AppError::MongoDB(e)
-            })?;
+            .map_err(AppError::MongoDB)?;
 
-        // ✅ Mirror the exact same +3/+1/+1 onto the canonical "users"
-        // collection. Previously this only ever landed on the channels
-        // collection — users.season_points/correct_votes/total_votes never
-        // moved here, so they'd silently drift out of sync with what
-        // channel leaderboards showed until some unrelated code path
-        // (e.g. finalize_fixture_result_handler) happened to resync them.
         let correct_oids: Vec<bson::oid::ObjectId> = correct_ids
             .iter()
             .filter_map(|id| bson::oid::ObjectId::parse_str(id).ok())
@@ -1623,15 +1408,11 @@ pub async fn settle_bets_handler(
                     }},
                 )
                 .await
-                .map_err(|e| {
-                    tracing::error!("❌ Failed to sync correct voters to users collection: {}", e);
-                    AppError::MongoDB(e)
-                })?;
+                .map_err(AppError::MongoDB)?;
         }
     }
 
     if !incorrect_ids.is_empty() {
-        tracing::debug!("✅ Deducting 3 from {} incorrect voters", incorrect_ids.len());
         channels_col
             .update_many(
                 doc! { "members.user_id": { "$in": &incorrect_ids } },
@@ -1642,13 +1423,8 @@ pub async fn settle_bets_handler(
             )
             .array_filters(vec![doc! { "m.user_id": { "$in": &incorrect_ids } }])
             .await
-            .map_err(|e| {
-                tracing::error!("❌ Failed to update incorrect voters: {}", e);
-                AppError::MongoDB(e)
-            })?;
+            .map_err(AppError::MongoDB)?;
 
-        // ✅ Same mirror for incorrect voters — the users collection was
-        // never getting the -3/+1 either.
         let incorrect_oids: Vec<bson::oid::ObjectId> = incorrect_ids
             .iter()
             .filter_map(|id| bson::oid::ObjectId::parse_str(id).ok())
@@ -1663,16 +1439,10 @@ pub async fn settle_bets_handler(
                     }},
                 )
                 .await
-                .map_err(|e| {
-                    tracing::error!("❌ Failed to sync incorrect voters to users collection: {}", e);
-                    AppError::MongoDB(e)
-                })?;
+                .map_err(AppError::MongoDB)?;
         }
     }
 
-    // ============================================================
-    // ✅ SEND SETTLEMENT NOTIFICATIONS TO ALL CHANNEL MEMBERS
-    // ============================================================
     let result_payload = serde_json::json!({
         "fixture_id": payload.fixture_id,
         "result": payload.result,
@@ -1699,14 +1469,6 @@ pub async fn settle_bets_handler(
         .await;
     }
 
-    tracing::info!(
-        "✅ Settlement complete: {} settled, {} refunded, {} correct (+3 each), {} incorrect (-3 each)",
-        settled_count,
-        refund_count,
-        correct_ids.len(),
-        incorrect_ids.len()
-    );
-
     Ok(Json(json!({
         "success": true,
         "message": format!("Settled {} bets, refunded {} unmatched bets", settled_count, refund_count),
@@ -1718,7 +1480,7 @@ pub async fn settle_bets_handler(
 }
 
 // ============================================================================
-// 6. GET FIXTURE VOTERS (from votes collection)
+// 6. GET FIXTURE VOTERS
 // ============================================================================
 pub async fn get_fixture_voters_handler(
     State(state): State<AppState>,
@@ -1726,22 +1488,14 @@ pub async fn get_fixture_voters_handler(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let votes_col: Collection<Vote> = state.db.collection("votes");
 
-    tracing::debug!("📊 Getting voters for fixture: {}", fixture_id);
-
     let mut cursor = votes_col
         .find(doc! { "fixture_id": &fixture_id })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find voters: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
     let mut voters = Vec::new();
     while let Some(vote) = cursor.next().await {
-        let vote: Vote = vote.map_err(|e| {
-            tracing::error!("❌ Failed to deserialize vote: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        let vote: Vote = vote.map_err(AppError::MongoDB)?;
         voters.push(json!({
             "user_id": vote.user_id,
             "user_name": vote.user_name,
@@ -1751,8 +1505,6 @@ pub async fn get_fixture_voters_handler(
             "points_awarded": vote.points_awarded,
         }));
     }
-
-    tracing::debug!("✅ Found {} voters", voters.len());
 
     Ok(Json(json!({
         "success": true,
@@ -1771,22 +1523,14 @@ pub async fn get_user_votes_handler(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let votes_col: Collection<Vote> = state.db.collection("votes");
 
-    tracing::debug!("📊 Getting votes for user: {}", user_id);
-
     let mut cursor = votes_col
         .find(doc! { "user_id": &user_id })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find user votes: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
     let mut votes = Vec::new();
     while let Some(vote) = cursor.next().await {
-        let vote: Vote = vote.map_err(|e| {
-            tracing::error!("❌ Failed to deserialize vote: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        let vote: Vote = vote.map_err(AppError::MongoDB)?;
         votes.push(json!({
             "fixture_id": vote.fixture_id,
             "selection": vote.selection,
@@ -1795,8 +1539,6 @@ pub async fn get_user_votes_handler(
             "points_awarded": vote.points_awarded,
         }));
     }
-
-    tracing::debug!("✅ Found {} votes for user", votes.len());
 
     Ok(Json(json!({
         "success": true,
@@ -1815,18 +1557,13 @@ pub async fn check_user_vote_handler(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let votes_col: Collection<Vote> = state.db.collection("votes");
 
-    tracing::debug!("🔍 Checking vote: fixture={}, user={}", fixture_id, user_id);
-
     let vote = votes_col
         .find_one(doc! {
             "fixture_id": &fixture_id,
             "user_id": &user_id,
         })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to check vote: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
     Ok(Json(json!({
         "success": true,
@@ -1846,26 +1583,14 @@ pub async fn get_channel_vote_count_handler(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
 
-    tracing::debug!(
-        "📊 Getting channel vote count: channel={}, fixture={}",
-        channel_id,
-        fixture_id
-    );
-
     let cf = channel_fixtures_col
         .find_one(doc! {
             "channel_id": &channel_id,
             "fixture_id": &fixture_id,
         })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find channel_fixture: {}", e);
-            AppError::MongoDB(e)
-        })?
-        .ok_or_else(|| {
-            tracing::warn!("⚠️ Channel fixture not found");
-            AppError::DocumentNotFound
-        })?;
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
 
     let total_votes = cf.vote_counts.home + cf.vote_counts.away + cf.vote_counts.draw;
 
@@ -1883,7 +1608,7 @@ pub async fn get_channel_vote_count_handler(
 }
 
 // ============================================================================
-// 10. GET VOTE BREAKDOWN (from votes collection)
+// 10. GET VOTE BREAKDOWN
 // ============================================================================
 pub async fn get_vote_breakdown_handler(
     State(state): State<AppState>,
@@ -1891,27 +1616,16 @@ pub async fn get_vote_breakdown_handler(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let votes_col: Collection<Vote> = state.db.collection("votes");
 
-    tracing::debug!("📊 Getting vote breakdown for fixture: {}", fixture_id);
-
     let pipeline = vec![
         doc! { "$match": { "fixture_id": &fixture_id } },
-        doc! { "$group": {
-            "_id": "$selection",
-            "count": { "$sum": 1 }
-        }},
+        doc! { "$group": { "_id": "$selection", "count": { "$sum": 1 } } },
     ];
 
-    let mut cursor = votes_col.aggregate(pipeline).await.map_err(|e| {
-        tracing::error!("❌ Failed to aggregate votes: {}", e);
-        AppError::MongoDB(e)
-    })?;
+    let mut cursor = votes_col.aggregate(pipeline).await.map_err(AppError::MongoDB)?;
 
     let mut breakdown = serde_json::Map::new();
     while let Some(doc) = cursor.next().await {
-        let doc = doc.map_err(|e| {
-            tracing::error!("❌ Failed to deserialize aggregation: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        let doc = doc.map_err(AppError::MongoDB)?;
         if let (Some(selection), Some(count)) = (
             doc.get("_id").and_then(|v| v.as_str()),
             doc.get("count").and_then(|v| v.as_i64()),
@@ -1927,11 +1641,7 @@ pub async fn get_vote_breakdown_handler(
     Ok(Json(json!({
         "success": true,
         "fixture_id": fixture_id,
-        "breakdown": {
-            "home": home,
-            "away": away,
-            "draw": draw,
-        },
+        "breakdown": { "home": home, "away": away, "draw": draw },
         "total": home + away + draw,
     })))
 }
@@ -1946,40 +1656,22 @@ pub async fn get_channel_votes_handler(
     let votes_col: Collection<Vote> = state.db.collection("votes");
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    tracing::debug!(
-        "📊 Getting channel votes: channel={}, fixture={}",
-        channel_id,
-        fixture_id
-    );
-
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find channel: {}", e);
-            AppError::MongoDB(e)
-        })?
-        .ok_or_else(|| {
-            tracing::warn!("⚠️ Channel not found: {}", channel_id);
-            AppError::DocumentNotFound
-        })?;
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
 
     let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
 
     let mut cursor = votes_col
         .find(doc! { "fixture_id": &fixture_id })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find votes: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
     let mut channel_votes = Vec::new();
     while let Some(vote) = cursor.next().await {
-        let vote: Vote = vote.map_err(|e| {
-            tracing::error!("❌ Failed to deserialize vote: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        let vote: Vote = vote.map_err(AppError::MongoDB)?;
         if member_ids.contains(&vote.user_id) {
             channel_votes.push(json!({
                 "user_id": vote.user_id,
@@ -2014,43 +1706,22 @@ pub async fn get_channel_pledges_handler(
     let bets_col: Collection<Bet> = state.db.collection("bets");
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    tracing::debug!(
-        "📊 Getting channel pledges: channel={}, fixture={}",
-        channel_id,
-        fixture_id
-    );
-
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find channel: {}", e);
-            AppError::MongoDB(e)
-        })?
-        .ok_or_else(|| {
-            tracing::warn!("⚠️ Channel not found: {}", channel_id);
-            AppError::DocumentNotFound
-        })?;
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
 
     let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
 
     let mut cursor = bets_col
-        .find(doc! {
-            "fixture_id": &fixture_id,
-            "status": "open",
-        })
+        .find(doc! { "fixture_id": &fixture_id, "status": "open" })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find open bets: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
     let mut open_bets = Vec::new();
     while let Some(bet) = cursor.next().await {
-        let bet: Bet = bet.map_err(|e| {
-            tracing::error!("❌ Failed to deserialize bet: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        let bet: Bet = bet.map_err(AppError::MongoDB)?;
         if member_ids.contains(&bet.starter_id) {
             open_bets.push(json!({
                 "id": bet.id.map(|oid| oid.to_hex()),
@@ -2074,7 +1745,7 @@ pub async fn get_channel_pledges_handler(
 }
 
 // ============================================================================
-// 13. GET CHANNEL BETTORS (Matched bets)
+// 13. GET CHANNEL BETTORS (matched + settled)
 // ============================================================================
 pub async fn get_channel_bettors_handler(
     State(state): State<AppState>,
@@ -2083,23 +1754,11 @@ pub async fn get_channel_bettors_handler(
     let bets_col: Collection<Bet> = state.db.collection("bets");
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    tracing::debug!(
-        "📊 Getting channel bettors: channel={}, fixture={}",
-        channel_id,
-        fixture_id
-    );
-
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find channel: {}", e);
-            AppError::MongoDB(e)
-        })?
-        .ok_or_else(|| {
-            tracing::warn!("⚠️ Channel not found: {}", channel_id);
-            AppError::DocumentNotFound
-        })?;
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
 
     let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
 
@@ -2109,17 +1768,11 @@ pub async fn get_channel_bettors_handler(
             "status": { "$in": vec!["matched", "settled"] },
         })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find matched bets: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
     let mut matched_bets = Vec::new();
     while let Some(bet) = cursor.next().await {
-        let bet: Bet = bet.map_err(|e| {
-            tracing::error!("❌ Failed to deserialize bet: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        let bet: Bet = bet.map_err(AppError::MongoDB)?;
         if let Some(finisher_id) = &bet.finisher_id {
             if member_ids.contains(&bet.starter_id) && member_ids.contains(finisher_id) {
                 matched_bets.push(json!({
@@ -2159,19 +1812,11 @@ pub async fn get_channel_members_handler(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let channels_col: Collection<Channel> = state.db.collection("channels");
 
-    tracing::debug!("📊 Getting channel members: channel={}", channel_id);
-
     let channel = channels_col
         .find_one(doc! { "channel_id": &channel_id })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find channel: {}", e);
-            AppError::MongoDB(e)
-        })?
-        .ok_or_else(|| {
-            tracing::warn!("⚠️ Channel not found: {}", channel_id);
-            AppError::DocumentNotFound
-        })?;
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
 
     let member_ids: Vec<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
 
@@ -2192,8 +1837,6 @@ pub async fn get_user_bets_handler(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let bets_col: Collection<Bet> = state.db.collection("bets");
 
-    tracing::debug!("📊 Getting bets for user: {}", user_id);
-
     let mut cursor = bets_col
         .find(doc! {
             "$or": [
@@ -2203,17 +1846,11 @@ pub async fn get_user_bets_handler(
         })
         .sort(doc! { "created_at": -1 })
         .await
-        .map_err(|e| {
-            tracing::error!("❌ Failed to find user bets: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        .map_err(AppError::MongoDB)?;
 
     let mut bets = Vec::new();
     while let Some(bet) = cursor.next().await {
-        let bet: Bet = bet.map_err(|e| {
-            tracing::error!("❌ Failed to deserialize bet: {}", e);
-            AppError::MongoDB(e)
-        })?;
+        let bet: Bet = bet.map_err(AppError::MongoDB)?;
         bets.push(json!({
             "id": bet.id.map(|oid| oid.to_hex()),
             "fixture_id": bet.fixture_id,
@@ -2237,12 +1874,742 @@ pub async fn get_user_bets_handler(
         }));
     }
 
-    tracing::debug!("✅ Found {} bets for user", bets.len());
-
     Ok(Json(json!({
         "success": true,
         "user_id": user_id,
         "bets": bets,
         "count": bets.len(),
+    })))
+}
+
+// ============================================================================
+// 16. CREATE POKE (points) — atomic with auto-vote, no draw
+// ============================================================================
+pub async fn create_poke_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<CreatePokeRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let votes_col: Collection<Vote> = state.db.collection("votes");
+    let pokes_col: Collection<Poke> = state.db.collection("pokes");
+    let users_doc_col: Collection<Document> = state.db.collection("users");
+    let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    tracing::info!(
+        "👉 CREATE_POKE: fixture='{}', market='{:?}', starter='{}', selection='{}', stake={}",
+        payload.fixture_id,
+        payload.market_id,
+        payload.starter_id,
+        payload.starter_selection,
+        payload.stake
+    );
+
+    if payload.stake <= 0 {
+        return Err(AppError::ValidationError(
+            "Stake must be greater than 0".to_string(),
+        ));
+    }
+
+    // Validate target + selection (no draw, market open if sub-fixture).
+    let target = load_poke_target(&state, &payload.fixture_id, &payload.market_id, true).await?;
+    check_selection(&payload.starter_selection, &target.options)?;
+
+    let starter_oid = bson::oid::ObjectId::parse_str(&payload.starter_id)
+        .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+
+    let poke = Poke::new_open(
+        payload.fixture_id.clone(),
+        target.market_id.clone(),
+        payload.starter_id.clone(),
+        payload.starter_name.clone(),
+        payload.starter_selection.clone(),
+        payload.stake,
+    );
+    let vote_key = poke.vote_key();
+
+    let existing_vote = votes_col
+        .find_one(doc! { "fixture_id": &vote_key, "user_id": &payload.starter_id })
+        .await
+        .map_err(AppError::MongoDB)?;
+    let needs_auto_vote = check_vote_matches(&existing_vote, &payload.starter_selection)?;
+
+    let channel_ids = get_user_channel_ids(&channels_col, &payload.starter_id).await?;
+
+    let mut session = state.client.start_session().await.map_err(AppError::MongoDB)?;
+    session.start_transaction().await.map_err(AppError::MongoDB)?;
+
+    let user = users_doc_col
+        .find_one(doc! { "_id": starter_oid })
+        .session(&mut session)
+        .await
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
+    let points = read_points(&user);
+
+    if points < MIN_POKE_POINTS as i64 {
+        return Err(AppError::ValidationError(format!(
+            "You need at least {} points to poke. You have {}",
+            MIN_POKE_POINTS, points
+        )));
+    }
+    if points < payload.stake as i64 {
+        return Err(AppError::ValidationError(format!(
+            "Insufficient points. You have {}, need {}",
+            points, payload.stake
+        )));
+    }
+
+    if needs_auto_vote {
+        let vote = Vote::new(
+            vote_key.clone(),
+            payload.starter_id.clone(),
+            payload.starter_name.clone(),
+            payload.starter_selection.clone(),
+        );
+        votes_col
+            .insert_one(&vote)
+            .session(&mut session)
+            .await
+            .map_err(AppError::MongoDB)?;
+    }
+
+    reserve_points(
+        &users_doc_col,
+        &channels_col,
+        starter_oid,
+        &payload.starter_id,
+        payload.stake,
+        &mut session,
+    )
+    .await?;
+
+    let insert_result = pokes_col
+        .insert_one(&poke)
+        .session(&mut session)
+        .await
+        .map_err(AppError::MongoDB)?;
+
+    let poke_id = insert_result
+        .inserted_id
+        .as_object_id()
+        .map(|oid| oid.to_hex())
+        .ok_or_else(|| AppError::InternalServerError("Failed to get poke ID".to_string()))?;
+
+    session.commit_transaction().await.map_err(AppError::MongoDB)?;
+
+    // Counter updates post-commit (best-effort).
+    let main_vote_field = if target.market_id.is_none() {
+        vote_count_field(&payload.starter_selection)
+    } else {
+        None
+    };
+
+    for channel_id in &channel_ids {
+        if needs_auto_vote {
+            if let Some(field) = main_vote_field {
+                if let Err(e) = upsert_channel_fixture(
+                    &channel_fixtures_col,
+                    channel_id,
+                    &payload.fixture_id,
+                    Some(field),
+                    1,
+                    "active",
+                )
+                .await
+                {
+                    tracing::warn!("⚠️ vote_counts update failed for '{}': {:?}", channel_id, e);
+                }
+            }
+        }
+        if let Err(e) = upsert_channel_fixture(
+            &channel_fixtures_col,
+            channel_id,
+            &payload.fixture_id,
+            Some("poke_count"),
+            1,
+            "active",
+        )
+        .await
+        {
+            tracing::warn!("⚠️ poke_count update failed for '{}': {:?}", channel_id, e);
+        }
+    }
+
+    let poke_payload = json!({
+        "poke_id": poke_id,
+        "fixture_id": payload.fixture_id,
+        "market_id": target.market_id,
+        "user_id": payload.starter_id,
+        "username": payload.starter_name,
+        "selection": payload.starter_selection,
+        "stake": payload.stake,
+    });
+
+    let target_label = if target.market_id.is_some() {
+        "a sub-fixture"
+    } else {
+        "the match"
+    };
+
+    for channel_id in &channel_ids {
+        let _ = notify_channel_members(
+            &state,
+            &payload.starter_id,
+            channel_id,
+            &payload.fixture_id,
+            "poke.create",
+            "👉 New Poke",
+            &format!(
+                "{} poked {} points on {}",
+                payload.starter_name, payload.stake, target_label
+            ),
+            poke_payload.clone(),
+        )
+        .await;
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Poke created successfully",
+        "poke_id": poke_id,
+        "market_id": target.market_id,
+        "status": "open",
+        "stake": payload.stake,
+        "new_points": points - payload.stake as i64,
+        "auto_voted": needs_auto_vote,
+        "channels_updated": channel_ids.len(),
+    })))
+}
+
+// ============================================================================
+// 17. FILL POKE (points) — equal stake, different side, shared channel
+// ============================================================================
+pub async fn fill_poke_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<FillPokeRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let votes_col: Collection<Vote> = state.db.collection("votes");
+    let pokes_col: Collection<Poke> = state.db.collection("pokes");
+    let users_doc_col: Collection<Document> = state.db.collection("users");
+    let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+    let now = BsonDateTime::now();
+
+    let finisher_oid = bson::oid::ObjectId::parse_str(&payload.finisher_id)
+        .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+    let poke_oid = bson::oid::ObjectId::parse_str(&payload.poke_id)
+        .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+
+    let mut session = state.client.start_session().await.map_err(AppError::MongoDB)?;
+    session.start_transaction().await.map_err(AppError::MongoDB)?;
+
+    // 1. Poke must be OPEN.
+    let poke = pokes_col
+        .find_one(doc! { "_id": poke_oid, "status": "open" })
+        .session(&mut session)
+        .await
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::ValidationError(
+            "Poke not found or already filled".to_string(),
+        ))?;
+
+    // 2. Target still valid + selection allowed (no draw).
+    let target = load_poke_target(&state, &poke.fixture_id, &poke.market_id, true).await?;
+    check_selection(&payload.finisher_selection, &target.options)?;
+
+    // 3. Own poke / same side.
+    if poke.starter_id == payload.finisher_id {
+        return Err(AppError::ValidationError(
+            "Cannot fill your own poke".to_string(),
+        ));
+    }
+    if poke.starter_selection == payload.finisher_selection {
+        return Err(AppError::ValidationError(
+            "You must pick a different outcome from the poke starter".to_string(),
+        ));
+    }
+
+    // 4. Must share a channel with the starter.
+    let starter_channels = get_user_channel_ids(&channels_col, &poke.starter_id).await?;
+    let finisher_channels = get_user_channel_ids(&channels_col, &payload.finisher_id).await?;
+    let finisher_set: HashSet<&String> = finisher_channels.iter().collect();
+    let shared_channels: Vec<String> = starter_channels
+        .iter()
+        .filter(|c| finisher_set.contains(c))
+        .cloned()
+        .collect();
+    if shared_channels.is_empty() {
+        return Err(AppError::ValidationError(
+            "You can only fill pokes from members of your channels".to_string(),
+        ));
+    }
+
+    // 5. Points check.
+    let finisher = users_doc_col
+        .find_one(doc! { "_id": finisher_oid })
+        .session(&mut session)
+        .await
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
+    let points = read_points(&finisher);
+
+    if points < MIN_POKE_POINTS as i64 {
+        return Err(AppError::ValidationError(format!(
+            "You need at least {} points to poke. You have {}",
+            MIN_POKE_POINTS, points
+        )));
+    }
+    if points < poke.stake as i64 {
+        return Err(AppError::ValidationError(format!(
+            "Insufficient points. You have {}, need {}",
+            points, poke.stake
+        )));
+    }
+
+    // 6. Vote consistency.
+    let vote_key = poke.vote_key();
+    let existing_vote = votes_col
+        .find_one(doc! { "fixture_id": &vote_key, "user_id": &payload.finisher_id })
+        .session(&mut session)
+        .await
+        .map_err(AppError::MongoDB)?;
+    let needs_auto_vote = check_vote_matches(&existing_vote, &payload.finisher_selection)?;
+
+    // 7. Reserve points (atomic $gte guard).
+    reserve_points(
+        &users_doc_col,
+        &channels_col,
+        finisher_oid,
+        &payload.finisher_id,
+        poke.stake,
+        &mut session,
+    )
+    .await?;
+
+    // 8. open -> matched (status filter blocks double fill).
+    let upd = pokes_col
+        .update_one(
+            doc! { "_id": poke_oid, "status": "open" },
+            doc! { "$set": {
+                "status": "matched",
+                "finisher_id": &payload.finisher_id,
+                "finisher_name": &payload.finisher_name,
+                "finisher_selection": &payload.finisher_selection,
+                "matched_at": now,
+            }},
+        )
+        .session(&mut session)
+        .await
+        .map_err(AppError::MongoDB)?;
+    if upd.matched_count == 0 {
+        return Err(AppError::ValidationError("Poke already filled".to_string()));
+    }
+
+    // 9. Auto-vote.
+    if needs_auto_vote {
+        let vote = Vote::new(
+            vote_key.clone(),
+            payload.finisher_id.clone(),
+            payload.finisher_name.clone(),
+            payload.finisher_selection.clone(),
+        );
+        votes_col
+            .insert_one(&vote)
+            .session(&mut session)
+            .await
+            .map_err(AppError::MongoDB)?;
+    }
+
+    session.commit_transaction().await.map_err(AppError::MongoDB)?;
+
+    // vote_counts only exist for main-match votes.
+    if needs_auto_vote && poke.market_id.is_none() {
+        if let Some(field) = vote_count_field(&payload.finisher_selection) {
+            for channel_id in &finisher_channels {
+                if let Err(e) = upsert_channel_fixture(
+                    &channel_fixtures_col,
+                    channel_id,
+                    &poke.fixture_id,
+                    Some(field),
+                    1,
+                    "active",
+                )
+                .await
+                {
+                    tracing::warn!("⚠️ vote_counts update failed for '{}': {:?}", channel_id, e);
+                }
+            }
+        }
+    }
+
+    let match_payload = json!({
+        "poke_id": payload.poke_id,
+        "fixture_id": poke.fixture_id,
+        "market_id": poke.market_id,
+        "starter_id": poke.starter_id,
+        "starter_name": poke.starter_name,
+        "starter_selection": poke.starter_selection,
+        "finisher_id": payload.finisher_id,
+        "finisher_name": payload.finisher_name,
+        "finisher_selection": payload.finisher_selection,
+        "stake": poke.stake,
+        "total_pot": poke.stake * 2,
+    });
+
+    for channel_id in &shared_channels {
+        let _ = notify_channel_members(
+            &state,
+            &payload.finisher_id,
+            channel_id,
+            &poke.fixture_id,
+            "poke.matched",
+            "🤝 Poke Matched",
+            &format!(
+                "{} matched {}'s poke",
+                payload.finisher_name, poke.starter_name
+            ),
+            match_payload.clone(),
+        )
+        .await;
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Poke filled successfully",
+        "poke_id": payload.poke_id,
+        "status": "matched",
+        "stake": poke.stake,
+        "total_pot": poke.stake * 2,
+        "new_points": points - poke.stake as i64,
+        "auto_voted": needs_auto_vote,
+    })))
+}
+
+// ============================================================================
+// 18. SETTLE POKES — exactly-once per poke, per-poke transaction
+// ============================================================================
+
+/// `winner`: winning selection, or `None` to refund both sides (draw / no winner).
+async fn settle_one_matched_poke(
+    state: &AppState,
+    poke: &Poke,
+    winner: Option<&str>,
+) -> Result<&'static str, AppError> {
+    let pokes_col: Collection<Poke> = state.db.collection("pokes");
+    let users_doc_col: Collection<Document> = state.db.collection("users");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+    let now = BsonDateTime::now();
+
+    let poke_oid = poke.id.ok_or(AppError::DocumentNotFound)?;
+    let finisher_id = poke.finisher_id.clone().ok_or(AppError::DocumentNotFound)?;
+    let starter_won = winner == Some(poke.starter_selection.as_str());
+    let finisher_won = winner.is_some() && winner == poke.finisher_selection.as_deref();
+    let pot = poke.stake * 2;
+
+    let mut session = state.client.start_session().await.map_err(AppError::MongoDB)?;
+    session.start_transaction().await.map_err(AppError::MongoDB)?;
+
+    let (update_doc, outcome) = if starter_won {
+        (doc! { "$set": {
+            "status": "settled",
+            "winner_id": &poke.starter_id,
+            "starter_result": "won",
+            "finisher_result": "lost",
+            "settled_at": now,
+        }}, "settled")
+    } else if finisher_won {
+        (doc! { "$set": {
+            "status": "settled",
+            "winner_id": &finisher_id,
+            "starter_result": "lost",
+            "finisher_result": "won",
+            "settled_at": now,
+        }}, "settled")
+    } else {
+        (doc! { "$set": {
+            "status": "refunded",
+            "starter_result": "refunded",
+            "finisher_result": "refunded",
+            "settled_at": now,
+        }}, "refunded")
+    };
+
+    // Only flips if still "matched" => can never pay out twice.
+    let upd = pokes_col
+        .update_one(doc! { "_id": poke_oid, "status": "matched" }, update_doc)
+        .session(&mut session)
+        .await
+        .map_err(AppError::MongoDB)?;
+    if upd.matched_count == 0 {
+        return Ok("skipped");
+    }
+
+    if outcome == "settled" {
+        let winner_id = if starter_won { &poke.starter_id } else { &finisher_id };
+        credit_points(&users_doc_col, &channels_col, winner_id, pot, &mut session).await?;
+    } else {
+        credit_points(&users_doc_col, &channels_col, &poke.starter_id, poke.stake, &mut session)
+            .await?;
+        credit_points(&users_doc_col, &channels_col, &finisher_id, poke.stake, &mut session)
+            .await?;
+    }
+
+    session.commit_transaction().await.map_err(AppError::MongoDB)?;
+    Ok(outcome)
+}
+
+async fn refund_one_open_poke(state: &AppState, poke: &Poke) -> Result<bool, AppError> {
+    let pokes_col: Collection<Poke> = state.db.collection("pokes");
+    let users_doc_col: Collection<Document> = state.db.collection("users");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+    let poke_oid = poke.id.ok_or(AppError::DocumentNotFound)?;
+
+    let mut session = state.client.start_session().await.map_err(AppError::MongoDB)?;
+    session.start_transaction().await.map_err(AppError::MongoDB)?;
+
+    let upd = pokes_col
+        .update_one(
+            doc! { "_id": poke_oid, "status": "open" },
+            doc! { "$set": {
+                "status": "refunded",
+                "starter_result": "unmatched",
+                "settled_at": BsonDateTime::now(),
+            }},
+        )
+        .session(&mut session)
+        .await
+        .map_err(AppError::MongoDB)?;
+    if upd.matched_count == 0 {
+        return Ok(false);
+    }
+
+    credit_points(&users_doc_col, &channels_col, &poke.starter_id, poke.stake, &mut session).await?;
+    session.commit_transaction().await.map_err(AppError::MongoDB)?;
+    Ok(true)
+}
+
+pub async fn settle_pokes_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<SettlePokeRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let pokes_col: Collection<Poke> = state.db.collection("pokes");
+    let channel_fixtures_col: Collection<ChannelFixture> = state.db.collection("channel_fixtures");
+
+    let target = load_poke_target(&state, &payload.fixture_id, &payload.market_id, false).await?;
+
+    // `None` / `"draw"` (main match only) => refund all. Otherwise the result
+    // must be a valid option for this target.
+    let winner: Option<String> = match payload.result.as_deref() {
+        None => None,
+        Some("draw") if target.market_id.is_none() => None,
+        Some(r) => {
+            check_selection(r, &target.options)?;
+            Some(r.to_string())
+        }
+    };
+
+    tracing::info!(
+        "⚖️ Settling pokes: fixture={}, market={:?}, winner={:?}",
+        payload.fixture_id,
+        target.market_id,
+        winner
+    );
+
+    let mut all_channel_ids = HashSet::new();
+    let mut cf_cursor = channel_fixtures_col
+        .find(doc! { "fixture_id": &payload.fixture_id })
+        .await
+        .map_err(AppError::MongoDB)?;
+    while let Some(cf) = cf_cursor.next().await {
+        if let Ok(cf) = cf {
+            all_channel_ids.insert(cf.channel_id);
+        }
+    }
+
+    let mut settled = 0;
+    let mut refunded = 0;
+    let mut failed = 0;
+
+    // matched pokes
+    let mut matched_filter = poke_target_filter(&payload.fixture_id, &target.market_id);
+    matched_filter.insert("status", "matched");
+    let mut cursor = pokes_col.find(matched_filter).await.map_err(AppError::MongoDB)?;
+    let mut matched: Vec<Poke> = Vec::new();
+    while let Some(p) = cursor.next().await {
+        matched.push(p.map_err(AppError::MongoDB)?);
+    }
+    for poke in &matched {
+        match settle_one_matched_poke(&state, poke, winner.as_deref()).await {
+            Ok("settled") => settled += 1,
+            Ok("refunded") => refunded += 1,
+            Ok(_) => {}
+            Err(e) => {
+                failed += 1;
+                tracing::error!("❌ Failed to settle poke {:?}: {:?}", poke.id, e);
+            }
+        }
+    }
+
+    // unmatched pokes: refund
+    let mut open_filter = poke_target_filter(&payload.fixture_id, &target.market_id);
+    open_filter.insert("status", "open");
+    let mut cursor = pokes_col.find(open_filter).await.map_err(AppError::MongoDB)?;
+    let mut open: Vec<Poke> = Vec::new();
+    while let Some(p) = cursor.next().await {
+        open.push(p.map_err(AppError::MongoDB)?);
+    }
+    let mut unmatched_refunded = 0;
+    for poke in &open {
+        match refund_one_open_poke(&state, poke).await {
+            Ok(true) => unmatched_refunded += 1,
+            Ok(false) => {}
+            Err(e) => {
+                failed += 1;
+                tracing::error!("❌ Failed to refund poke {:?}: {:?}", poke.id, e);
+            }
+        }
+    }
+
+    let result_payload = json!({
+        "fixture_id": payload.fixture_id,
+        "market_id": target.market_id,
+        "winner": winner,
+        "settled_count": settled,
+        "refunded_count": refunded + unmatched_refunded,
+    });
+
+    for channel_id in &all_channel_ids {
+        let _ = notify_channel_members(
+            &state,
+            "system",
+            channel_id,
+            &payload.fixture_id,
+            "poke.settled",
+            "⚖️ Pokes Settled",
+            &format!("{} pokes settled.", settled),
+            result_payload.clone(),
+        )
+        .await;
+    }
+
+    Ok(Json(json!({
+        "success": failed == 0,
+        "message": format!("Settled {} pokes, refunded {}", settled, refunded + unmatched_refunded),
+        "settled": settled,
+        "refunded_no_winner": refunded,
+        "refunded_unmatched": unmatched_refunded,
+        "failed": failed,
+    })))
+}
+
+// ============================================================================
+// 19. GET USER POINTS
+// ============================================================================
+pub async fn get_user_points_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let users_doc_col: Collection<Document> = state.db.collection("users");
+    let oid = bson::oid::ObjectId::parse_str(&user_id)
+        .map_err(|e| AppError::InvalidObjectId(e.to_string()))?;
+
+    let user = users_doc_col
+        .find_one(doc! { "_id": oid })
+        .await
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
+    let points = read_points(&user);
+
+    Ok(Json(json!({
+        "success": true,
+        "user_id": user_id,
+        "points": points,
+        "min_points_to_poke": MIN_POKE_POINTS,
+        "can_poke": points >= MIN_POKE_POINTS as i64,
+    })))
+}
+
+// ============================================================================
+// 20. GET USER POKES
+// ============================================================================
+pub async fn get_user_pokes_handler(
+    State(state): State<AppState>,
+    Path(user_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let pokes_col: Collection<Poke> = state.db.collection("pokes");
+
+    let mut cursor = pokes_col
+        .find(doc! { "$or": [{ "starter_id": &user_id }, { "finisher_id": &user_id }] })
+        .sort(doc! { "created_at": -1 })
+        .await
+        .map_err(AppError::MongoDB)?;
+
+    let mut pokes = Vec::new();
+    while let Some(p) = cursor.next().await {
+        pokes.push(poke_json(&p.map_err(AppError::MongoDB)?));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "user_id": user_id,
+        "pokes": pokes,
+        "count": pokes.len(),
+    })))
+}
+
+// ============================================================================
+// 21. GET CHANNEL POKES — open + matched in one call
+//     Query: ?market_id=...   (omit for main match)
+// ============================================================================
+pub async fn get_channel_pokes_handler(
+    State(state): State<AppState>,
+    Path((channel_id, fixture_id)): Path<(String, String)>,
+    Query(query): Query<PokeListQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let pokes_col: Collection<Poke> = state.db.collection("pokes");
+    let channels_col: Collection<Channel> = state.db.collection("channels");
+
+    let channel = channels_col
+        .find_one(doc! { "channel_id": &channel_id })
+        .await
+        .map_err(AppError::MongoDB)?
+        .ok_or(AppError::DocumentNotFound)?;
+    let member_ids: HashSet<String> = channel.members.iter().map(|m| m.user_id.clone()).collect();
+
+    let mut filter = poke_target_filter(&fixture_id, &query.market_id);
+    filter.insert("status", doc! { "$in": ["open", "matched", "settled"] });
+
+    let mut cursor = pokes_col
+        .find(filter)
+        .sort(doc! { "created_at": -1 })
+        .await
+        .map_err(AppError::MongoDB)?;
+
+    let mut open = Vec::new();
+    let mut matched = Vec::new();
+    while let Some(p) = cursor.next().await {
+        let p = p.map_err(AppError::MongoDB)?;
+        match p.status.as_str() {
+            "open" if member_ids.contains(&p.starter_id) => open.push(poke_json(&p)),
+            "matched" | "settled" => {
+                if let Some(f) = &p.finisher_id {
+                    if member_ids.contains(&p.starter_id) && member_ids.contains(f) {
+                        matched.push(poke_json(&p));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "fixture_id": fixture_id,
+        "market_id": query.market_id,
+        "channel_id": channel_id,
+        "open": open,
+        "matched": matched,
+        "open_count": open.len(),
+        "matched_count": matched.len(),
     })))
 }
