@@ -676,7 +676,7 @@ pub async fn get_games(
     let mut games = find_games_tolerant_all(&state, filter, Some(doc! { "kickoffUtc": 1 })).await?;
 
     // Hard-capped at 20 regardless of what the caller requests
-    let limit = query.limit.unwrap_or(20).clamp(0, 30) as usize;
+    let limit = query.limit.unwrap_or(50).clamp(0, 30) as usize;
     games.truncate(limit);
 
     tracing::info!("✅ Returning {} games", games.len());
