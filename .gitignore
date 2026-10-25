@@ -1,6 +1,5 @@
 ﻿git commit -m "Clean commit without build artifacts"# Rust - NEVER commit these!
 target/
-Cargo.lock
 
 # Debug files
 *.pdb
