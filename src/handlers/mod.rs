@@ -17,6 +17,7 @@ pub(crate) mod mpesa_handlers;
 pub(crate) mod notification_handler;
 pub(crate) mod posta;
 pub(crate) mod statistics_handler;
+pub(crate) mod weekly_leaderboard;
 pub mod sub_fixture_handler;
 pub(crate) mod user_profile;
 pub(crate) mod comments_handlers;

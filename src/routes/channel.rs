@@ -26,6 +26,9 @@ use crate::handlers::channel::{
     toggle_like_handler, upload_chat_media_handler,
 };
 use crate::handlers::ws_handler::ws_comments_handler;
+use crate::handlers::weekly_leaderboard::{
+    get_channel_weekly_leaderboard_handler,
+};
 use crate::AppState;
 
 // ============================================================================
@@ -219,6 +222,10 @@ pub fn channel_routes() -> Router<AppState> {
             "/likes/user/:user_id/channel/:channel_id",
             get(get_user_liked_fixtures_handler),
         )
+
+
+      //  .route("/leaderboard/weekly", get(get_global_weekly_leaderboard_handler))
+.route("/:channel_id/leaderboard/weekly", get(get_channel_weekly_leaderboard_handler))
 }
 
 // ============================================================================
